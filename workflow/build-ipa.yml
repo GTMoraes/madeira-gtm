@@ -1,0 +1,109 @@
+name: Madeira-GTM IPA
+
+# Baixa o IPA oficial do Madeira, compila o GTMTouch.dylib (overlay de toque do
+# GTA SA) e injeta no app. O IPA sai numa Release deste repositorio, pronto para
+# instalar pela AltStore (que assina o app e o dylib juntos).
+
+on:
+  workflow_dispatch:
+    inputs:
+      madeira_tag:
+        description: "Tag da release do Madeira (vazio = a mais recente)"
+        required: false
+        default: ""
+  push:
+    branches: [main]
+    paths: ["dylib/**", ".github/workflows/**"]
+
+permissions:
+  contents: write
+
+jobs:
+  ipa:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ferramentas
+        run: |
+          xcodebuild -version
+          xcrun -sdk iphoneos --show-sdk-version
+
+      - name: Baixar o IPA oficial do Madeira
+        run: |
+          set -euo pipefail
+          mkdir -p work && cd work
+          TAG="${{ github.event.inputs.madeira_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release list -R willfaust/Madeira --limit 1 --json tagName -q '.[0].tagName')
+          fi
+          echo "Madeira: $TAG"
+          echo "MADEIRA_TAG=$TAG" >> "$GITHUB_ENV"
+          gh release download "$TAG" -R willfaust/Madeira --pattern '*.ipa*' --dir .
+          ls -la
+          IPA=$(ls *.ipa | head -1)
+          test -n "$IPA"
+          if ls *.sha256 >/dev/null 2>&1; then
+            SUM=$(shasum -a 256 "$IPA" | cut -d' ' -f1)
+            grep -qi "$SUM" *.sha256 && echo "sha256 confere: $SUM" || { echo "sha256 NAO confere"; exit 1; }
+          fi
+          mv "$IPA" madeira.ipa
+
+      - name: Compilar GTMTouch.dylib
+        run: |
+          set -euo pipefail
+          xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 \
+            -dynamiclib -fobjc-arc -fmodules -Wall -Werror=objc-method-access \
+            -framework Foundation -framework UIKit -framework QuartzCore \
+            -install_name @executable_path/Frameworks/GTMTouch.dylib \
+            -o work/GTMTouch.dylib dylib/GTMTouch.m
+          lipo -info work/GTMTouch.dylib
+          codesign -f -s - work/GTMTouch.dylib
+
+      - name: Compilar insert_dylib
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/Tyilo/insert_dylib.git work/insert_dylib_src
+          clang -O2 -o work/insert_dylib work/insert_dylib_src/insert_dylib/main.c
+
+      - name: Injetar no Madeira
+        run: |
+          set -euo pipefail
+          cd work
+          unzip -q madeira.ipa -d ipa
+          APP=$(ls -d ipa/Payload/*.app | head -1)
+          EXE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")
+          echo "App: $APP  Executavel: $EXE"
+          # guarda os entitlements do Madeira (memoria extra etc.) antes de mexer na assinatura
+          codesign -d --entitlements - --xml "$APP/$EXE" > ent.plist 2>/dev/null || true
+          echo "Entitlements:"; cat ent.plist || true; echo
+          mkdir -p "$APP/Frameworks"
+          cp GTMTouch.dylib "$APP/Frameworks/GTMTouch.dylib"
+          ./insert_dylib --inplace --all-yes --strip-codesig \
+            @executable_path/Frameworks/GTMTouch.dylib "$APP/$EXE"
+          otool -L "$APP/$EXE" | grep GTMTouch
+          if grep -q "<plist" ent.plist; then
+            codesign -f -s - --entitlements ent.plist "$APP"
+          else
+            codesign -f -s - "$APP"
+          fi
+          codesign -d --entitlements - --xml "$APP/$EXE" | head -c 600; echo
+          (cd ipa && zip -qry ../Madeira-GTM.ipa Payload)
+          ls -la Madeira-GTM.ipa
+
+      - name: Publicar
+        run: |
+          set -euo pipefail
+          NAME="Madeira-GTM-${MADEIRA_TAG}-${GITHUB_RUN_NUMBER}.ipa"
+          mv work/Madeira-GTM.ipa "work/$NAME"
+          gh release create "gtm-${MADEIRA_TAG}-${GITHUB_RUN_NUMBER}" "work/$NAME" \
+            --title "Madeira ${MADEIRA_TAG} + GTMTouch (build ${GITHUB_RUN_NUMBER})" \
+            --notes "IPA oficial do Madeira ${MADEIRA_TAG} com o overlay de toque do GTA SA (GTMTouch.dylib). Instale pela AltStore."
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-GTM
+          path: work/Madeira-GTM-*.ipa
