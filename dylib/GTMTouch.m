@@ -411,11 +411,13 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
     UIImpactFeedbackGenerator *_haptic;
     UIButton *_pencil;
     UIView *_toolbar;
+    BOOL _toolbarLow;                                   // caixa do editor embaixo (para alcancar botoes do topo)
     UILabel *_toast;
     int _selected;
     double _pinchBase;
     uint32_t _state;
     uint8_t _weapon, _nearVeh;
+    UIPinchGestureRecognizer *_pinch;                   // so ligado no editor
     double _pitch;                                      // rampa do ▲ ▼ das aeronaves (-1..1)
     CFTimeInterval _pitchTime;
 }
@@ -461,8 +463,11 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
         UIButton *reset = [self toolButton:@"Restaurar padrão" action:@selector(askReset)];
         reset.tag = 12;
         [reset setTitleColor:[UIColor colorWithRed:1 green:0.45 blue:0.4 alpha:1] forState:UIControlStateNormal];
+        UIButton *move = [self toolButton:@"Caixa para baixo" action:@selector(moveToolbar)];
+        move.tag = 13;
         [_toolbar addSubview:done];
         [_toolbar addSubview:reset];
+        [_toolbar addSubview:move];
         [self addSubview:_toolbar];
 
         _toast = [UILabel new];
@@ -475,9 +480,14 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
         _toast.alpha = 0;
         [self addSubview:_toast];
 
-        UIPinchGestureRecognizer *pinch = [[UIPinchGestureRecognizer alloc] initWithTarget:self action:@selector(pinched:)];
-        pinch.cancelsTouchesInView = NO;
-        [self addGestureRecognizer:pinch];
+        // a pinca so existe no editor: ligada no jogo, com dois dedos na tela (acelerar + direcao)
+        // ela segurava o "soltou" do dedo por segundos e o botao ficava preso
+        _pinch = [[UIPinchGestureRecognizer alloc] initWithTarget:self action:@selector(pinched:)];
+        _pinch.cancelsTouchesInView = NO;
+        _pinch.delaysTouchesBegan = NO;
+        _pinch.delaysTouchesEnded = NO;
+        _pinch.enabled = NO;
+        [self addGestureRecognizer:_pinch];
     }
     return self;
 }
@@ -575,11 +585,14 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
     _pencil.layer.cornerRadius = _pencil.bounds.size.width / 2;
     _pencil.hidden = _editing || !_live;
     CGFloat W = self.bounds.size.width, tw = MIN(560, W - 40);
-    _toolbar.frame = CGRectMake((W - tw) / 2, 82 * [self sy], tw, 92);
+    CGFloat th = 92, ty = _toolbarLow ? self.bounds.size.height - th - 12 * [self sy] : 82 * [self sy];
+    _toolbar.frame = CGRectMake((W - tw) / 2, ty, tw, th);
     UILabel *hint = [_toolbar viewWithTag:10];
     hint.frame = CGRectMake(12, 6, tw - 24, 40);
-    [_toolbar viewWithTag:11].frame = CGRectMake(tw / 2 + 10, 50, tw / 2 - 30, 34);
-    [_toolbar viewWithTag:12].frame = CGRectMake(20, 50, tw / 2 - 30, 34);
+    CGFloat bw = (tw - 40) / 3;                         // Restaurar | Caixa para cima/baixo | Concluir
+    [_toolbar viewWithTag:12].frame = CGRectMake(20, 50, bw, 34);
+    [_toolbar viewWithTag:13].frame = CGRectMake(20 + bw, 50, bw, 34);
+    [_toolbar viewWithTag:11].frame = CGRectMake(20 + 2 * bw, 50, bw, 34);
     [self layoutToast];
 }
 
@@ -731,6 +744,7 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
 - (void)startEditing {
     if (!_layoutKey) return;
     _editing = YES;
+    _pinch.enabled = YES;
     for (int s = 0; s < 12; s++) _slots[s].kind = T_NONE, _slots[s].touch = nil;
     for (GTMButtonView *v in _buttons) v.editing = YES;
     UILabel *hint = [_toolbar viewWithTag:10];
@@ -738,6 +752,13 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
     _toolbar.hidden = NO;
     [self refreshPressed];
     [self setNeedsLayout];
+}
+
+- (void)moveToolbar {
+    _toolbarLow = !_toolbarLow;
+    UIButton *move = [_toolbar viewWithTag:13];
+    [move setTitle:(_toolbarLow ? @"Caixa para cima" : @"Caixa para baixo") forState:UIControlStateNormal];
+    [UIView animateWithDuration:0.2 animations:^{ [self setNeedsLayout]; [self layoutIfNeeded]; }];
 }
 
 - (void)selectForEdit:(int)b {
@@ -770,6 +791,7 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
 
 - (void)leaveEditing {
     _editing = NO;
+    _pinch.enabled = NO;
     _toolbar.hidden = YES;
     [self selectForEdit:-1];
     for (int s = 0; s < 12; s++) _slots[s].kind = T_NONE, _slots[s].touch = nil;
