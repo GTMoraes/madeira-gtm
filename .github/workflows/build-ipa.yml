@@ -1,14 +1,24 @@
 name: Madeira-GTM IPA
 
-# Baixa o IPA oficial do Madeira, compila o GTMTouch.dylib (overlay de toque do
-# GTA SA) e injeta no app. O IPA sai numa Release deste repositorio, pronto para
-# instalar pela AltStore (que assina o app e o dylib juntos).
+# Baixa o IPA do Madeira, compila o GTMTouch.dylib (overlay de toque do GTA SA) e
+# injeta no app. O IPA sai numa Release deste repositorio, pronto para instalar pela
+# AltStore (que assina o app e o dylib juntos).
+#
+# Fonte do Madeira:
+#   fork    = ultimo build com sucesso de GTMoraes/Madeira (emulador com a precisao
+#             simples do x87, branch gtm-x87pc de GTMoraes/FEX). Padrao.
+#   oficial = Release de willfaust/Madeira (tag abaixo, vazio = a mais recente).
 
 on:
   workflow_dispatch:
     inputs:
+      fonte:
+        description: "De onde vem o Madeira"
+        type: choice
+        options: [fork, oficial]
+        default: fork
       madeira_tag:
-        description: "Tag da release do Madeira (vazio = a mais recente)"
+        description: "So para a fonte oficial: tag da release do Madeira (vazio = a mais recente)"
         required: false
         default: ""
   push:
@@ -32,25 +42,49 @@ jobs:
           xcodebuild -version
           xcrun -sdk iphoneos --show-sdk-version
 
-      - name: Baixar o IPA oficial do Madeira
+      - name: Baixar o IPA do Madeira
+        env:
+          # para baixar o artefato do fork; se o token padrao for recusado, crie um
+          # token (Actions: read) e guarde como secret MADEIRA_FORK_TOKEN
+          FORK_TOKEN: ${{ secrets.MADEIRA_FORK_TOKEN }}
         run: |
           set -euo pipefail
           mkdir -p work && cd work
-          TAG="${{ github.event.inputs.madeira_tag }}"
-          if [ -z "$TAG" ]; then
-            TAG=$(gh release list -R willfaust/Madeira --limit 1 --json tagName -q '.[0].tagName')
+          FONTE="${{ github.event.inputs.fonte }}"
+          [ -n "$FONTE" ] || FONTE=fork
+          echo "Fonte: $FONTE"
+          if [ "$FONTE" = "fork" ]; then
+            [ -z "${FORK_TOKEN:-}" ] || export GH_TOKEN="$FORK_TOKEN"
+            RUN=$(gh run list -R GTMoraes/Madeira --workflow build.yml --branch main --status success \
+                  --limit 1 --json databaseId,headSha,createdAt -q '.[0]')
+            test -n "$RUN"
+            RUN_ID=$(echo "$RUN" | jq -r .databaseId)
+            SHA=$(echo "$RUN" | jq -r .headSha | cut -c1-7)
+            echo "Build do fork: run $RUN_ID, commit $SHA ($(echo "$RUN" | jq -r .createdAt))"
+            gh run download "$RUN_ID" -R GTMoraes/Madeira -n Madeira-ipa -D fork
+            ls -laR fork
+            IPA=$(find fork -name '*.ipa' | head -1)
+            test -n "$IPA"
+            mv "$IPA" madeira.ipa
+            TAG="fork-$SHA"
+          else
+            TAG="${{ github.event.inputs.madeira_tag }}"
+            if [ -z "$TAG" ]; then
+              TAG=$(gh release list -R willfaust/Madeira --limit 1 --json tagName -q '.[0].tagName')
+            fi
+            gh release download "$TAG" -R willfaust/Madeira --pattern '*.ipa*' --dir .
+            ls -la
+            IPA=$(ls *.ipa | head -1)
+            test -n "$IPA"
+            if ls *.sha256 >/dev/null 2>&1; then
+              SUM=$(shasum -a 256 "$IPA" | cut -d' ' -f1)
+              grep -qi "$SUM" *.sha256 && echo "sha256 confere: $SUM" || { echo "sha256 NAO confere"; exit 1; }
+            fi
+            mv "$IPA" madeira.ipa
           fi
           echo "Madeira: $TAG"
           echo "MADEIRA_TAG=$TAG" >> "$GITHUB_ENV"
-          gh release download "$TAG" -R willfaust/Madeira --pattern '*.ipa*' --dir .
-          ls -la
-          IPA=$(ls *.ipa | head -1)
-          test -n "$IPA"
-          if ls *.sha256 >/dev/null 2>&1; then
-            SUM=$(shasum -a 256 "$IPA" | cut -d' ' -f1)
-            grep -qi "$SUM" *.sha256 && echo "sha256 confere: $SUM" || { echo "sha256 NAO confere"; exit 1; }
-          fi
-          mv "$IPA" madeira.ipa
+          shasum -a 256 madeira.ipa
 
       - name: Compilar GTMTouch.dylib
         run: |
@@ -77,6 +111,7 @@ jobs:
           APP=$(ls -d ipa/Payload/*.app | head -1)
           EXE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")
           echo "App: $APP  Executavel: $EXE"
+          echo "Bundle ID: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")  versao: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist" 2>/dev/null || true)"
           # guarda os entitlements do Madeira (memoria extra etc.) antes de mexer na assinatura
           codesign -d --entitlements - --xml "$APP/$EXE" > ent.plist 2>/dev/null || true
           echo "Entitlements:"; cat ent.plist || true; echo
@@ -101,7 +136,7 @@ jobs:
           mv work/Madeira-GTM.ipa "work/$NAME"
           gh release create "gtm-${MADEIRA_TAG}-${GITHUB_RUN_NUMBER}" "work/$NAME" \
             --title "Madeira ${MADEIRA_TAG} + GTMTouch (build ${GITHUB_RUN_NUMBER})" \
-            --notes "IPA oficial do Madeira ${MADEIRA_TAG} com o overlay de toque do GTA SA (GTMTouch.dylib). Instale pela AltStore."
+            --notes "Madeira ${MADEIRA_TAG} com o overlay de toque do GTA SA (GTMTouch.dylib). fork-xxxxxxx = build de GTMoraes/Madeira (x87 em precisao simples). Instale pela AltStore."
 
       - uses: actions/upload-artifact@v4
         with:

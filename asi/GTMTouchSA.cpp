@@ -1,4 +1,4 @@
-// GTMTouchSA.asi 3.0 - controles de toque contextuais para GTA San Andreas 1.0 US no Madeira
+// GTMTouchSA.asi 3.6 - controles de toque contextuais para GTA San Andreas 1.0 US no Madeira
 //
 // 1) Contexto: a cada quadro escreve em C:\gtmtouch.bin em que situacao o CJ esta (a pe,
 //    nadando, de jetpack, carro, moto, helicoptero, aviao, barco, passageiro, cutscene,
@@ -25,7 +25,7 @@
 //   [Save]     Slot=8  AutosaveMinutes=5  AfterMission=1  KeepVehicle=1
 //   [YesNo]    Scripts=1  IgnoreScripts=
 //   [Vehicles] MissionModels=...  FireModels=...  Fire2Models=...
-//   [Debug]    Log=1
+//   [Debug]    Log=1  TouchTrace=0  RagdollTrace=0  RagdollCount=0 (diagnosticos)
 
 #include <windows.h>
 #include <stdio.h>
@@ -34,10 +34,13 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <math.h>
+#include <tlhelp32.h>
+#include <stdint.h>
 #include "MinHook.h"
 
 // ---------------------------------------------------------------- configuracao e log
 static int  g_steerOn = 1, g_rampMs = 150, g_releaseMs = 60, g_touchOn = 1, g_log = 1;
+static int  g_traceTouch = 0, g_traceRagdoll = 0, g_countRagdoll = 0, g_audioHash = 0, g_fixX87 = 1;     // diagnosticos ([Debug] TouchTrace / RagdollTrace)
 static int  g_saveSlot = 8, g_autosaveMin = 5, g_afterMission = 1, g_keepVehicle = 1;
 static int  g_ynScripts = 1;
 static char g_ignoreScripts[512];                       // minusculas, ",nome,nome,"
@@ -72,6 +75,7 @@ static void Log(const char* fmt, ...) {
     LeaveCriticalSection(&g_logCs);
 }
 
+static void X87Check();
 static int ParseList(const char* s, short* out, int max) {
     int n = 0;
     while (*s && n < max) {
@@ -518,6 +522,17 @@ static DWORD Filter(DWORD ret, DWORD idx, XState* st) {
     // 3) Sim/Nao do overlay: setas de verdade, mesmo dentro do carro
     if (host) st->Gamepad.wButtons |= h.rawButtons;
 
+    // diagnostico: o que o jogo recebeu, quadro a quadro (so quando muda)
+    if (g_traceTouch) {
+        static WORD lastB = 0xFFFF; static BYTE lastLT = 0xFF, lastRT = 0xFF;
+        const PadState& p = st->Gamepad;
+        if (p.wButtons != lastB || p.bLeftTrigger != lastLT || p.bRightTrigger != lastRT) {
+            lastB = p.wButtons; lastLT = p.bLeftTrigger; lastRT = p.bRightTrigger;
+            Log("toque: quadro %u botoes 0x%04X LT %u RT %u (overlay 0x%04X)", *(volatile unsigned*)0xB7CB4C,
+                (unsigned)p.wButtons, (unsigned)p.bLeftTrigger, (unsigned)p.bRightTrigger, host ? (unsigned)h.buttons : 0u);
+        }
+    }
+
     // 4) o leitor so processa pacotes novos: numera quando o que entregamos mudou
     if (memcmp(&g_lastOut, &st->Gamepad, sizeof(PadState)) != 0) { g_packetBump++; g_lastOut = st->Gamepad; }
     st->dwPacketNumber += g_packetBump;
@@ -836,6 +851,300 @@ static void SaveTick() {
     g_saveInfo.slot = (BYTE)g_saveSlot;
 }
 
+// ---------------------------------------------------------------- diagnostico do Ragdoll
+// (3.2) Pontos do codigo do jogo que o RagDoll_physics.bin altera (lidos do proprio .bin):
+// confere se os desvios dele estao la, para onde apontam e, com RagdollCount=1, conta
+// quantas vezes cada um roda (um contador intermediario no caminho, sem tocar no .bin).
+struct RdSite { DWORD addr; BYTE orig[5]; };
+static const RdSite kRdSites[] = {
+    { 0x538090, {0x6A,0xFF,0x68,0x31,0xC9} }, { 0x53BCA0, {0xE8,0x2B,0x6E,0x07,0x00} },
+    { 0x532B20, {0x56,0x8B,0xF1,0x8B,0x46} }, { 0x53E293, {0xE8,0x28,0x16,0x0D,0x00} },
+    { 0x6D6263, {0xC2,0x04,0x00,0x90,0x90} }, { 0x6E2D90, {0x8B,0x4C,0x24,0x04,0x56} },
+    { 0x5E4760, {0x8B,0x4C,0x24,0x04,0x56} }, { 0x681AF0, {0x53,0x8B,0x5C,0x24,0x08} },
+    { 0x73B550, {0x6A,0xFF,0x68,0x50,0x8E} }, { 0x59F660, {0x6A,0xFF,0x68,0x28,0xD2} },
+    { 0x5A1D69, {0xC3,0x90,0x90,0x90,0x90} }, { 0x5A1DDE, {0xC2,0x08,0x00,0x90,0x90} },
+    { 0x5A1ED3, {0xC2,0x04,0x00,0x90,0x90} },
+};
+static const int kRdN = sizeof kRdSites / sizeof kRdSites[0];
+static char  g_rdSnap[kRdN][96];
+static bool  g_rdSnapped = false;
+static BYTE* g_rdStubs = nullptr;                 // 16 bytes por ponto
+static DWORD g_rdTarget[kRdN];                    // destino real (no .bin) de cada contador
+static volatile LONG g_rdCount[kRdN];
+static LONG  g_rdPrinted[kRdN];
+static bool  g_rdCounting = false;
+
+static void ModuleOf(DWORD a, char* out, int n) {
+    HMODULE m = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)a, &m) && m) {
+        char path[MAX_PATH]; path[0] = 0;
+        GetModuleFileNameA(m, path, MAX_PATH);
+        const char* b = strrchr(path, '\\');
+        snprintf(out, n, "%s", b ? b + 1 : path);
+    } else snprintf(out, n, "memoria sem modulo");
+}
+
+static void DescribeSite(int i, char* out, int n) {
+    const BYTE* s = (const BYTE*)kRdSites[i].addr;
+    BYTE b[5]; memcpy(b, s, 5);
+    if (!memcmp(b, kRdSites[i].orig, 5)) { snprintf(out, n, "original do jogo (sem desvio)"); return; }
+    if (b[0] == 0xE8 || b[0] == 0xE9) {
+        DWORD t = kRdSites[i].addr + 5 + *(int*)(b + 1);
+        bool viaCount = g_rdStubs && t == (DWORD)(g_rdStubs + i * 16);
+        if (viaCount) t = g_rdTarget[i];
+        char mod[64]; ModuleOf(t, mod, sizeof mod);
+        snprintf(out, n, "%s -> 0x%08lX (%s)%s", b[0] == 0xE8 ? "CALL" : "JMP", (unsigned long)t, mod, viaCount ? " [contando]" : "");
+        return;
+    }
+    snprintf(out, n, "alterado: %02X %02X %02X %02X %02X", b[0], b[1], b[2], b[3], b[4]);
+}
+
+static void ListMods() {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE) { Log("ragdoll: nao listou os modulos (erro %lu)", GetLastError()); return; }
+    MODULEENTRY32 me; me.dwSize = sizeof me;
+    for (BOOL ok = Module32First(snap, &me); ok; ok = Module32Next(snap, &me)) {
+        char low[MAX_PATH]; snprintf(low, sizeof low, "%s", me.szExePath);
+        for (char* c = low; *c; c++) *c = (char)tolower((unsigned char)*c);
+        if (strstr(low, "\\windows\\")) continue;
+        Log("ragdoll: modulo carregado %s em 0x%08lX (%lu KB)", me.szExePath, (unsigned long)(DWORD_PTR)me.modBaseAddr, (unsigned long)(me.modBaseSize / 1024));
+    }
+    CloseHandle(snap);
+}
+
+static void InstallRdCounters() {
+    HMODULE rd = GetModuleHandleA("RagDoll_physics.bin");
+    if (!rd) { Log("ragdoll: RagDoll_physics.bin nao esta carregado; contadores nao instalados"); return; }
+    g_rdStubs = (BYTE*)VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!g_rdStubs) { Log("ragdoll: sem memoria para os contadores"); return; }
+    int n = 0;
+    for (int i = 0; i < kRdN; i++) {
+        BYTE* site = (BYTE*)kRdSites[i].addr;
+        if (site[0] != 0xE8 && site[0] != 0xE9) continue;
+        DWORD t = kRdSites[i].addr + 5 + *(int*)(site + 1);
+        HMODULE m = nullptr;
+        if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)t, &m) || m != rd) continue;
+        BYTE* st = g_rdStubs + i * 16;
+        st[0] = 0x9C;                                                  // pushfd
+        st[1] = 0xF0; st[2] = 0xFF; st[3] = 0x05;                      // lock inc dword [contador]
+        *(DWORD*)(st + 4) = (DWORD)&g_rdCount[i];
+        st[8] = 0x9D;                                                  // popfd
+        st[9] = 0xE9; *(int*)(st + 10) = (int)(t - (DWORD)(st + 14));  // jmp destino original
+        g_rdTarget[i] = t;
+        FlushInstructionCache(GetCurrentProcess(), st, 16);
+        DWORD old;
+        VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &old);
+        *(int*)(site + 1) = (int)((DWORD)st - (kRdSites[i].addr + 5));
+        VirtualProtect(site, 5, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), site, 5);
+        n++;
+    }
+    g_rdCounting = n > 0;
+    Log("ragdoll: %d contadores instalados", n);
+}
+
+static void CheckRagdollHooks(bool full, const char* when) {
+    if (full) {
+        HMODULE rd = GetModuleHandleA("RagDoll_physics.bin");
+        Log("ragdoll: conferindo os desvios (%s); RagDoll_physics.bin %s 0x%08lX", when,
+            rd ? "carregado em" : "NAO carregado", (unsigned long)(DWORD_PTR)rd);
+    }
+    bool any = false;
+    for (int i = 0; i < kRdN; i++) {
+        char d[96]; DescribeSite(i, d, sizeof d);
+        if (full || !g_rdSnapped || strcmp(d, g_rdSnap[i])) {
+            Log("ragdoll: desvio 0x%06lX: %s%s", (unsigned long)kRdSites[i].addr, d, (!full && g_rdSnapped) ? " (MUDOU)" : "");
+            any = true;
+        }
+        snprintf(g_rdSnap[i], sizeof g_rdSnap[i], "%s", d);
+    }
+    g_rdSnapped = true;
+    (void)any;
+}
+
+static void PrintRdCounts(const char* when) {
+    if (!g_rdCounting) return;
+    char line[700]; int o = 0;
+    for (int i = 0; i < kRdN && o < (int)sizeof line - 40; i++) {
+        if (!g_rdTarget[i]) continue;
+        LONG c = g_rdCount[i];
+        o += snprintf(line + o, sizeof line - o, " %06lX=%ld(+%ld)", (unsigned long)kRdSites[i].addr, (long)c, (long)(c - g_rdPrinted[i]));
+        g_rdPrinted[i] = c;
+    }
+    Log("ragdoll: contagem (%s):%s", when, line);
+}
+
+
+// (3.3) configuracao que o Ragdoll realmente leu: valores na memoria do .bin
+// (enderecos tirados do codigo dele) e o que o Windows/Wine devolve do RagDoll_physics.ini
+struct RdCfg { const char* name; DWORD rva; char kind; };   // i int, d double, f float
+static const RdCfg kRdCfg[] = {
+    {"iNumSubsteps",0xC2570,'i'}, {"fSimulationSpeed",0xBA890,'d'}, {"fRagdollLinearDamping",0xBA8A8,'f'},
+    {"fRagdollAngularDamping",0xBA884,'f'}, {"fRagdollGravity",0xBA8A0,'f'}, {"fBulletPower",0xBA8B0,'f'},
+    {"fExplosionPower",0xBA89C,'f'}, {"fSurfaceFriction",0xBA8B4,'f'}, {"fRagDollFriction",0xBA870,'f'},
+    {"fRagDollRestitution",0xC254C,'f'}, {"fRagDollJointDamping",0xBA8AC,'f'}, {"fRagDollGetUpThreshold",0xBA8B8,'f'},
+    {"bVehicleShapeUseSpheres",0xBA87C,'i'}, {"bUseDynamicObjects",0xBA8A4,'i'}, {"fRagDollShapeMargin",0xC2560,'f'},
+    {"fWorldShapeMargin",0xC2540,'f'}, {"fDynamicObjectMass",0xBA898,'f'}, {"fWorldMinX",0xBA880,'f'},
+    {"fWorldMinY",0xBA88C,'f'}, {"fWorldMaxX",0xBA874,'f'}, {"fWorldMaxY",0xBA888,'f'}, {"iNumIPLInstances",0xBA878,'i'},
+};
+static void RagdollConfig() {
+    HMODULE rd = GetModuleHandleA("RagDoll_physics.bin");
+    wchar_t exe[MAX_PATH]; exe[0] = 0;
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    wchar_t ini[MAX_PATH + 32]; wcscpy(ini, exe);
+    wchar_t* sl = wcsrchr(ini, L'\\'); if (sl) *sl = 0;
+    wcscat(ini, L"\\RagDoll_physics.ini");
+    char exeA[MAX_PATH * 2], iniA[MAX_PATH * 2];
+    WideCharToMultiByte(CP_UTF8, 0, exe, -1, exeA, sizeof exeA, nullptr, nullptr);
+    WideCharToMultiByte(CP_UTF8, 0, ini, -1, iniA, sizeof iniA, nullptr, nullptr);
+    DWORD attr = GetFileAttributesW(ini);
+    LONG size = -1;
+    HANDLE f = CreateFileW(ini, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f != INVALID_HANDLE_VALUE) { size = (LONG)GetFileSize(f, nullptr); CloseHandle(f); }
+    Log("ragdoll: exe do jogo %s; ini que o Ragdoll procura %s: %s (%ld bytes); codepage %u",
+        exeA, iniA, attr == INVALID_FILE_ATTRIBUTES ? "NAO EXISTE" : "existe", (long)size, GetACP());
+    {   // caminho que o RagDoll_physics.asi entrega ao .bin (buffer em +0x3008 do .asi)
+        wchar_t cwd[MAX_PATH]; cwd[0] = 0; GetCurrentDirectoryW(MAX_PATH, cwd);
+        char cwdA[MAX_PATH * 2]; WideCharToMultiByte(CP_UTF8, 0, cwd, -1, cwdA, sizeof cwdA, nullptr, nullptr);
+        HMODULE asi = GetModuleHandleA("RagDoll_physics.asi");
+        char buf[600]; int o = 0;
+        if (asi) {
+            const wchar_t* w = (const wchar_t*)((const char*)asi + 0x3008);
+            for (int k = 0; k < 260 && w[k] && o < (int)sizeof buf - 8; k++) {
+                wchar_t c = w[k];
+                if (c >= 32 && c < 127) buf[o++] = (char)c;
+                else o += snprintf(buf + o, sizeof buf - o, "<%04X>", (unsigned)c);
+            }
+        }
+        buf[o] = 0;
+        Log("ragdoll: pasta atual %s; caminho que o RagDoll_physics.asi montou: pasta do exe + \"%s\"%s",
+            cwdA, buf, asi ? "" : " (RagDoll_physics.asi nao encontrado)");
+    }
+    static const wchar_t* keys[] = { L"iNumSubsteps", L"fSimulationSpeed", L"fRagdollGravity", L"bUseDynamicObjects", L"fWorldMinX" };
+    for (const wchar_t* k : keys) {
+        wchar_t v[256]; v[0] = 0;
+        GetPrivateProfileStringW(L"CONFIG", k, L"<faltou>", v, 255, ini);
+        char kA[64], vA[512];
+        WideCharToMultiByte(CP_UTF8, 0, k, -1, kA, sizeof kA, nullptr, nullptr);
+        WideCharToMultiByte(CP_UTF8, 0, v, -1, vA, sizeof vA, nullptr, nullptr);
+        Log("ragdoll: ini [CONFIG] %s = \"%s\"", kA, vA);
+    }
+    if (!rd) { Log("ragdoll: RagDoll_physics.bin nao carregado; sem valores da memoria"); return; }
+    char line[1400]; int o = 0;
+    for (const RdCfg& c : kRdCfg) {
+        const char* a = (const char*)rd + c.rva;
+        if (c.kind == 'i')      o += snprintf(line + o, sizeof line - o, " %s=%d", c.name, *(const int*)a);
+        else if (c.kind == 'd') o += snprintf(line + o, sizeof line - o, " %s=%g", c.name, *(const double*)a);
+        else                    o += snprintf(line + o, sizeof line - o, " %s=%g", c.name, *(const float*)a);
+        if (o > (int)sizeof line - 80) break;
+    }
+    Log("ragdoll: valores em uso pelo Ragdoll:%s", line);
+}
+
+// tudo de uma vez, alguns segundos depois do CJ aparecer (vale para jogo novo e save)
+static void RagdollStartupCheck() {
+    static DWORD s_at = 0; static bool s_done = false;
+    if (s_done) return;
+    if (!s_at) { s_at = GetTickCount() + 3000; return; }
+    if (GetTickCount() < s_at) return;
+    s_done = true;
+    ListMods();
+    RagdollConfig();
+    CheckRagdollHooks(true, "3 s depois do CJ aparecer");
+    if (g_countRagdoll) { InstallRdCounters(); CheckRagdollHooks(false, "com contadores"); }
+}
+
+// ossos do pedestre: posicao do primeiro osso, maior distancia de um osso ao corpo,
+// espalhamento entre ossos e quantos valores invalidos (NaN)
+static void BoneInfo(const char* p, V3 q, char* out, int n) {
+    void* clump = Rd<void*>(p, 0x18);
+    if (!clump) { snprintf(out, n, " ossos -"); return; }
+    char* h = (char*)((void* (__cdecl*)(void*))0x734A40)(clump);    // GetAnimHierarchyFromSkinClump
+    if (!h) { snprintf(out, n, " ossos sem-hierarquia"); return; }
+    int nb = Rd<int>(h, 4);
+    const char* mats = Rd<const char*>(h, 8);
+    if (!mats || nb <= 0 || nb > 64) { snprintf(out, n, " ossos invalidos(%d)", nb); return; }
+    const float* r = (const float*)(mats + 48);
+    float farD = 0.f, spread = 0.f; int nan = 0;
+    for (int b = 0; b < nb; b++) {
+        const float* m = (const float*)(mats + b * 64);
+        for (int k = 0; k < 16; k++) if (m[k] != m[k]) nan++;
+        float x = m[12], y = m[13], z = m[14];
+        float d = sqrtf((x - q.x) * (x - q.x) + (y - q.y) * (y - q.y) + (z - q.z) * (z - q.z));
+        float e = sqrtf((x - r[0]) * (x - r[0]) + (y - r[1]) * (y - r[1]) + (z - r[2]) * (z - r[2]));
+        if (d > farD || d != d) farD = d;
+        if (e > spread || e != e) spread = e;
+    }
+    snprintf(out, n, " ossos %d raiz (%.2f, %.2f, %.2f) longe %.1f esp %.1f nan %d fl 0x%X",
+             nb, r[0], r[1], r[2], farD, spread, nan, Rd<int>(h, 0));
+}
+
+// Acompanha os pedestres perto do CJ: quando um morre ou "salta" mais de 3 m num quadro,
+// registra posicao, velocidade, estado e visibilidade quadro a quadro por alguns segundos.
+struct PedTrack { bool have, alive; V3 prev; DWORD until; DWORD start; };
+static PedTrack g_ped[256];
+static int g_ragLines = 0;
+static void RagdollTrace() {
+    char* player = PlayerPed();
+    if (!player || g_ragLines > 9000) return;
+    RagdollStartupCheck();
+    static DWORD s_countAt = 0;
+    if (g_rdCounting && !s_countAt) s_countAt = GetTickCount() + 10000;
+    if (s_countAt && GetTickCount() >= s_countAt) { s_countAt = 0xFFFFFFFF; PrintRdCounts("10 s depois de instalar"); }
+    const char* pool = *(const char* volatile*)0xB74490;            // CPools::ms_pPedPool
+    if (!pool) return;
+    const char* objs = Rd<const char*>(pool, 0);
+    const BYTE* map  = Rd<const BYTE*>(pool, 4);
+    int size = Rd<int>(pool, 8);
+    if (!objs || !map || size <= 0 || size > 256) return;
+    V3 pp = EntityPos(player);
+    DWORD now = GetTickCount();
+    unsigned frame = *(volatile unsigned*)0xB7CB4C;                  // CTimer::m_FrameCounter
+    for (int i = 0; i < size; i++) {
+        PedTrack& t = g_ped[i];
+        if (map[i] & 0x80) { t.have = false; continue; }
+        const char* p = objs + i * 0x7C4;
+        if (p == player) continue;
+        V3 q = EntityPos(p);
+        float hp = Rd<float>(p, 0x540);
+        int st = Rd<int>(p, 0x530);
+        bool dead = hp <= 0.f || (st >= 54 && st <= 56);
+        float dx = q.x - pp.x, dy = q.y - pp.y, dz = q.z - pp.z;
+        float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (!t.have) { t = {}; t.have = true; t.prev = q; t.alive = !dead; continue; }
+        float jx = q.x - t.prev.x, jy = q.y - t.prev.y, jz = q.z - t.prev.z;
+        float jump = sqrtf(jx * jx + jy * jy + jz * jz);
+        bool nearP = dist < 60.f || (t.until && now < t.until);
+        if (nearP && t.alive && dead) {
+            t.until = now + 5000; t.start = now;
+            Log("ragdoll: pedestre #%d (modelo %d) morreu em (%.2f, %.2f, %.2f) a %.1f m do CJ; estado %d vida %.1f",
+                i, (int)Rd<short>(p, 0x22), q.x, q.y, q.z, dist, st, hp);
+            g_ragLines++;
+            CheckRagdollHooks(false, "morte");
+            PrintRdCounts("na morte");
+        }
+        if (nearP && (jump > 3.f || q.x != q.x)) {
+            if (!t.until || now >= t.until) t.start = now;
+            t.until = now + 4000;
+            Log("ragdoll: pedestre #%d SALTOU %.1f m num quadro: (%.2f, %.2f, %.2f) -> (%.2f, %.2f, %.2f)",
+                i, jump, t.prev.x, t.prev.y, t.prev.z, q.x, q.y, q.z);
+            g_ragLines++;
+        }
+        if (t.until && now < t.until) {
+            float vx = Rd<float>(p, 0x44), vy = Rd<float>(p, 0x48), vz = Rd<float>(p, 0x4C);
+            bool vis = (Rd<BYTE>(p, 0x1C) & 0x80) != 0;
+            bool hasMat = Rd<const void*>(p, 0x14) != nullptr;
+            char bones[128]; BoneInfo(p, q, bones, sizeof bones);
+            Log("rd #%d t=%4lu q=%u pos (%.2f, %.2f, %.2f) vel (%.3f, %.3f, %.3f) dist %.1f est %d vida %.1f vis %d mat %d%s",
+                i, (unsigned long)(now - t.start), frame, q.x, q.y, q.z, vx, vy, vz, dist, st, hp, vis ? 1 : 0, hasMat ? 1 : 0, bones);
+            g_ragLines++;
+        }
+        t.prev = q;
+        t.alive = !dead;
+    }
+    if (g_ragLines > 9000) Log("ragdoll: limite de linhas atingido; diagnostico parado");
+}
+
 // ---------------------------------------------------------------- gancho por quadro
 static Void_t g_origFrameCall = nullptr;
 static const DWORD kFrameCall = 0x53C077;              // CALL CCranes::UpdateCranes em CGame::Process (todo quadro sem pausa)
@@ -845,6 +1154,7 @@ static void __cdecl FrameTick() {
     if (g_origFrameCall) g_origFrameCall();
     if (g_firstFrame) {                                 // reserva, se a thread de inicio nao conseguiu
         g_firstFrame = false;
+        X87Check();
         if (g_hookCount == 0) InstallXInputHooks();
         if (g_hookCount == 0) Log("nenhuma funcao XInput interceptada");
     }
@@ -860,6 +1170,7 @@ static void __cdecl FrameTick() {
     SaveTick();
     bool xinputLive = g_xinputCalls > 0 && GetTickCount() - g_lastXInputTick < 1000;
     WriteGame(g_info, (WORD)(xinputLive ? 1 : 0));
+    if (g_traceRagdoll) RagdollTrace();
 
     if (xinputLive) return;
     if (!g_fallbackNoted) { g_fallbackNoted = true; Log("usando o caminho reserva (CPad::NewState)"); }
@@ -887,6 +1198,220 @@ static void HookGame(DWORD addr, void* detour, void** orig, const char* what) {
         Log("falha no gancho %s (0x%X)", what, addr);
 }
 
+// ---------------------------------------------------------------- precisao do x87 ([Fixes] X87=1)
+// No Windows, o Direct3D 9 poe o x87 do jogo em precisao simples (24 bits) e o jogo depende disso.
+// No iPhone o emulador (FEX) calcula com mais precisao e ignora esse ajuste. Dois lugares quebram:
+//  1) 0x4D9CC0 CAEAudioUtility::GetBankAndSoundFromScriptSlotAudioEvent: banco = floor((id-2000)*0.005f).
+//     Com mais precisao, 200*0.005f da 0,99999998 em vez de 1, e todo som de numero 0 de um banco
+//     (multiplo de 200) vem do banco anterior: fala trocada do Ryder, telefone com fala de pedestre,
+//     musica da festa no carro do Smoke, maquina do barbeiro muda. Troca por divisao inteira por 200,
+//     que da exatamente o resultado do Windows.
+//  2) 0x72B89D CWeather::Update: compara o valor novo da interpolacao (ainda no registrador, com mais
+//     precisao) com o valor guardado em float. Quando o arredondamento do float sobe, o jogo acha que a
+//     hora virou e troca o clima: o clima cicla sozinho. Passa a comparar o valor ja arredondado em float.
+static bool PatchBytes(DWORD addr, const BYTE* expect, int nExpect, const BYTE* repl, int nRepl, const char* what) {
+    if (memcmp((void*)addr, expect, nExpect)) {
+        char got[64]; int o = 0;
+        for (int i = 0; i < nExpect && i < 16; i++) o += snprintf(got + o, sizeof got - o, "%02X", ((BYTE*)addr)[i]);
+        Log("x87: %s nao aplicada: codigo em 0x%X nao e o original (%s...)", what, addr, got);
+        return false;
+    }
+    DWORD old;
+    VirtualProtect((void*)addr, nExpect, PAGE_EXECUTE_READWRITE, &old);
+    memcpy((void*)addr, repl, nRepl);
+    for (int i = nRepl; i < nExpect; i++) ((BYTE*)addr)[i] = 0x90;
+    VirtualProtect((void*)addr, nExpect, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void*)addr, nExpect);
+    Log("x87: %s aplicada em 0x%X", what, addr);
+    return true;
+}
+
+static void ApplyX87Fixes() {
+    // 1) som de missao: 0x4D9D38..0x4D9D81
+    static const BYTE bankOrig[] = {
+        0x05,0x30,0xF8,0xFF,0xFF, 0x89,0x44,0x24,0x08, 0xDB,0x44,0x24,0x08, 0x83,0xEC,0x08,
+        0xD8,0x0D,0x4C,0x8B,0x85,0x00, 0xDD,0x1C,0x24, 0xE8,0x9A,0x7C,0x34,0x00, 0x83,0xC4,0x08,
+        0xE8,0xE2,0x7D,0x34,0x00, 0x8B,0x4C,0x24,0x0C, 0x05,0x93,0x00,0x00,0x00, 0x89,0x01,
+        0x8B,0x06, 0x2D,0xD0,0x07,0x00,0x00, 0x99, 0xB9,0xC8,0x00,0x00,0x00, 0xF7,0xF9,
+        0x8B,0x44,0x24,0x10, 0x5E, 0x89,0x10, 0xB0,0x01, 0xC3 };
+    static const BYTE bankNew[] = {
+        0x2D,0xD0,0x07,0x00,0x00,       // sub  eax, 2000
+        0x99,                           // cdq
+        0xB9,0xC8,0x00,0x00,0x00,       // mov  ecx, 200
+        0xF7,0xF9,                      // idiv ecx
+        0x05,0x93,0x00,0x00,0x00,       // add  eax, 0x93 (primeiro banco de script)
+        0x8B,0x4C,0x24,0x0C,            // mov  ecx, [esp+0xC] (banco)
+        0x89,0x01,                      // mov  [ecx], eax
+        0x8B,0x44,0x24,0x10,            // mov  eax, [esp+0x10] (som)
+        0x89,0x10,                      // mov  [eax], edx
+        0xB0,0x01,                      // mov  al, 1
+        0x5E,                           // pop  esi
+        0xC3 };                         // ret
+    PatchBytes(0x4D9D38, bankOrig, sizeof bankOrig, bankNew, sizeof bankNew, "correcao do som de missao");
+
+    // 2) clima: fst [esp+8] ; fcomp [InterpolationValue]  ->  call stub ; nop x5
+    static BYTE* stub = nullptr;
+    if (!stub) stub = (BYTE*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!stub) { Log("x87: sem memoria para a correcao do clima"); return; }
+    static const BYTE stubCode[] = {
+        0xD9,0x5C,0x24,0x0C,            // fstp dword [esp+0xC]  (o [esp+8] de quem chamou)
+        0xD9,0x44,0x24,0x0C,            // fld  dword [esp+0xC]  (o mesmo valor, ja arredondado em float)
+        0xD8,0x1D,0x0C,0x13,0xC8,0x00,  // fcomp dword [0xC8130C] (CWeather::InterpolationValue)
+        0xC3 };                         // ret
+    memcpy(stub, stubCode, sizeof stubCode);
+    FlushInstructionCache(GetCurrentProcess(), stub, sizeof stubCode);
+    static const BYTE wOrig[] = { 0xD9,0x54,0x24,0x08, 0xD8,0x1D,0x0C,0x13,0xC8,0x00 };
+    BYTE wNew[5]; wNew[0] = 0xE8; *(int*)(wNew + 1) = (int)((DWORD)stub - (0x72B89D + 5));
+    PatchBytes(0x72B89D, wOrig, sizeof wOrig, wNew, sizeof wNew, "correcao do clima");
+}
+
+// confere, na thread do jogo, se o x87 arredonda como no Windows
+static void X87Check() {
+    unsigned short cw = 0; double r = 0; int x = 200; float c = 0.005f;
+    __asm__ volatile("fnstcw %0" : "=m"(cw));
+    __asm__ volatile("fildl %1\n\tfmuls %2\n\tfstpl %0" : "=m"(r) : "m"(x), "m"(c));
+    Log("x87: palavra de controle 0x%04X (precisao %s); 200 x 0,005f = %.10f (%s)", cw,
+        ((cw >> 8) & 3) == 0 ? "simples, 24 bits" : ((cw >> 8) & 3) == 2 ? "dupla, 53 bits" : "estendida, 64 bits",
+        r, r >= 1.0 ? "como no Windows" : "diferente do Windows: as correcoes x87 sao necessarias aqui");
+}
+
+// ---------------------------------------------------------------- diagnostico do audio ([Debug] AudioHash=1)
+// Para cada arquivo de audio\CONFIG e audio\SFX: tamanho exato, CRC32 do arquivo inteiro e de cada bloco
+// de 64 MB (lidos do jeito simples). Depois, nos arquivos de SFX, le 64 trechos de cada um tambem do jeito
+// que o jogo le (FILE_FLAG_OVERLAPPED + NO_BUFFERING, posicao no OVERLAPPED, sem evento) e compara com a
+// leitura simples: se divergir, quem le errado e o sistema (Madeira/Wine), nao o arquivo.
+static uint32_t g_crcTab[256];
+static void CrcInit() {
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+        g_crcTab[i] = c;
+    }
+}
+static uint32_t CrcAdd(uint32_t c, const unsigned char* p, DWORD n) {
+    c = ~c;
+    while (n--) c = g_crcTab[(c ^ *p++) & 0xFF] ^ (c >> 8);
+    return ~c;
+}
+
+static void HashOneFile(const wchar_t* path, const char* shown) {
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { Log("audio: %s nao abriu (erro %lu)", shown, GetLastError()); return; }
+    LARGE_INTEGER sz; GetFileSizeEx(h, &sz);
+    const DWORD BUF = 1 << 20;
+    const long long BLOCK = 64ll << 20;
+    unsigned char* b = (unsigned char*)VirtualAlloc(nullptr, BUF, MEM_COMMIT, PAGE_READWRITE);
+    uint32_t whole = 0, blk = 0; long long done = 0, inBlk = 0; DWORD t0 = GetTickCount();
+    char blocks[1600]; int bo = 0; blocks[0] = 0;
+    for (;;) {
+        DWORD got = 0;
+        if (!ReadFile(h, b, BUF, &got, nullptr)) { Log("audio: %s erro de leitura %lu em %lld", shown, GetLastError(), done); break; }
+        if (!got) break;
+        whole = CrcAdd(whole, b, got);
+        DWORD off = 0;
+        while (off < got) {
+            long long room = BLOCK - inBlk; DWORD take = (long long)(got - off) < room ? (got - off) : (DWORD)room;
+            blk = CrcAdd(blk, b + off, take);
+            off += take; inBlk += take;
+            if (inBlk == BLOCK) {
+                if (bo < (int)sizeof blocks - 12) bo += snprintf(blocks + bo, sizeof blocks - bo, " %08X", blk);
+                blk = 0; inBlk = 0;
+            }
+        }
+        done += got;
+    }
+    if (inBlk && bo < (int)sizeof blocks - 12) bo += snprintf(blocks + bo, sizeof blocks - bo, " %08X", blk);
+    VirtualFree(b, 0, MEM_RELEASE);
+    CloseHandle(h);
+    Log("audio: %s tamanho %lld lidos %lld crc %08X (%lu ms) blocos de 64 MB:%s",
+        shown, sz.QuadPart, done, whole, GetTickCount() - t0, blocks);
+}
+
+// le o mesmo trecho dos dois jeitos e compara
+static void CompareReads(const wchar_t* path, const char* shown) {
+    HANDLE hs = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    HANDLE ho = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                            FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING, nullptr);
+    if (hs == INVALID_HANDLE_VALUE || ho == INVALID_HANDLE_VALUE) {
+        Log("audio: %s comparacao nao abriu (erro %lu)", shown, GetLastError());
+        if (hs != INVALID_HANDLE_VALUE) CloseHandle(hs);
+        if (ho != INVALID_HANDLE_VALUE) CloseHandle(ho);
+        return;
+    }
+    LARGE_INTEGER sz; GetFileSizeEx(hs, &sz);
+    const DWORD LEN = 32768;
+    unsigned char* a = (unsigned char*)VirtualAlloc(nullptr, LEN, MEM_COMMIT, PAGE_READWRITE);
+    unsigned char* o = (unsigned char*)VirtualAlloc(nullptr, LEN, MEM_COMMIT, PAGE_READWRITE);
+    long long sectors = sz.QuadPart / 2048;
+    int bad = 0, tested = 0; uint32_t seed = 12345;
+    for (int i = 0; i < 64 && sectors > 16; i++) {
+        long long sec;
+        if (i == 0) sec = 0;
+        else if (i == 1) sec = sectors - 16;
+        else { seed = seed * 1103515245u + 12345u; sec = (long long)(((unsigned long long)seed << 15 ^ (seed >> 3)) % (unsigned long long)(sectors - 16)); }
+        long long pos = sec * 2048;
+        LARGE_INTEGER li; li.QuadPart = pos;
+        SetFilePointerEx(hs, li, nullptr, FILE_BEGIN);
+        DWORD gs = 0; ReadFile(hs, a, LEN, &gs, nullptr);
+        memset(o, 0xCD, LEN);
+        OVERLAPPED ov = {}; ov.Offset = (DWORD)pos; ov.OffsetHigh = (DWORD)(pos >> 32);
+        DWORD go = 0;
+        BOOL ok = ReadFile(ho, o, LEN, &go, &ov);
+        DWORD err = ok ? 0 : GetLastError();
+        if (!ok && err == ERROR_IO_PENDING) { ok = GetOverlappedResult(ho, &ov, &go, TRUE); err = ok ? 0 : GetLastError(); }
+        tested++;
+        if (!ok || go != gs || memcmp(a, o, gs)) {
+            bad++;
+            if (bad <= 6) {
+                DWORD firstDiff = 0; while (firstDiff < gs && a[firstDiff] == o[firstDiff]) firstDiff++;
+                Log("audio: %s DIVERGE na posicao %lld: simples %lu bytes, como o jogo %lu bytes (ok=%d erro %lu), 1a diferenca no byte %lu",
+                    shown, pos, gs, go, ok, err, firstDiff);
+            }
+        }
+    }
+    VirtualFree(a, 0, MEM_RELEASE); VirtualFree(o, 0, MEM_RELEASE);
+    CloseHandle(hs); CloseHandle(ho);
+    Log("audio: %s leitura como o jogo: %d trechos testados, %d diferentes", shown, tested, bad);
+}
+
+static DWORD WINAPI AudioHashThread(LPVOID) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    Sleep(8000);
+    CrcInit();
+    wchar_t root[MAX_PATH]; GetModuleFileNameW(nullptr, root, MAX_PATH);
+    wchar_t* sl = wcsrchr(root, L'\\'); if (sl) sl[1] = 0;
+    Log("audio: conferencia dos arquivos de audio comecou (a leitura roda em segundo plano)");
+    DWORD t0 = GetTickCount();
+    static const wchar_t* dirs[] = { L"audio\\CONFIG\\", L"audio\\SFX\\" };
+    for (int pass = 0; pass < 2; pass++) {
+        for (const wchar_t* d : dirs) {
+            if (pass == 1 && d == dirs[0]) continue;
+            wchar_t pat[MAX_PATH]; _snwprintf(pat, MAX_PATH, L"%s%s*", root, d);
+            WIN32_FIND_DATAW fd; HANDLE f = FindFirstFileW(pat, &fd);
+            if (f == INVALID_HANDLE_VALUE) { Log("audio: pasta nao encontrada (erro %lu)", GetLastError()); continue; }
+            // em ordem alfabetica, para os dois logs ficarem na mesma ordem
+            wchar_t names[64][MAX_PATH]; int n = 0;
+            do {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                if (n < 64) wcscpy(names[n++], fd.cFileName);
+            } while (FindNextFileW(f, &fd));
+            FindClose(f);
+            for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++)
+                if (_wcsicmp(names[j], names[i]) < 0) { wchar_t t[MAX_PATH]; wcscpy(t, names[i]); wcscpy(names[i], names[j]); wcscpy(names[j], t); }
+            for (int i = 0; i < n; i++) {
+                wchar_t full[MAX_PATH]; _snwprintf(full, MAX_PATH, L"%s%s%s", root, d, names[i]);
+                char shown[MAX_PATH]; char dn[32];
+                WideCharToMultiByte(CP_UTF8, 0, d, -1, dn, sizeof dn, nullptr, nullptr);
+                char nn[MAX_PATH]; WideCharToMultiByte(CP_UTF8, 0, names[i], -1, nn, sizeof nn, nullptr, nullptr);
+                snprintf(shown, sizeof shown, "%s%s", dn, nn);
+                if (pass == 0) HashOneFile(full, shown); else CompareReads(full, shown);
+            }
+        }
+    }
+    Log("audio: conferencia terminou em %lu s", (GetTickCount() - t0) / 1000);
+    return 0;
+}
+
 // fora do DllMain (sem o loader lock): ganchos do MinHook e XInput logo no inicio,
 // para o menu principal e o de pausa ja terem controles
 static DWORD WINAPI StartupThread(LPVOID) {
@@ -895,6 +1420,7 @@ static DWORD WINAPI StartupThread(LPVOID) {
     HookGame(0x588BE0, (void*)&SetHelpDetour, (void**)&g_origSetHelp, "do texto de ajuda");
     HookGame(0x588E30, (void*)&SetHelpNumDetour, (void**)&g_origSetHelpNum, "do texto de ajuda com numero");
     InstallXInputHooks();
+    if (g_audioHash) { HANDLE t = CreateThread(nullptr, 0, AudioHashThread, nullptr, 0, nullptr); if (t) CloseHandle(t); }
     return 0;
 }
 
@@ -912,6 +1438,11 @@ static void LoadConfig(HMODULE self) {
     g_releaseMs = GetPrivateProfileIntA("Steer", "ReleaseMs", 60,  ini);
     g_touchOn   = GetPrivateProfileIntA("Touch", "Enabled",   1,   ini);
     g_log       = GetPrivateProfileIntA("Debug", "Log",       1,   ini);
+    g_traceTouch   = GetPrivateProfileIntA("Debug", "TouchTrace",   0, ini);
+    g_traceRagdoll = GetPrivateProfileIntA("Debug", "RagdollTrace", 0, ini);
+    g_countRagdoll = GetPrivateProfileIntA("Debug", "RagdollCount", 0, ini);
+    g_audioHash    = GetPrivateProfileIntA("Debug", "AudioHash",    0, ini);
+    g_fixX87       = GetPrivateProfileIntA("Fixes", "X87",          1, ini);
     g_saveSlot  = GetPrivateProfileIntA("Save",  "Slot",      8,   ini);
     g_autosaveMin  = GetPrivateProfileIntA("Save", "AutosaveMinutes", 5, ini);
     g_afterMission = GetPrivateProfileIntA("Save", "AfterMission",    1, ini);
@@ -939,12 +1470,13 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     InitializeCriticalSection(&g_hookCs);
     LoadConfig(inst);
     QueryPerformanceFrequency(&g_qpf);
-    Log("GTMTouchSA 3.0 carregado (direcao=%d rampa=%d retorno=%d toque=%d sim/nao por script=%d)",
-        g_steerOn, g_rampMs, g_releaseMs, g_touchOn, g_ynScripts);
+    Log("GTMTouchSA 3.6 carregado (direcao=%d rampa=%d retorno=%d toque=%d sim/nao por script=%d diag toque=%d ragdoll=%d contagem=%d audio=%d x87=%d)",
+        g_steerOn, g_rampMs, g_releaseMs, g_touchOn, g_ynScripts, g_traceTouch, g_traceRagdoll, g_countRagdoll, g_audioHash, g_fixX87);
     if (GetModuleHandleA("GTMSteerSA.asi")) Log("AVISO: GTMSteerSA.asi tambem esta carregado; apague ele da pasta scripts");
     if (!IsSupportedExe()) { Log("executavel nao e o 1.0 US: nada foi alterado"); return TRUE; }
     OpenShared();
     InstallFrameHook();
+    if (g_fixX87) ApplyX87Fixes();
     g_mhReady = (MH_Initialize() == MH_OK);
     if (!g_mhReady) { Log("MinHook nao iniciou"); return TRUE; }
     HANDLE t = CreateThread(nullptr, 0, StartupThread, nullptr, 0, nullptr);

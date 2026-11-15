@@ -14,5 +14,7 @@ Overlay de toque contextual para o GTA San Andreas (PC 1.0 US) rodando no Madeir
   iPhone), entregando ao GInput como um controle. Inclui a direção pelas setas, salvar na hora,
   autosave e o veículo salvo junto. Protocolo 3 (128 bytes).
 - `.github/workflows/build-ipa.yml`: baixa o Madeira, compila e injeta o dylib, publica o IPA numa Release.
+  Fonte padrao: o fork GTMoraes/Madeira (FEX de GTMoraes/FEX, branch gtm-x87pc: o x87 respeita a precisao
+  simples que o Direct3D 9 pede; `env.MADEIRA_X87_PC = 0` desliga). A fonte "oficial" usa willfaust/Madeira.
 
-Atualizar o Madeira: Actions > Madeira-GTM IPA > Run workflow (vazio = versão mais recente).
+Atualizar o Madeira: Actions > Madeira-GTM IPA > Run workflow (fonte fork ou oficial).
