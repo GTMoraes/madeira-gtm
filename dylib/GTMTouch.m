@@ -1,4 +1,4 @@
-// GTMTouch.dylib 3.0 - overlay de toque contextual para o GTA San Andreas no Madeira.
+// GTMTouch.dylib 3.1 - overlay de toque contextual para o GTA San Andreas no Madeira.
 //
 // Injetado no IPA oficial do Madeira. Desenha os controles por cima do jogo e troca o
 // conjunto de botoes sozinho conforme o contexto que o GTMTouchSA.asi escreve em
@@ -18,6 +18,11 @@
 //   Botoes que so aparecem em certas situacoes ficam visiveis (apagados) no editor.
 //   O layout fica em Documents/gtmtouch/layout.json, um por situacao.
 // - Salvar: botao "Salvar" manda o jogo salvar na hora; avisos de save aparecem no topo.
+//
+// 3.1: trocar de arma deslizando sobre o icone da arma do jogo (canto de cima a direita: para a
+// esquerda volta, para a direita ou um toque avanca); o botao TAB mostra os status do CJ e vira
+// telefone ou troca pela arma do chao quando o jogo pede; botoes do canto de cima a esquerda
+// abriram espaco para o radar, que o GTMTouchSA 3.8 desenha no alto.
 //
 // Sem jogo rodando o overlay some e todo toque passa direto para o Madeira. No menu e na
 // cutscene so os botoes recebem toque; o resto da tela continua sendo do Madeira.
@@ -61,6 +66,7 @@ enum {
     S_VEHNEAR = 1u << 5, S_FIRE = 1u << 6, S_FIRE2 = 1u << 7, S_NITRO = 1u << 8, S_HYDRAULICS = 1u << 9,
     S_SUBMISSION = 1u << 10, S_GROUP = 1u << 11, S_TARGETPED = 1u << 12, S_ARMED = 1u << 13,
     S_REMOTE = 1u << 14, S_GROUPMEMBERS = 1u << 15, S_DRIVEBY = 1u << 16,
+    S_ACTPHONE = 1u << 17, S_ACTWEAPON = 1u << 18, S_ACTOTHER = 1u << 19,
 };
 #define S_CANSAVE 0x80000000u
 // .asi 2.0 nao manda estado: mostra o que a 2.0 mostrava
@@ -74,7 +80,7 @@ enum {
     B_STKUP = 0x100000, B_STKDN = 0x200000      // analogico esquerdo para cima/baixo, com rampa (cruz das aeronaves)
 };
 enum { CMD_NONE = 0, CMD_SAVE = 1, CMD_DETONATE = 2, CMD_SATCHEL = 3 };
-enum { DYN_NONE = 0, DYN_WEAPON, DYN_VEHICLE, DYN_GROUP };
+enum { DYN_NONE = 0, DYN_WEAPON, DYN_VEHICLE, DYN_GROUP, DYN_ACTION };
 
 // ------------------------------------------------------------------ layouts padrao
 // Posicoes em pontos numa tela de referencia de 874 x 402 (iPhone 6,3" deitado); d = diametro.
@@ -83,6 +89,7 @@ typedef struct {
     const char *key, *label, *icon, *badge;
     uint32_t bits;
     uint8_t cmd, dyn;
+    uint8_t swipe;                  // area de deslizar (invisivel no jogo): esquerda = LT, direita/toque = RT
     uint32_t need, lit;
     double x, y, d;
 } GTMBtnDef;
@@ -90,7 +97,7 @@ static const double kRefW = 874.0, kRefH = 402.0;
 
 #define CAM_BTN   {.key = "cam",   .label = "Câmera", .icon = "cam-toggle", .bits = B_BACK, .x = 390, .y = 112, .d = 51}
 #define PAUSE_BTN {.key = "pause", .label = "Pausa",  .bits = B_START, .x = 484, .y = 112, .d = 51}
-#define SAVE_BTN  {.key = "save",  .label = "Salvar", .cmd = CMD_SAVE, .lit = S_CANSAVE, .x = 165, .y = 58, .d = 40}
+#define SAVE_BTN  {.key = "save",  .label = "Salvar", .cmd = CMD_SAVE, .lit = S_CANSAVE, .x = 300, .y = 58, .d = 40}
 #define YESNO_AT(yy) \
     {.key = "no",  .label = "Não", .icon = "hud_x",     .bits = B_RAWL, .need = S_YESNO, .x = 220, .y = yy, .d = 44}, \
     {.key = "yes", .label = "Sim", .icon = "hud_check", .bits = B_RAWR, .need = S_YESNO, .x = 280, .y = yy, .d = 44}
@@ -119,7 +126,7 @@ static const double kRefW = 874.0, kRefH = 402.0;
     {.key = "handbrake", .label = "Freio de\nmão", .icon = "handbrake", .bits = B_RB, .x = 765, .y = 225, .d = 58}, \
     {.key = "fire",  .label = "Atirar", .icon = "shoot",        .bits = B_B, .need = S_FIRE, .x = 665, .y = 240, .d = 54}, \
     {.key = "exit",  .label = "Sair",   .icon = "enterandexit", .bits = B_Y,  .x = 770, .y = 140, .d = 54}, \
-    {.key = "mission", .label = "Missão", .icon = "mission_start", .bits = B_R3, .need = S_SUBMISSION, .x = 110, .y = 150, .d = 46}, \
+    {.key = "mission", .label = "Missão", .icon = "mission_start", .bits = B_R3, .need = S_SUBMISSION, .x = 110, .y = 165, .d = 46}, \
     RADIO_BTNS, YESNO_AT(165), CAM_BTN, PAUSE_BTN, SAVE_BTN
 
 static const GTMBtnDef kFoot[] = {
@@ -128,12 +135,11 @@ static const GTMBtnDef kFoot[] = {
     {.key = "jump",   .label = "Pular",   .icon = "menu_up", .bits = B_X, .x = 680, .y = 255, .d = 61},
     ENTER_BTN,
     {.key = "aim",    .label = "Mirar",   .icon = "hud_lockon",  .bits = B_RB, .need = S_AIM,     .x = 765, .y = 150, .d = 54},
-    {.key = "wprev",  .label = "◀ Arma",  .icon = "hud_left",    .bits = B_LT, .need = S_WEAPONS, .x = 640, .y = 100, .d = 46},
-    {.key = "wnext",  .label = "Arma ▶",  .icon = "hud_swapgun", .bits = B_RT, .need = S_WEAPONS, .x = 730, .y = 100, .d = 46},
+    {.key = "wswipe", .label = "Trocar\narma", .swipe = 1, .need = S_WEAPONS, .x = 709, .y = 44, .d = 64},
     {.key = "detonate", .label = "Detonar",    .icon = "hud_detonator", .cmd = CMD_DETONATE, .need = S_DETONATE,    .x = 590, .y = 300, .d = 58},
     {.key = "satchel",  .label = "Jogar mais", .icon = "hud_bomb",      .cmd = CMD_SATCHEL,  .need = S_MORESATCHEL, .x = 590, .y = 225, .d = 54},
-    {.key = "action", .label = "Ação",    .icon = "hud_Cellphone", .bits = B_LB, .x = 110, .y = 140, .d = 51},
-    {.key = "crouch", .label = "Agachar", .icon = "crouch",        .bits = B_L3, .x = 110, .y = 200, .d = 51},
+    {.key = "action", .label = "Status",  .bits = B_LB, .dyn = DYN_ACTION, .x = 110, .y = 180, .d = 51},
+    {.key = "crouch", .label = "Agachar", .icon = "crouch",        .bits = B_L3, .x = 110, .y = 240, .d = 51},
     {.key = "follow", .label = "Recrutar", .icon = "LetsGoHand", .bits = B_UP,   .dyn = DYN_GROUP, .need = S_GROUP,     .x = 205, .y = 165, .d = 44},
     {.key = "stay",   .label = "Ficar",    .icon = "StopHand",   .bits = B_DOWN, .need = S_GROUPMEMBERS,                 .x = 265, .y = 165, .d = 44},
     YESNO_AT(100), CAM_BTN, PAUSE_BTN, SAVE_BTN,
@@ -369,7 +375,7 @@ typedef struct { double x, y, d; } GTMPlace;
     _ring.path = [UIBezierPath bezierPathWithOvalInRect:CGRectInset(b, -3, -3)].CGPath;
 }
 - (void)refresh {
-    self.hidden = _contextHidden && !_editing;
+    self.hidden = (_contextHidden || _def->swipe) && !_editing;
     CGFloat a = _dimmed ? 0.3 : (_pressed ? 1.0 : 0.78);
     self.alpha = _editing ? (_contextHidden ? 0.45 : 0.9) : a;
     self.transform = _pressed ? CGAffineTransformMakeScale(0.9, 0.9) : CGAffineTransformIdentity;
@@ -388,7 +394,7 @@ typedef struct { double x, y, d; } GTMPlace;
 @end
 
 // ------------------------------------------------------------------ overlay
-typedef enum { T_NONE = 0, T_BUTTON, T_LSTICK, T_RSTICK, T_EDIT } GTMTouchKind;
+typedef enum { T_NONE = 0, T_BUTTON, T_LSTICK, T_RSTICK, T_EDIT, T_SWIPE } GTMTouchKind;
 typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int button; CGPoint start, cur, grab; } GTMSlot;
 
 @interface GTMPadView : UIView
@@ -420,6 +426,8 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
     UIPinchGestureRecognizer *_pinch;                   // so ligado no editor
     double _pitch;                                      // rampa do ▲ ▼ das aeronaves (-1..1)
     CFTimeInterval _pitchTime;
+    uint32_t _pulseBits;                                // toque curto vindo do deslizar (troca de arma)
+    CFTimeInterval _pulseUntil;
 }
 
 - (instancetype)initWithFrame:(CGRect)frame {
@@ -558,6 +566,8 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
         case DYN_WEAPON:  return _weapon < 47 ? kWeaponIcon[_weapon] : NULL;
         case DYN_VEHICLE: return _nearVeh < 12 ? kVehicleIcon[_nearVeh] : NULL;
         case DYN_GROUP:   return (_state & S_TARGETPED) ? "FistBump" : NULL;
+        case DYN_ACTION:  return (_state & S_ACTWEAPON) ? "hud_swapgun" : (_state & S_ACTPHONE) ? "hud_Cellphone"
+                               : (_state & S_ACTOTHER) ? "hud_check" : NULL;     // sem pedido: texto "Status"
         default:          return NULL;
     }
 }
@@ -580,7 +590,7 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
 - (void)layoutSubviews {
     [super layoutSubviews];
     for (GTMButtonView *v in _buttons) v.frame = [self rectForPlace:v.place];
-    GTMPlace pp = { 95, 58, 34 };
+    GTMPlace pp = { 240, 58, 34 };
     _pencil.frame = [self rectForPlace:pp];
     _pencil.layer.cornerRadius = _pencil.bounds.size.width / 2;
     _pencil.hidden = _editing || !_live;
@@ -663,7 +673,9 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
         GTMSlot *s = [self slotFor:t create:YES];
         if (!s) continue;
         s->touch = t; s->start = p; s->cur = p;
-        if (b >= 0) {
+        if (b >= 0 && _buttons[b].def->swipe) {
+            s->kind = T_SWIPE; s->button = b;
+        } else if (b >= 0) {
             s->kind = T_BUTTON; s->button = b; [_haptic impactOccurred];
             uint8_t cmd = _buttons[b].def->cmd;
             if (cmd) { _cmdSeq++; _hostCmd = cmd; }
@@ -696,7 +708,14 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
 - (void)endTouches:(NSSet<UITouch *> *)touches {
     for (UITouch *t in touches) {
         GTMSlot *s = [self slotFor:t create:NO];
-        if (s) { s->kind = T_NONE; s->touch = nil; }
+        if (!s) continue;
+        if (s->kind == T_SWIPE) {                       // para a esquerda volta a arma; direita ou toque avanca
+            CGFloat dx = s->cur.x - s->start.x;
+            _pulseBits = (dx < -18 * [self sy]) ? B_LT : B_RT;
+            _pulseUntil = CACurrentMediaTime() + 0.12;
+            [_haptic impactOccurred];
+        }
+        s->kind = T_NONE; s->touch = nil;
     }
     [self refreshPressed];
 }
@@ -877,6 +896,7 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
         uint32_t bits = 0;
         for (int s = 0; s < 12; s++)
             if (_slots[s].kind == T_BUTTON && _slots[s].button < (int)_buttons.count) bits |= _buttons[_slots[s].button].def->bits;
+        if (now < _pulseUntil) bits |= _pulseBits;
         h.buttons = (uint16_t)(bits & 0xFFFF);
         h.lt = (bits & B_LT) ? 255 : 0;
         h.rt = (bits & B_RT) ? 255 : 0;
@@ -948,7 +968,7 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
     self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(frame:)];
     self.link.preferredFrameRateRange = CAFrameRateRangeMake(30, 60, 60);
     [self.link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
-    NSLog(@"[GTMTouch] overlay 3.0 ligado; arquivo %@", GTMSharedPath());
+    NSLog(@"[GTMTouch] overlay 3.1 ligado; arquivo %@", GTMSharedPath());
 }
 - (void)frame:(CADisplayLink *)l { [self.pad tick]; }
 - (void)sceneEvent:(NSNotification *)n { [self attachIfNeeded]; }

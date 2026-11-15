@@ -1,4 +1,4 @@
-// GTMTouchSA.asi 3.6 - controles de toque contextuais para GTA San Andreas 1.0 US no Madeira
+// GTMTouchSA.asi 3.8 - controles de toque contextuais para GTA San Andreas 1.0 US no Madeira
 //
 // 1) Contexto: a cada quadro escreve em C:\gtmtouch.bin em que situacao o CJ esta (a pe,
 //    nadando, de jetpack, carro, moto, helicoptero, aviao, barco, passageiro, cutscene,
@@ -40,10 +40,10 @@
 
 // ---------------------------------------------------------------- configuracao e log
 static int  g_steerOn = 1, g_rampMs = 150, g_releaseMs = 60, g_touchOn = 1, g_log = 1;
-static int  g_traceTouch = 0, g_traceRagdoll = 0, g_countRagdoll = 0, g_audioHash = 0, g_fixX87 = 1;     // diagnosticos ([Debug] TouchTrace / RagdollTrace)
+static int  g_traceTouch = 0, g_traceRagdoll = 0, g_countRagdoll = 0, g_audioHash = 0, g_fixX87 = 1, g_skipIntro = 1, g_radarTop = 16, g_weaponGuard = 1;     // diagnosticos ([Debug] TouchTrace / RagdollTrace)
 static int  g_saveSlot = 8, g_autosaveMin = 5, g_afterMission = 1, g_keepVehicle = 1;
 static int  g_ynScripts = 1;
-static char g_ignoreScripts[512];                       // minusculas, ",nome,nome,"
+static char g_ignoreScripts[512], g_ignoreTabScripts[512];                       // minusculas, ",nome,nome,"
 static char g_dir[MAX_PATH];
 
 static short g_missionModels[64], g_fireModels[64], g_fire2Models[32];
@@ -143,6 +143,9 @@ enum State : DWORD {
     S_REMOTE       = 1u << 14,  // dirigindo um veiculo de controle remoto
     S_GROUPMEMBERS = 1u << 15,
     S_DRIVEBY      = 1u << 16,  // da para atirar da janela (olhar para o lado + B)
+    S_ACTPHONE     = 1u << 17,  // o TAB (acao) atende o telefone
+    S_ACTWEAPON    = 1u << 18,  // o TAB troca pela arma do chao
+    S_ACTOTHER     = 1u << 19,  // o jogo pede o TAB para outra coisa (comprar, presente, foto...)
 };
 
 struct Info { int ctx; DWORD state; BYTE weapon, nearVeh; };
@@ -246,9 +249,21 @@ static const char  kWhyScript[] = "script";
 static bool HelpHasYesNo(const char* t) {
     return t && (strstr(t, "CONVERSATION_YES") || strstr(t, "CONVERSATION_NO"));
 }
+// textos que pedem o TAB (~k~~PED_ANSWER_PHONE~): telefone, trocar pela arma do chao, ou outra coisa
+static volatile DWORD g_helpAct = 0, g_helpActTick = 0;
+static bool HasWord(const char* t, const char* w) {          // sem diferenciar maiusculas
+    size_t n = strlen(w);
+    for (; *t; t++) if (!_strnicmp(t, w, n)) return true;
+    return false;
+}
 static void NoteHelp(const char* text, bool permanent) {
     if (HelpHasYesNo(text)) { g_helpYN = true; g_helpYNPerm = permanent; g_helpYNTick = GetTickCount(); }
     else g_helpYN = false;
+    if (text && strstr(text, "PED_ANSWER_PHONE")) {
+        DWORD kind = HasWord(text, "phone") ? S_ACTPHONE : HasWord(text, "weapon") ? S_ACTWEAPON : S_ACTOTHER;
+        if (kind != g_helpAct) Log("acao: o jogo pede o TAB (%s)", kind == S_ACTPHONE ? "telefone" : kind == S_ACTWEAPON ? "trocar arma" : "outro");
+        g_helpAct = kind; g_helpActTick = GetTickCount();
+    } else g_helpAct = 0;
 }
 
 typedef void (__cdecl* SetHelp_t)(const char*, bool, bool, bool);
@@ -284,10 +299,28 @@ static void NoteScriptYesNo(const char* script) {
 // retorna int: o EAX do original passa inteiro (o chamador pode testar o registrador todo)
 typedef int (__thiscall* GetPadState_t)(void*, int, int);
 static GetPadState_t g_origGetPadState = nullptr;
+// scripts que leem o TAB (IS_BUTTON_PRESSED 0 LEFTSHOULDER1): telefone tocando e afins
+static volatile DWORD g_scriptTabTick = 0;
+static char g_loggedTab[32][9];
+static int  g_nLoggedTab = 0;
+static void NoteScriptTab(const char* script) {
+    char name[9] = "";
+    if (script) { memcpy(name, script + 8, 8); name[8] = 0; }
+    for (char* c = name; *c; c++) *c = (char)tolower((unsigned char)*c);
+    if (name[0]) {
+        char key[12]; snprintf(key, sizeof key, ",%s,", name);
+        if (strstr(g_ignoreTabScripts, key)) return;
+    }
+    g_scriptTabTick = GetTickCount();
+    for (int i = 0; i < g_nLoggedTab; i++) if (!strcmp(g_loggedTab[i], name)) return;
+    if (g_nLoggedTab < 32) { strcpy(g_loggedTab[g_nLoggedTab++], name); Log("script '%s' le o TAB (acao)", name); }
+}
+
 static int __fastcall GetPadStateDetour(void* self, void* /*edx*/, int pad, int button) {
     int r = g_origGetPadState(self, pad, button);
     int b = button & 0xFFFF;
     if (g_ynScripts && (pad & 0xFFFF) == 0 && (b == 10 || b == 11)) NoteScriptYesNo((const char*)self);
+    if ((pad & 0xFFFF) == 0 && b == 4) NoteScriptTab((const char*)self);
     return r;
 }
 
@@ -390,6 +423,12 @@ static void ComputeInfo(Info& in) {
     if (active != 0) in.state |= S_ARMED;
     if (active != 40 && active != 44 && active != 45 && active != 46) in.state |= S_AIM;
     if (YesNoPending()) in.state |= S_YESNO;
+    {
+        DWORD now = GetTickCount();
+        bool shown = *(volatile char*)0xBAA480 != 0;                          // CHud::m_pHelpMessageToPrint
+        if (g_helpAct && shown && now - g_helpActTick < 20000) in.state |= g_helpAct;
+        else if (g_scriptTabTick && now - g_scriptTabTick < 600) in.state |= S_ACTPHONE;   // script esperando o TAB
+    }
     bool driveByWeapon = (active == 28 || active == 29 || active == 32) && activeAmmo > 0 && Rd<BYTE>(info, 0x153);   // m_bCanDoDriveBy
 
     char* remote = Rd<char*>(info, 0xB0);                                     // m_pRemoteVehicle
@@ -1150,6 +1189,7 @@ static Void_t g_origFrameCall = nullptr;
 static const DWORD kFrameCall = 0x53C077;              // CALL CCranes::UpdateCranes em CGame::Process (todo quadro sem pausa)
 static bool g_firstFrame = true, g_fallbackNoted = false, g_lastYN = false;
 
+static void WeaponGuardTick();
 static void __cdecl FrameTick() {
     if (g_origFrameCall) g_origFrameCall();
     if (g_firstFrame) {                                 // reserva, se a thread de inicio nao conseguiu
@@ -1160,6 +1200,7 @@ static void __cdecl FrameTick() {
     }
     ComputeInfo(g_info);
     g_ctxCache = g_info.ctx;
+    if (g_weaponGuard) WeaponGuardTick();
     if (g_info.ctx != g_lastCtx) { Log("contexto: %s", g_info.ctx >= 0 && g_info.ctx <= CTX_CUTSCENE ? kCtxName[g_info.ctx] : "?"); g_lastCtx = g_info.ctx; }
     bool yn = (g_info.state & S_YESNO) != 0;
     if (yn != g_lastYN) {
@@ -1198,6 +1239,174 @@ static void HookGame(DWORD addr, void* detour, void** orig, const char* what) {
         Log("falha no gancho %s (0x%X)", what, addr);
 }
 
+// ---------------------------------------------------------------- radar no alto ([Hud] RadarTop=16)
+// O jogo desenha o radar a SCREEN_HEIGHT - 104 * (altura/448) (a borda de cima do radar, 104 unidades
+// acima do fundo numa tela de 448). Como SCREEN_HEIGHT = 448 unidades, trocar 104 por (448 - T) poe a
+// borda de cima a T unidades do topo. O 104.0f (0x866B70) tambem serve ao nome do bairro, ao nome do
+// veiculo e ao "pular viagem" (canto de baixo a direita), entao so as instrucoes do radar passam a ler
+// um float nosso: CRadar::TransformRadarPointToScreenSpace (mapa, icones, norte) e CHud::DrawRadar
+// (moldura, aro do aviao, altimetro). O painel de status do TAB (CHud::DrawVitalStats, 140 do fundo,
+// 0x865374, que tambem e usado em outro lugar) vai para logo abaixo do radar.
+static float g_radarK = 104.0f, g_statsK = 140.0f;
+// tudo ou nada: se algum ponto nao for o original (outro mod mexeu), nao muda nenhum, para o radar nao
+// ficar com metade em cima e metade embaixo
+static int PatchFloatRefs(const DWORD* sites, int n, DWORD oldAddr, float* newVar) {
+    for (int i = 0; i < n; i++) {
+        BYTE* p = (BYTE*)sites[i];
+        bool op = (p[0] == 0xD8 && p[1] == 0x0D) || (p[0] == 0xD9 && p[1] == 0x05);   // fmul / fld dword [abs]
+        if (!op || *(DWORD*)(p + 2) != oldAddr) { Log("radar: 0x%X nao e o codigo original; nada foi mudado neste grupo", sites[i]); return 0; }
+    }
+    int ok = 0;
+    for (int i = 0; i < n; i++) {
+        BYTE* p = (BYTE*)sites[i];
+        DWORD old; VirtualProtect(p + 2, 4, PAGE_EXECUTE_READWRITE, &old);
+        *(DWORD*)(p + 2) = (DWORD)newVar;
+        VirtualProtect(p + 2, 4, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), p, 6);
+        ok++;
+    }
+    return ok;
+}
+static void ApplyRadarTop(int top) {
+    if (top < 0) top = 0;
+    if (top > 300) top = 300;
+    g_radarK = 448.0f - (float)top;
+    g_statsK = 448.0f - (float)(top + 84);                     // radar tem 76 de altura + folga
+    static const DWORD radarSites[] = { 0x5834FE, 0x58A497, 0x58A60C, 0x58A71C, 0x58A7C5, 0x58A866, 0x58A911, 0x58A9C5 };
+    static const DWORD statsSites[] = { 0x589799, 0x58981B, 0x58984D, 0x5898C5 };
+    int r = PatchFloatRefs(radarSites, 8, 0x866B70, &g_radarK);
+    int st = PatchFloatRefs(statsSites, 4, 0x865374, &g_statsK);
+    Log("radar: no alto (borda a %d de 448), %d/8 pontos do radar e %d/4 do painel de status", top, r, st);
+}
+
+// ---------------------------------------------------------------- pular os videos de abertura ([Fixes] SkipIntro=1)
+// O laco principal (0x748A90) passa pelos estados 1 a 4: toca movies\Logo.mpg, espera acabar ou uma tecla,
+// toca movies\GTAtitles.mpg e espera de novo. Sem os arquivos, o video nunca "acaba" e o jogo fica parado
+// esperando um toque. O estado 1 passa a ir direto para o 5 (inicializacao e menu), sem tocar nada.
+static void ApplySkipIntro() {
+    static const BYTE orig[] = { 0x39,0x1D,0xCC,0x20,0xC9,0x00, 0x75,0x0E, 0x68,0x04,0x4C,0x87,0x00, 0x56, 0xE8 };
+    BYTE repl[15];
+    repl[0] = 0xC7; repl[1] = 0x05; *(DWORD*)(repl + 2) = 0xC8D4C0; *(DWORD*)(repl + 6) = 5;  // mov [gGameState], 5
+    repl[10] = 0xE9; *(int*)(repl + 11) = (int)(0x748DA3 - (0x748AF2 + 15));                    // jmp fim do switch
+    if (memcmp((void*)0x748AF2, orig, sizeof orig)) { Log("abertura: codigo em 0x748AF2 nao e o original, nao mexi"); return; }
+    DWORD old; VirtualProtect((void*)0x748AF2, sizeof repl, PAGE_EXECUTE_READWRITE, &old);
+    memcpy((void*)0x748AF2, repl, sizeof repl);
+    VirtualProtect((void*)0x748AF2, sizeof repl, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void*)0x748AF2, sizeof repl);
+    Log("abertura: videos pulados (direto para o menu)");
+}
+
+
+// ---------------------------------------------------------------- protecao da arma ([Fixes] WeaponGuard=1)
+// Se o modelo de uma arma do CJ ou o pacote de animacoes dela sai da memoria, o icone some, o CJ fica de
+// maos vazias e, ao mirar, o jogo trava: CAnimBlendAssocGroup::GetAnimation (0x4CE090) devolve um ponteiro
+// a partir de zero e CAnimManager::BlendAnimation le o endereco 0xA (0x4D464E).
+// 1) GetAnimation e CopyAnimation de um grupo que nao esta na memoria passam a devolver a animacao parada do grupo padrao
+//    (que esta sempre carregado) em vez de um ponteiro invalido, e anota o grupo.
+// 2) A cada quadro: pede de novo ao jogo o pacote anotado e os modelos das armas do CJ que estiverem fora
+//    da memoria; quando o modelo da arma na mao volta, poe a arma de volta na mao.
+static volatile BYTE g_animMiss[256];
+static volatile int  g_animMissAny = 0;
+extern "C" void* __cdecl AnimMiss(char* group, int id) {
+    char* base = *(char**)0xB4EA34;                                   // CAnimManager::ms_aAnimAssocGroups
+    int g = base ? (int)(group - base) / 0x14 : -1;
+    if (g >= 0 && g < 256) { g_animMiss[g] = 1; g_animMissAny = 1; }
+    if (base) {
+        char* a0 = *(char**)(base + 4); int n0 = *(int*)(base + 8), off0 = *(int*)(base + 0xC);
+        int i = 3 - off0;                                              // ANIM_ID_IDLE do grupo padrao
+        if (a0 && i >= 0 && i < n0) return a0 + i * 0x14;
+    }
+    return (char*)0 + (id - *(int*)(group + 0xC)) * 0x14;              // como o original
+}
+extern "C" void AnimGetStub();
+asm(".text\n.globl _AnimGetStub\n_AnimGetStub:\n"
+    "  movl 4(%ecx), %eax\n  testl %eax, %eax\n  jz 1f\n"
+    "  movl 4(%esp), %edx\n  subl 12(%ecx), %edx\n  leal (%edx,%edx,4), %edx\n  leal (%eax,%edx,4), %eax\n  ret $4\n"
+    "1:\n  pushl 4(%esp)\n  pushl %ecx\n  call _AnimMiss\n  addl $8, %esp\n  ret $4\n");
+
+static bool PatchBytes(DWORD addr, const BYTE* expect, int nExpect, const BYTE* repl, int nRepl, const char* what);
+static void ApplyWeaponGuard() {
+    static const BYTE orig[] = { 0x8B,0x51,0x0C, 0x8B,0x44,0x24,0x04, 0x8B,0x49,0x04, 0x2B,0xC2, 0x8D,0x04,0x80, 0x8D,0x04,0x81, 0xC2,0x04,0x00 };
+    BYTE repl[5]; repl[0] = 0xE9; *(int*)(repl + 1) = (int)((DWORD)&AnimGetStub - (0x4CE090 + 5));
+    if (!PatchBytes(0x4CE090, orig, sizeof orig, repl, sizeof repl, "arma: protecao das animacoes (GetAnimation)")) return;
+    // CAnimBlendAssocGroup::CopyAnimation (0x4CE130) faz a mesma conta por dentro: passa a usar a de cima
+    static const BYTE orig2[] = { 0x8B,0x51,0x0C, 0x8B,0x49,0x04, 0x2B,0xC2, 0x8D,0x04,0x80, 0x56, 0x8D,0x34,0x81 };
+    BYTE r2[9];
+    r2[0] = 0x56;                                                      // push esi
+    r2[1] = 0x50;                                                      // push eax (id)
+    r2[2] = 0xE8; *(int*)(r2 + 3) = (int)((DWORD)&AnimGetStub - (0x4CE149 + 2 + 5));   // call (ecx = grupo)
+    r2[7] = 0x89; r2[8] = 0xC6;                                        // mov esi, eax
+    PatchBytes(0x4CE149, orig2, sizeof orig2, r2, sizeof r2, "arma: protecao das animacoes (CopyAnimation)");
+}
+
+typedef int  (__cdecl *AnimBlockIndex_t)(const char* name);
+static const AnimBlockIndex_t GameAnimBlockIndex = (AnimBlockIndex_t)0x4D3990;  // CAnimManager::GetAnimationBlockIndex
+static bool ModelLoaded(int m) { return *(volatile BYTE*)(0x8E4CC0 + m * 0x14 + 0x10) == 1; }   // ms_aInfoForModel[m].m_nLoadState
+static const int kKeep = 0x02 | 0x10;                                    // GAME_REQUIRED | PRIORITY_REQUEST
+
+static void AddWeaponModel(char* ped, int model) {
+    __asm__ volatile("pushl %1\n\tcall *%2" : "+c"(ped) : "r"(model), "r"((DWORD)0x5E5ED0) : "eax", "edx", "memory");
+}
+
+static DWORD g_animMissLog[256], g_weapReq[64], g_weapSince[64];
+static int   g_weapFix = 0;                                              // tipo da arma esperando voltar para a mao
+
+static void WeaponGuardTick() {
+    DWORD now = GetTickCount();
+    if (g_animMissAny) {
+        g_animMissAny = 0;
+        for (int g = 0; g < 256; g++) {
+            if (!g_animMiss[g]) continue;
+            g_animMiss[g] = 0;
+            const char* block = (const char*)(0x8AA5B8 + g * 0x30);       // ms_aAnimAssocDefinitions[g].blockName
+            int idx = GameAnimBlockIndex(block);
+            bool loaded = idx >= 0 && *(volatile BYTE*)(0xB5D4B0 + idx * 0x20);   // ms_aAnimBlocks[idx].bLoaded
+            if (idx >= 0 && !loaded) RequestModel(idx + 25575, kKeep);
+            if (now - g_animMissLog[g] > 10000 || !g_animMissLog[g]) {
+                g_animMissLog[g] = now;
+                Log("arma: o jogo pediu as animacoes do grupo %d (%.16s) sem elas estarem na memoria; usei a animacao parada no lugar%s",
+                    g, block, idx >= 0 && !loaded ? " e pedi o pacote de novo" : "");
+            }
+        }
+    }
+    char* ped = PlayerPed();
+    if (!ped) return;
+    int cur = (signed char)Rd<BYTE>(ped, 0x718);                           // m_nActiveWeaponSlot
+    for (int slot = 0; slot < 13; slot++) {
+        int type = Rd<int>(ped, 0x5A0 + slot * 0x1C);                      // m_aWeapons[slot].m_eWeaponType
+        if (type <= 0 || type > 46) continue;
+        const char* info = (const char*)(0xC8AAB8 + type * 0x70);          // aWeaponInfo[type] (habilidade normal)
+        bool missing = false;
+        for (int k = 0; k < 2; k++) {
+            int m = *(const int*)(info + 0xC + k * 4);                     // m_nModelId1 / m_nModelId2
+            if (m > 0 && m < 20000 && !ModelLoaded(m)) missing = true;
+        }
+        if (!missing) { g_weapSince[type] = 0; g_weapReq[type] = 0; continue; }
+        if (!g_weapSince[type]) g_weapSince[type] = now;
+        if (now - g_weapSince[type] < 1000) continue;                       // logo depois de carregar o jogo e normal
+        if (slot == cur) g_weapFix = type;
+        if (g_weapReq[type] && now - g_weapReq[type] < 500) continue;
+        for (int k = 0; k < 2; k++) {
+            int m = *(const int*)(info + 0xC + k * 4);
+            if (m <= 0 || m >= 20000 || ModelLoaded(m)) continue;
+            if (!g_weapReq[type]) Log("arma: o modelo %d da arma %d (posicao %d) nao estava na memoria; pedi de novo", m, type, slot);
+            RequestModel(m, kKeep);
+        }
+        g_weapReq[type] = now;
+    }
+    if (g_weapFix && cur >= 0 && cur < 13) {
+        int type = Rd<int>(ped, 0x5A0 + cur * 0x1C);
+        if (type != g_weapFix) { g_weapFix = 0; return; }                  // trocou de arma: o jogo cuida
+        int m = *(const int*)(0xC8AAB8 + type * 0x70 + 0xC);
+        if (g_info.ctx != CTX_FOOT || m <= 0 || !ModelLoaded(m)) return;
+        if (!Rd<char*>(ped, 0x4F4) && !Rd<BYTE>(ped, 0x5A0 + cur * 0x1C + 0x15)) {   // m_pWeaponObject, m_bNoModel
+            AddWeaponModel(ped, m);
+            Log("arma: modelo da arma %d de volta na mao", type);
+        }
+        g_weapFix = 0;
+    }
+}
+
 // ---------------------------------------------------------------- precisao do x87 ([Fixes] X87=1)
 // No Windows, o Direct3D 9 poe o x87 do jogo em precisao simples (24 bits) e o jogo depende disso.
 // No iPhone o emulador (FEX) calcula com mais precisao e ignora esse ajuste. Dois lugares quebram:
@@ -1213,7 +1422,7 @@ static bool PatchBytes(DWORD addr, const BYTE* expect, int nExpect, const BYTE* 
     if (memcmp((void*)addr, expect, nExpect)) {
         char got[64]; int o = 0;
         for (int i = 0; i < nExpect && i < 16; i++) o += snprintf(got + o, sizeof got - o, "%02X", ((BYTE*)addr)[i]);
-        Log("x87: %s nao aplicada: codigo em 0x%X nao e o original (%s...)", what, addr, got);
+        Log("%s nao aplicada: codigo em 0x%X nao e o original (%s...)", what, addr, got);
         return false;
     }
     DWORD old;
@@ -1222,7 +1431,7 @@ static bool PatchBytes(DWORD addr, const BYTE* expect, int nExpect, const BYTE* 
     for (int i = nRepl; i < nExpect; i++) ((BYTE*)addr)[i] = 0x90;
     VirtualProtect((void*)addr, nExpect, old, &old);
     FlushInstructionCache(GetCurrentProcess(), (void*)addr, nExpect);
-    Log("x87: %s aplicada em 0x%X", what, addr);
+    Log("%s aplicada em 0x%X", what, addr);
     return true;
 }
 
@@ -1247,7 +1456,7 @@ static void ApplyX87Fixes() {
         0xB0,0x01,                      // mov  al, 1
         0x5E,                           // pop  esi
         0xC3 };                         // ret
-    PatchBytes(0x4D9D38, bankOrig, sizeof bankOrig, bankNew, sizeof bankNew, "correcao do som de missao");
+    PatchBytes(0x4D9D38, bankOrig, sizeof bankOrig, bankNew, sizeof bankNew, "x87: correcao do som de missao");
 
     // 2) clima: fst [esp+8] ; fcomp [InterpolationValue]  ->  call stub ; nop x5
     static BYTE* stub = nullptr;
@@ -1262,7 +1471,7 @@ static void ApplyX87Fixes() {
     FlushInstructionCache(GetCurrentProcess(), stub, sizeof stubCode);
     static const BYTE wOrig[] = { 0xD9,0x54,0x24,0x08, 0xD8,0x1D,0x0C,0x13,0xC8,0x00 };
     BYTE wNew[5]; wNew[0] = 0xE8; *(int*)(wNew + 1) = (int)((DWORD)stub - (0x72B89D + 5));
-    PatchBytes(0x72B89D, wOrig, sizeof wOrig, wNew, sizeof wNew, "correcao do clima");
+    PatchBytes(0x72B89D, wOrig, sizeof wOrig, wNew, sizeof wNew, "x87: correcao do clima");
 }
 
 // confere, na thread do jogo, se o x87 arredonda como no Windows
@@ -1443,6 +1652,9 @@ static void LoadConfig(HMODULE self) {
     g_countRagdoll = GetPrivateProfileIntA("Debug", "RagdollCount", 0, ini);
     g_audioHash    = GetPrivateProfileIntA("Debug", "AudioHash",    0, ini);
     g_fixX87       = GetPrivateProfileIntA("Fixes", "X87",          1, ini);
+    g_skipIntro    = GetPrivateProfileIntA("Fixes", "SkipIntro",    1, ini);
+    g_radarTop     = GetPrivateProfileIntA("Hud",   "RadarTop",     16, ini);
+    g_weaponGuard  = GetPrivateProfileIntA("Fixes", "WeaponGuard",  1, ini);
     g_saveSlot  = GetPrivateProfileIntA("Save",  "Slot",      8,   ini);
     g_autosaveMin  = GetPrivateProfileIntA("Save", "AutosaveMinutes", 5, ini);
     g_afterMission = GetPrivateProfileIntA("Save", "AfterMission",    1, ini);
@@ -1454,6 +1666,9 @@ static void LoadConfig(HMODULE self) {
     GetPrivateProfileStringA("YesNo", "IgnoreScripts", "", buf, sizeof buf, ini);
     snprintf(g_ignoreScripts, sizeof g_ignoreScripts, ",%s,", buf);
     for (char* c = g_ignoreScripts; *c; c++) { *c = (char)tolower((unsigned char)*c); if (*c == ' ' || *c == ';') *c = ','; }
+    GetPrivateProfileStringA("Action", "IgnoreScripts", "", buf, sizeof buf, ini);
+    snprintf(g_ignoreTabScripts, sizeof g_ignoreTabScripts, ",%s,", buf);
+    for (char* c = g_ignoreTabScripts; *c; c++) { *c = (char)tolower((unsigned char)*c); if (*c == ' ' || *c == ';') *c = ','; }
     GetPrivateProfileStringA("Vehicles", "MissionModels", kDefMission, buf, sizeof buf, ini);
     g_nMission = ParseList(buf, g_missionModels, 64);
     GetPrivateProfileStringA("Vehicles", "FireModels", kDefFire, buf, sizeof buf, ini);
@@ -1470,13 +1685,16 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     InitializeCriticalSection(&g_hookCs);
     LoadConfig(inst);
     QueryPerformanceFrequency(&g_qpf);
-    Log("GTMTouchSA 3.6 carregado (direcao=%d rampa=%d retorno=%d toque=%d sim/nao por script=%d diag toque=%d ragdoll=%d contagem=%d audio=%d x87=%d)",
-        g_steerOn, g_rampMs, g_releaseMs, g_touchOn, g_ynScripts, g_traceTouch, g_traceRagdoll, g_countRagdoll, g_audioHash, g_fixX87);
+    Log("GTMTouchSA 3.9 carregado (direcao=%d rampa=%d retorno=%d toque=%d sim/nao por script=%d diag toque=%d ragdoll=%d contagem=%d audio=%d x87=%d pular abertura=%d radar no alto=%d protecao da arma=%d)",
+        g_steerOn, g_rampMs, g_releaseMs, g_touchOn, g_ynScripts, g_traceTouch, g_traceRagdoll, g_countRagdoll, g_audioHash, g_fixX87, g_skipIntro, g_radarTop, g_weaponGuard);
     if (GetModuleHandleA("GTMSteerSA.asi")) Log("AVISO: GTMSteerSA.asi tambem esta carregado; apague ele da pasta scripts");
     if (!IsSupportedExe()) { Log("executavel nao e o 1.0 US: nada foi alterado"); return TRUE; }
     OpenShared();
     InstallFrameHook();
     if (g_fixX87) ApplyX87Fixes();
+    if (g_skipIntro) ApplySkipIntro();
+    if (g_radarTop > 0) ApplyRadarTop(g_radarTop);
+    if (g_weaponGuard) ApplyWeaponGuard();
     g_mhReady = (MH_Initialize() == MH_OK);
     if (!g_mhReady) { Log("MinHook nao iniciou"); return TRUE; }
     HANDLE t = CreateThread(nullptr, 0, StartupThread, nullptr, 0, nullptr);
