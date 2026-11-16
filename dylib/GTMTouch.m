@@ -1,4 +1,4 @@
-// GTMTouch.dylib 3.2 - overlay de toque contextual para o GTA San Andreas no Madeira.
+// GTMTouch.dylib 3.3 - overlay de toque contextual para o GTA San Andreas no Madeira.
 //
 // Injetado no IPA oficial do Madeira. Desenha os controles por cima do jogo e troca o
 // conjunto de botoes sozinho conforme o contexto que o GTMTouchSA.asi escreve em
@@ -25,6 +25,9 @@
 // abriram espaco para o radar, que o GTMTouchSA 3.8 desenha no alto.
 // 3.2: um toque no icone da arma, sem deslizar, recarrega a arma na mao quando o GTMTouchSA 3.12
 // diz que da (S_RELOAD); se nao precisar ou nao der, nao faz nada. A troca de arma fica so no deslizar.
+// 3.3: teclado para o GTMTouchSA 3.16 ("Trocar placa" da garagem). O jogo pede em [128..191] do arquivo
+// (GTMK: numero do pedido, titulo, texto atual); o overlay abre um alerta com o teclado do iPhone (ate 8
+// letras ou numeros, maiusculas) e responde em [192..255] (GTMA: 1 salvar, 2 cancelar). Protocolo 4.
 //
 // Sem jogo rodando o overlay some e todo toque passa direto para o Madeira. No menu e na
 // cutscene so os botoes recebem toque; o resto da tela continua sendo do Madeira.
@@ -52,7 +55,18 @@ typedef struct __attribute__((packed)) {
     uint16_t rawButtons, version;   // v3
     uint8_t pad[32];
 } GTMHostBlock;
+// teclado (protocolo 4): pedido do jogo em 128, resposta do overlay em 192
+typedef struct __attribute__((packed)) {
+    uint32_t magic, seq; uint8_t maxLen, kind, pad[2]; char title[32]; char text[16]; uint8_t pad2[4];
+} GTMKbRequest;
+typedef struct __attribute__((packed)) {
+    uint32_t magic, seq, result; char text[16]; uint8_t pad[36];
+} GTMKbAnswer;
 _Static_assert(sizeof(GTMGameBlock) == 64 && sizeof(GTMHostBlock) == 64, "layout");
+_Static_assert(sizeof(GTMKbRequest) == 64 && sizeof(GTMKbAnswer) == 64, "layout kb");
+static const uint32_t kKbReqMagic = 0x4B4D5447;  // "GTMK"
+static const uint32_t kKbAnsMagic = 0x414D5447;  // "GTMA"
+static const off_t kKbReqOffset = 128, kKbAnsOffset = 192;
 static const uint32_t kGameMagic = 0x544D5447;   // "GTMT"
 static const uint32_t kHostMagic = 0x484D5447;   // "GTMH"
 static const off_t kHostOffset = 64;
@@ -415,6 +429,11 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
     CAShapeLayer *_lBase, *_lKnob, *_rBase, *_rKnob;
     uint32_t _hostSeq, _lastGameSeq, _cmdSeq, _hostCmd, _lastSaveSeq;
     BOOL _saveSeqKnown;
+    uint32_t _kbSeq;                                    // pedido de teclado aberto (0 = nenhum)
+    uint32_t _kbDone;                                   // ultimo pedido respondido
+    UIAlertController *_kbAlert;
+    __weak UIWindow *_kbPrevKey;
+    int _kbMax;
     CFTimeInterval _lastGameChange;
     UIImpactFeedbackGenerator *_haptic;
     UIButton *_pencil;
@@ -838,6 +857,89 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
     [self.host presentViewController:a animated:YES completion:nil];
 }
 
+// ---- teclado pedido pelo jogo (placa da garagem)
+- (void)keyboardTick {
+    GTMKbRequest r = {0};
+    BOOL valid = pread(gFd, &r, sizeof r, kKbReqOffset) == sizeof r && r.magic == kKbReqMagic;
+    uint32_t seq = valid ? r.seq : 0;
+    if (_kbSeq && seq != _kbSeq) {                      // o jogo desistiu (ou outro pedido): fecha o alerta
+        [self closeKeyboardAlert];
+        _kbSeq = 0;
+    }
+    if (!seq || seq == _kbSeq || seq == _kbDone || self.host.presentedViewController) return;
+    _kbSeq = seq;
+    r.title[sizeof r.title - 1] = 0; r.text[sizeof r.text - 1] = 0;
+    _kbMax = (r.maxLen > 0 && r.maxLen <= 15) ? r.maxLen : 8;
+    NSString *title = [NSString stringWithUTF8String:r.title] ?: @"Placa";
+    NSString *cur = [NSString stringWithUTF8String:r.text] ?: @"";
+    NSString *msg = [NSString stringWithFormat:@"Até %d letras ou números. Vazio volta a placa do jogo.", _kbMax];
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:title message:msg preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *t) {
+        t.text = cur;
+        t.placeholder = @"GROVE 4L";
+        t.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
+        t.autocorrectionType = UITextAutocorrectionTypeNo;
+        t.spellCheckingType = UITextSpellCheckingTypeNo;
+        t.smartDashesType = UITextSmartDashesTypeNo;
+        t.smartQuotesType = UITextSmartQuotesTypeNo;
+        t.keyboardType = UIKeyboardTypeASCIICapable;
+        t.returnKeyType = UIReturnKeyDone;
+        t.clearButtonMode = UITextFieldViewModeWhileEditing;
+        t.textAlignment = NSTextAlignmentCenter;
+        t.font = [UIFont monospacedSystemFontOfSize:22 weight:UIFontWeightSemibold];
+        [t addTarget:self action:@selector(plateEdited:) forControlEvents:UIControlEventEditingChanged];
+    }];
+    __weak UIAlertController *wa = a;
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancelar" style:UIAlertActionStyleCancel handler:^(UIAlertAction *x) {
+        [self answerKeyboard:seq result:2 text:@""];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Salvar" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+        [self answerKeyboard:seq result:1 text:wa.textFields.firstObject.text ?: @""];
+    }]];
+    _kbAlert = a;
+    _kbPrevKey = nil;                                   // o teclado so aparece na janela principal (key)
+    for (UIWindow *w in self.window.windowScene.windows) if (w.isKeyWindow) { _kbPrevKey = w; break; }
+    [self.window makeKeyWindow];
+    [self.host presentViewController:a animated:YES completion:nil];
+}
+
+// so A-Z, 0-9 e espaco, em maiusculas, ate o limite
+- (void)plateEdited:(UITextField *)t {
+    NSString *up = (t.text ?: @"").uppercaseString;
+    NSMutableString *out = [NSMutableString string];
+    for (NSUInteger i = 0; i < up.length && (int)out.length < _kbMax; i++) {
+        unichar c = [up characterAtIndex:i];
+        if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || (c == ' ' && out.length > 0)) [out appendFormat:@"%C", c];
+    }
+    if (![out isEqualToString:t.text ?: @""]) t.text = out;
+}
+
+- (void)answerKeyboard:(uint32_t)seq result:(uint32_t)result text:(NSString *)text {
+    GTMKbAnswer ans = {0};
+    ans.magic = kKbAnsMagic; ans.seq = seq; ans.result = result;
+    const char *u = text.UTF8String ?: "";
+    strncpy(ans.text, u, sizeof ans.text - 1);
+    if (gFd >= 0) pwrite(gFd, &ans, sizeof ans, kKbAnsOffset);
+    _kbDone = seq;
+    if (_kbSeq == seq) _kbSeq = 0;
+    _kbAlert = nil;
+    [self restoreKeyWindow];
+    if (result == 1) [self showToast:text.length ? [NSString stringWithFormat:@"Placa: %@", text] : @"Placa do jogo"];
+}
+
+- (void)closeKeyboardAlert {
+    UIAlertController *a = _kbAlert;
+    _kbAlert = nil;
+    if (a && a.presentingViewController) [a dismissViewControllerAnimated:YES completion:nil];
+    [self restoreKeyWindow];
+}
+
+- (void)restoreKeyWindow {
+    UIWindow *prev = _kbPrevKey;
+    _kbPrevKey = nil;
+    if (prev && prev != self.window) [prev makeKeyWindow];
+}
+
 // ---- ponte com o jogo (60 Hz)
 - (void)handleSave:(GTMGameBlock *)g {
     if (!_saveSeqKnown) { _saveSeqKnown = YES; _lastSaveSeq = g->saveSeq; return; }
@@ -893,11 +995,12 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
         [self setNeedsLayout];
     }
     if (!live) return;
+    [self keyboardTick];
 
     GTMHostBlock h = {0};
     h.magic = kHostMagic;
     h.seq = ++_hostSeq;
-    h.version = 3;
+    h.version = 4;
     h.cmdSeq = _cmdSeq; h.cmd = _hostCmd;
     if (!_editing) {
         uint32_t bits = 0;
@@ -975,7 +1078,7 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
     self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(frame:)];
     self.link.preferredFrameRateRange = CAFrameRateRangeMake(30, 60, 60);
     [self.link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
-    NSLog(@"[GTMTouch] overlay 3.1 ligado; arquivo %@", GTMSharedPath());
+    NSLog(@"[GTMTouch] overlay 3.3 ligado; arquivo %@", GTMSharedPath());
 }
 - (void)frame:(CADisplayLink *)l { [self.pad tick]; }
 - (void)sceneEvent:(NSNotification *)n { [self attachIfNeeded]; }

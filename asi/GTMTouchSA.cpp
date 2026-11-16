@@ -1,4 +1,4 @@
-// GTMTouchSA.asi 3.12 - controles de toque contextuais para GTA San Andreas 1.0 US no Madeira
+// GTMTouchSA.asi 3.16 - controles de toque contextuais para GTA San Andreas 1.0 US no Madeira
 //
 // 1) Contexto: a cada quadro escreve em C:\gtmtouch.bin em que situacao o CJ esta (a pe,
 //    nadando, de jetpack, carro, moto, helicoptero, aviao, barco, passageiro, cutscene,
@@ -14,6 +14,11 @@
 // 5) Comandos do overlay: 1 salvar, 2 detonar as satchels, 3 voltar para a satchel, 4 recarregar.
 // 6) Skin Selector (3.10/3.12): Status + Atirar abre o menu; a skin escolhida anda e fala como o
 //    personagem do modelo; o save daqui grava a skin no slot do save.
+// 7) Garagem pelo telefone (3.13/3.14): Status + Pular lista os carros das garagens; um membro da Grove entrega,
+//    busca e leva para a garagem; venda no mercado negro; amassados do LocalDent salvos com o carro.
+//    3.15: patios da policia fora. 3.16: capacidade pelo tamanho de cada garagem (o carro que nao cabe fica
+//    seu, "sem vaga"), lugar livre ao voltar, e "Trocar placa" (teclado do iPhone pelo overlay 3.3, ou do PC).
+// 8) Arquivo compartilhado, parte do teclado: [128..191] pedido do jogo, [192..255] resposta do overlay.
 //
 // Interceptacoes: XInputGetState (instalada logo na carga, para valer no menu tambem),
 // CALL em 0x53C077 dentro de CGame::Process (por quadro: CCranes::UpdateCranes, depois dos
@@ -568,7 +573,7 @@ static SHORT Stronger(SHORT a, SHORT b) { return (abs((int)b) > abs((int)a)) ? b
 // Com o Status (TAB) do overlay segurado, um toque no Atirar abre o menu: a pe, sem o jogo pedir o TAB
 // para outra coisa e com um Skin Selector rodando. Esse Atirar nao chega ao jogo; os dois gatilhos entram
 // juntos ate o Status ser solto. Segurar o Status sozinho continua mostrando o status do CJ.
-static int  g_skinOn = 1, g_skinAnims = 1, g_skinVoice = 1;
+static int  g_skinOn = 1, g_skinAnims = 1, g_skinVoice = 1, g_skinClothes = 1;
 static bool g_skinCombo = false;
 static void SkinCombo(WORD buttons, PadState& p, DWORD now) {
     if (!g_skinOn) return;
@@ -586,6 +591,7 @@ static void SkinCombo(WORD buttons, PadState& p, DWORD now) {
     p.bLeftTrigger = p.bRightTrigger = 255;
 }
 
+static void GarageCombo(WORD buttons, PadState& p);
 static DWORD Filter(DWORD ret, DWORD idx, XState* st) {
     if (idx != 0 || !st) return ret;
     InterlockedIncrement(&g_xinputCalls);
@@ -615,6 +621,7 @@ static DWORD Filter(DWORD ret, DWORD idx, XState* st) {
         p.sThumbLX = Stronger(p.sThumbLX, h.lx); p.sThumbLY = Stronger(p.sThumbLY, h.ly);
         p.sThumbRX = Stronger(p.sThumbRX, h.rx); p.sThumbRY = Stronger(p.sThumbRY, h.ry);
         SkinCombo(h.buttons, p, now);
+        GarageCombo(h.buttons, p);
     }
     if (ret != ERROR_SUCCESS) return ret;
 
@@ -778,6 +785,8 @@ struct VehicleSave {            // GTASAsfN.b.gtmveh
 static const DWORD VEH_MAGIC = 0x564D5447;
 
 static bool  g_pendingRestore = false;
+static char* g_saveVeh = nullptr;                                          // veiculo do CJ durante o DoSave
+static void  GarOnLoad();
 static unsigned g_loadedTimeMs = 0;
 static DWORD g_lastAutosaveTick = 0, g_missionEndTick = 0, g_hostCmdSeen = 0;
 static int   g_lastMissionsPassed = -1;
@@ -883,7 +892,9 @@ static void DoSave(int kind) {
     DWORD* pedFlags = sp ? (DWORD*)(sp + 0x46C) : nullptr;
     bool inVeh = pedFlags && (*pedFlags & 0x100);
     if (inVeh) *pedFlags &= ~0x100u;
+    g_saveVeh = inVeh ? Rd<char*>(sp, 0x58C) : nullptr;
     bool ok = GenericSave(0);
+    g_saveVeh = nullptr;
     if (inVeh) *pedFlags |= 0x100u;
     SetDir("");
     if (ok) WriteVehicleSidecar(t);
@@ -984,6 +995,7 @@ static void __cdecl AfterLoadDetour() {
     if (g_origAfterLoad) g_origAfterLoad();
     g_loadedTimeMs = *TimeMs;
     g_pendingRestore = g_keepVehicle != 0;
+    GarOnLoad();
     g_lastAutosaveTick = GetTickCount();
     g_lastMissionsPassed = -1;
     g_missionEndTick = 0;
@@ -1342,6 +1354,8 @@ static bool g_firstFrame = true, g_fallbackNoted = false, g_lastYN = false;
 
 static void WeaponGuardTick();
 static void SkinVoiceTick();
+static void SkinClothesTick();
+static void GarageTick();
 static void __cdecl FrameTick() {
     if (g_origFrameCall) g_origFrameCall();
     if (g_firstFrame) {                                 // reserva, se a thread de inicio nao conseguiu
@@ -1354,6 +1368,8 @@ static void __cdecl FrameTick() {
     g_ctxCache = g_info.ctx;
     if (g_weaponGuard) WeaponGuardTick();
     if (g_skinVoice) SkinVoiceTick();
+    if (g_skinClothes) SkinClothesTick();
+    GarageTick();
     if (g_info.ctx != g_lastCtx) { Log("contexto: %s", g_info.ctx >= 0 && g_info.ctx <= CTX_CUTSCENE ? kCtxName[g_info.ctx] : "?"); g_lastCtx = g_info.ctx; }
     bool yn = (g_info.state & S_YESNO) != 0;
     if (yn != g_lastYN) {
@@ -1618,12 +1634,74 @@ asm(".text\n"
     "2:\n  pushl $0x609A44\n  ret\n"                                          // grava eax como grupo e reaplica
     "3:\n  pushl $0x609A3B\n  ret\n");                                        // grupo do CJ pelos status
 
+// O Skin Selector so volta para o CJ numa loja (barbeiro etc.) quando o CJ nao esta tocando "WALK_player"
+// (opcode 0611), para nao trocar o modelo no meio da ida ate a cadeira. Com o andar da skin, essa animacao nunca
+// toca e ele trocava na hora errada (CJ parado em pe, loja travada). No 0611 (chamada em 0x491703), se o script
+// pergunta por "WALK_player" no jogador com o andar de uma skin, vale a animacao de andar dela (ANIM_ID_WALK).
+typedef void* (__cdecl* AssocByName_t)(void* clump, const char* name);
+typedef void* (__cdecl* AssocById_t)(void* clump, int id);
+static const AssocByName_t AssocByName = (AssocByName_t)0x4D6870;            // RpAnimBlendClumpGetAssociation(nome)
+static const AssocById_t   AssocById   = (AssocById_t)0x4D68B0;              // RpAnimBlendClumpGetAssociation(id)
+extern "C" void* __cdecl ScriptAnimLookup(void* clump, const char* name) {
+    void* r = AssocByName(clump, name);
+    if (r || !g_skinAnims || !name || _stricmp(name, "WALK_player")) return r;
+    char* ped = PlayerPed();
+    if (!ped || Rd<void*>(ped, 0x18) != clump || Rd<int>(ped, 0x4D4) < 0x76) return r;
+    return AssocById(clump, 0);                                               // ANIM_ID_WALK do grupo da skin
+}
+
 static void ApplySkinAnims() {
     static const BYTE orig[] = { 0x83,0xFF,0x36, 0x75,0x1C, 0x83,0xBE,0x98,0x05,0x00,0x00,0x01, 0x75,0x13 };
     BYTE r[10];
     r[0] = 0xE9; *(int*)(r + 1) = (int)((DWORD)&AnimGroupStubA - (0x609A1A + 5));
     r[5] = 0xE9; *(int*)(r + 6) = (int)((DWORD)&AnimGroupStubB - (0x609A1F + 5));
     PatchBytes(0x609A1A, orig, sizeof orig, r, sizeof r, "skins: jeito de andar da skin (CPlayerPed::ProcessAnimGroups)");
+    static const BYTE origCall[] = { 0xE8, 0x68, 0x51, 0x04, 0x00 };          // call 0x4D6870
+    BYTE c[5];
+    c[0] = 0xE8; *(int*)(c + 1) = (int)((DWORD)&ScriptAnimLookup - (0x491703 + 5));
+    PatchBytes(0x491703, origCall, sizeof origCall, c, sizeof c, "skins: WALK_player do Skin Selector com o andar da skin (opcode 0611)");
+}
+
+// ---------------------------------------------------------------- roupas de missao com skin ([Skins] KeepSkin=1)
+// CClothes::RebuildPlayer (0x5A82C0) monta o CJ com as roupas dele. Missoes (balaclava na Home Invasion etc.)
+// chamam isso pelo script (070D) sem saber da skin: as roupas do CJ vao por cima do modelo da skin e o corpo
+// fica torto (deitado, flutuando). Com uma skin, a reconstrucao fica guardada; quando o modelo volta a ser o do
+// CJ (o Skin Selector volta para ele em cutscenes e lojas, ou voce escolhe o CJ), ela e feita com as roupas da vez.
+typedef void (__cdecl* RebuildPlayer_t)(void* ped, int ignoreFatMuscle);
+static const RebuildPlayer_t RebuildPlayer = (RebuildPlayer_t)0x5A82C0;
+static volatile bool g_rebuildPending = false;
+static volatile bool g_rebuildNow = false;
+extern "C" int __cdecl SkinBlockRebuild(char* ped) {
+    if (!g_skinClothes || g_rebuildNow || !ped) return 0;
+    int model = Rd<short>(ped, 0x22);
+    if (model == 0) { g_rebuildPending = false; return 0; }
+    if (!g_rebuildPending) Log("skins: o jogo pediu as roupas do CJ com a skin %d; fica para quando o CJ voltar", model);
+    g_rebuildPending = true;
+    return 1;
+}
+extern "C" void RebuildStub();
+asm(".text\n"
+    ".globl _RebuildStub\n_RebuildStub:\n"
+    "  pushl 4(%esp)\n  call _SkinBlockRebuild\n  addl $4, %esp\n"
+    "  testl %eax, %eax\n  jnz 1f\n"
+    "  pushl %esi\n  movl 8(%esp), %esi\n  movl 0x18(%esi), %eax\n"      // instrucoes originais
+    "  pushl $0x5A82C8\n  ret\n"
+    "1:\n  ret\n");
+static void ApplySkinClothes() {
+    static const BYTE orig[] = { 0x56, 0x8B,0x74,0x24,0x08, 0x8B,0x46,0x18 };
+    BYTE r[5];
+    r[0] = 0xE9; *(int*)(r + 1) = (int)((DWORD)&RebuildStub - (0x5A82C0 + 5));
+    PatchBytes(0x5A82C0, orig, sizeof orig, r, sizeof r, "skins: roupas de missao guardadas enquanto ha skin (CClothes::RebuildPlayer)");
+}
+static void SkinClothesTick() {
+    if (!g_rebuildPending) return;
+    char* ped = PlayerPed();
+    if (!ped || Rd<short>(ped, 0x22) != 0) return;
+    g_rebuildPending = false;
+    g_rebuildNow = true;
+    RebuildPlayer(ped, 0);
+    g_rebuildNow = false;
+    Log("skins: CJ de volta; roupas reconstruidas");
 }
 
 typedef void (__thiscall* SpeechInit_t)(void* speech, void* entity);
@@ -1651,6 +1729,1345 @@ static void SkinVoiceTick() {
     }
     g_voiceChanged = model != 0;
     Log("skins: voz do modelo %d (tipo %d, voz %d)", model, Rd<short>(sp, 0x92), Rd<short>(sp, 0x94));
+}
+
+// ---------------------------------------------------------------- garagem pelo telefone ([Garage] Enabled=1)
+// Carros guardados nas garagens das casas do CJ viram "meus". Status + Pular: o personagem pega o telefone e
+// abre a lista (menu do jogo, como o do Skin Selector: analogico escolhe, Atirar confirma, Pular volta). Cada carro
+// tem as acoes dele: Chamar, Mandar para a garagem, Vender (mercado negro, com confirmacao) e Repor (destruido).
+// O carro escolhido aparece numa rua fora da vista, dirigido por um membro da Grove, que para perto, desce e vira
+// um pedestre comum. Durante a entrega o carro nao sofre dano nenhum (a prova de bala, fogo, explosao, colisao,
+// golpe e pneu; o LocalDent respeita a prova de colisao); depois volta as marcas que ele tinha.
+// Um carro meu na rua nao some: fica marcado como carro de script; longe (350 m) ele sai da memoria com posicao,
+// pecas e danos anotados e volta quando voce chega perto (180 m). Destruido: repor na vaga por $1250 pela lista.
+// Capacidade (3.16): cada garagem guarda ate 4 carros, quantos couberem dentro dela (o jogo apaga o que nao cabe).
+// Guardar outro carro enquanto um seu esta fora nao tira o seu de voce: se nao sobrar espaco para ele voltar, ele
+// fica seu "sem vaga" (chamar e vender continuam) e so entra quando abrir espaco. Ao voltar, ele procura um lugar
+// livre dentro da garagem (perto de onde estava), sem encostar nos carros que estao la.
+// Placa (3.16): "Trocar placa" abre o teclado do iPhone (pelo overlay 3.3) ou usa o teclado do PC. A placa segue o
+// carro: na garagem, na rua, longe e entre saves.
+// O que e meu fica num arquivo junto de cada save (GTASAsfN.b.gtmgar).
+//
+// Dados do jogo: CGarages::aCarsInSafeHouse (0x96ABD8): 20 casas x 4 vagas de CStoredCar (0x40 bytes: posicao,
+// marcas, modelo +0x12, pecas +0x14, cores +0x32, direcao +0x3C). CStoredCar::StoreCar (0x449760) guarda um
+// veiculo numa vaga; CStoredCar::RestoreCar (0x447E40) cria o veiculo da vaga (a garagem limpa a vaga depois).
+// Os comandos do jogo (criar motorista, dirigir ate, menu, telefone, dinheiro...) rodam como num script:
+// CRunningScript::ProcessOneCommand (0x469EB0) com um CRunningScript nosso, zerado (nao e missao).
+
+typedef void (__thiscall* ProcessOneCommand_t)(void*);
+static const ProcessOneCommand_t ProcessOneCommand = (ProcessOneCommand_t)0x469EB0;
+struct Cmd {
+    BYTE code[200]; int n;
+    explicit Cmd(WORD op) : n(2) { *(WORD*)code = op; }
+    Cmd& I(int v)   { code[n++] = 0x01; memcpy(code + n, &v, 4); n += 4; return *this; }
+    Cmd& F(float v) { code[n++] = 0x06; memcpy(code + n, &v, 4); n += 4; return *this; }
+    Cmd& Out(int lv){ code[n++] = 0x03; *(WORD*)(code + n) = (WORD)lv; n += 2; return *this; }
+    Cmd& Key(const char* k) { code[n++] = 0x09; memset(code + n, 0, 8); strncpy((char*)code + n, k, 7); n += 8; return *this; }
+    Cmd& Str(const char* s) { int l = (int)strlen(s); if (l > 100) l = 100; code[n++] = 0x0E; code[n++] = (BYTE)l; memcpy(code + n, s, l); n += l; return *this; }
+};
+static BYTE g_scr[0x100];
+static bool RunCmd(Cmd& c, int* out = nullptr, int nOut = 0) {
+    memset(g_scr, 0, sizeof g_scr);
+    strcpy((char*)g_scr + 8, "gtmgar");
+    *(BYTE**)(g_scr + 0x10) = c.code;                                          // m_pBaseIP
+    *(BYTE**)(g_scr + 0x14) = c.code;                                          // m_pCurrentIP
+    ProcessOneCommand(g_scr);
+    for (int i = 0; i < nOut; i++) out[i] = ((int*)(g_scr + 0x3C))[i];          // m_aLocalVars
+    return g_scr[0xC5] != 0;                                                   // m_bCondResult
+}
+
+// pools: handle = (indice << 8) | byte do mapa
+static char* PoolAt(DWORD poolVar, int elem, int h) {
+    char* pool = *(char**)poolVar;
+    if (!pool || h < 0) return nullptr;
+    int idx = h >> 8;
+    if (idx >= Rd<int>(pool, 8)) return nullptr;
+    BYTE b = Rd<BYTE*>(pool, 4)[idx];
+    if ((b & 0x80) || b != (BYTE)(h & 0xFF)) return nullptr;
+    return Rd<char*>(pool, 0) + idx * elem;
+}
+static int PoolRef(DWORD poolVar, int elem, const char* e) {
+    char* pool = *(char**)poolVar;
+    if (!pool || !e) return -1;
+    int idx = (int)((e - Rd<char*>(pool, 0)) / elem);
+    if (idx < 0 || idx >= Rd<int>(pool, 8)) return -1;
+    return (idx << 8) | Rd<BYTE*>(pool, 4)[idx];
+}
+static char* VehByRef(int h) { return PoolAt(0xB74494, 0xA18, h); }
+static int   VehRef(const char* v) { return PoolRef(0xB74494, 0xA18, v); }
+static char* PedByRef(int h) { return PoolAt(0xB74490, 0x7C4, h); }
+static int   PedRef(const char* p) { return PoolRef(0xB74490, 0x7C4, p); }
+
+typedef char* (__thiscall* RestoreCar_t)(void* stored);
+typedef void  (__thiscall* StoreCar_t)(void* stored, void* veh);
+typedef void  (__cdecl* WorldAdd_t)(void* e);
+typedef const char* (__thiscall* TextGet_t)(void* text, const char* key);
+typedef void  (__thiscall* SetupDamage_t)(void* veh);
+static RestoreCar_t g_origRestoreCar = (RestoreCar_t)0x447E40;              // CStoredCar::RestoreCar (o gancho troca)
+static StoreCar_t   g_origStoreCar = (StoreCar_t)0x449760;                  // CStoredCar::StoreCar
+static const WorldAdd_t WorldAdd = (WorldAdd_t)0x563220;                     // CWorld::Add
+static const TextGet_t  TextGet  = (TextGet_t)0x6A0050;                      // CText::Get
+static const SetupDamage_t SetupDamageAfterLoad = (SetupDamage_t)0x6B3E90;   // CAutomobile::SetupDamageAfterLoad
+static char* const SafeCars = (char*)0x96ABD8;                               // CGarages::aCarsInSafeHouse[20][4]
+
+static int g_garOn = 1, g_garPrice = 1250, g_garSellPct = 15;
+static const DWORD kProofMask = (1u << 18) | (1u << 19) | (1u << 20) | (1u << 21) | (1u << 23);   // CPhysical +0x40
+enum { GS_NONE = 0, GS_LIVE, GS_AWAY, GS_DEAD, GS_DELIVER, GS_TOGARAGE, GS_PICKUP };
+static const char* kGarState[] = { "-", "na rua", "longe", "destruido", "a caminho", "indo p/ garagem", "sendo levado" };
+enum { ER_NONE = 0, ER_DELIVER, ER_TOGARAGE, ER_SOLD };                      // servico em andamento (um por vez)
+struct GarCar {
+    BYTE  state, house, slot, inGarage, playerCar, hasDmg, pad[2];
+    int   veh;                     // handle do veiculo vivo
+    BYTE  blob[0x40];              // CStoredCar atual (posicao, direcao, pecas, cores, marcas)
+    float home[3]; signed char homeDir[3], pad2;   // onde ele fica na garagem
+    float health;
+    BYTE  dmg[0x18];               // CAutomobile::m_damageManager (+0x5A0)
+    // entrega (nao vai para o arquivo)
+    int   ped, blip, phase; DWORD t0, tPhase, tTarget; DWORD flags40; BYTE b42B, parked;
+    V3    lastTarget;
+    BYTE* dent; int dentLen, dentCap;                                        // estado do LocalDent (amassados)
+    char  plate[9];                // placa escolhida ("" = a sorteada pelo jogo)
+    BYTE  noSpot, waitLogged;      // sem vaga na garagem dele; aviso de espera ja no log
+};
+static GarCar g_gar[80];
+static int    g_nGar = 0;
+static int    g_errand = -1, g_errandKind = ER_NONE;                         // servico da Grove/comprador (indice em g_gar)
+static bool   g_garInternal = false;                                         // nossas chamadas a StoreCar/RestoreCar
+
+static WORD BlobModel(const BYTE* b) { return *(const WORD*)(b + 0x12); }
+// Os patios da policia (garagens 0x21-0x23) usam as vagas 12, 13 e 14 da mesma tabela: o jogo guarda la o seu
+// ultimo carro quando voce morre, e preso ou uma missao te leva (CGarages::StoreCarInNearestImpoundingGarage,
+// 0x44A3C0). Nao sao garagens suas.
+static bool IsImpoundHouse(int h) { return h >= 12 && h <= 14; }
+static V3   BlobPos(const BYTE* b) { const float* f = (const float*)b; return { f[0], f[1], f[2] }; }
+static float Dist2(V3 a, V3 b) { float dx = a.x - b.x, dy = a.y - b.y; return sqrtf(dx * dx + dy * dy); }
+static bool SlotOf(const void* stored, int* h, int* s) {
+    const char* p = (const char*)stored;
+    if (p < SafeCars || p >= SafeCars + 20 * 0x100 || (p - SafeCars) % 0x40) return false;
+    *h = (int)((p - SafeCars) / 0x100); *s = (int)(((p - SafeCars) % 0x100) / 0x40);
+    return true;
+}
+static const char* CarName(int model) {
+    if (model <= 0 || model >= 20000) return "?";
+    const char* mi = ((char**)0xA9B0C8)[model];
+    if (!mi) return "?";
+    const char* t = TextGet((void*)0xC1B340, mi + 0x32);                      // CVehicleModelInfo::m_szGameName
+    return t && *t ? t : mi + 0x32;
+}
+static void GarHelp(const char* fmt, ...) {
+    static char buf[200];
+    va_list a; va_start(a, fmt); vsnprintf(buf, sizeof buf, fmt, a); va_end(a);
+    if (g_origSetHelp) g_origSetHelp(buf, true, false, false);
+}
+static void RequestBlobModels(const BYTE* b) {
+    RequestModel(BlobModel(b), 2);
+    const short* up = (const short*)(b + 0x14);
+    for (int i = 0; i < 15; i++) if (up[i] > 0) RequestModel(up[i], 2);
+}
+static float AsF(int v) { float f; memcpy(&f, &v, 4); return f; }
+static bool BlobModelsLoaded(const BYTE* b) {
+    if (!ModelLoaded(BlobModel(b))) return false;
+    const short* up = (const short*)(b + 0x14);
+    for (int i = 0; i < 15; i++) if (up[i] > 0 && !ModelLoaded(up[i])) return false;
+    return true;
+}
+static bool IsAutomobile(const char* v) { int c = Rd<int>(v, 0x590); return c == 0 || c == 1 || c == 2; }
+static char* ModelInfo(int m) { return m > 0 && m < 20000 ? ((char**)0xA9B0C8)[m] : nullptr; }
+
+// ---- placas. Cada carro tem a textura da placa dele (CVehicle +0x588), feita quando ele nasce:
+// CVehicle::SetModelIndex (0x6D6A40) -> CustomCarPlate_TextureCreate (0x6D10E0), com o texto pendente do modelo
+// (CVehicleModelInfo +0x28, 8 letras, o mesmo do comando 0674) ou, sem texto, a placa sorteada do modelo. O texto
+// nao fica guardado no carro: a placa de cada carro seu fica anotada aqui e vai para o modelo antes de ele nascer.
+// Letras, numeros e espaco (o resto vira espaco na placa: 0x6FD7C0).
+typedef void  (__thiscall* SetPlateText_t)(void* mi, const char* text);
+typedef void* (__cdecl* CreatePlate_t)(const char* text, BYTE type);
+typedef void  (__thiscall* PlateDestroy_t)(void* veh);
+static const SetPlateText_t SetPlateText = (SetPlateText_t)0x4C8980;          // CVehicleModelInfo::SetCustomCarPlateText
+static const CreatePlate_t  CreatePlate  = (CreatePlate_t)0x6FDEA0;           // CCustomCarPlateMgr::CreatePlateTexture
+static const PlateDestroy_t PlateDestroy = (PlateDestroy_t)0x6D1150;          // CVehicle::CustomCarPlate_TextureDestroy
+static char g_slotPlate[20][4][9];                                            // placa de cada vaga das garagens
+static bool PlateCapable(int m) { char* mi = ModelInfo(m); int t = mi ? Rd<int>(mi, 0x3C) : -1; return t == 0 || t == 9; }   // carro, moto
+static void CleanPlate(const char* in, char* out) {                           // maiusculas, A-Z 0-9 e espaco, ate 8
+    int n = 0;
+    for (const char* p = in; *p && n < 8; p++) {
+        char c = *p;
+        if (c >= 'a' && c <= 'z') c -= 32;
+        if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || (c == ' ' && n > 0)) out[n++] = c;
+    }
+    while (n > 0 && out[n - 1] == ' ') n--;
+    out[n] = 0;
+}
+static void Plate8(const char* p, char* out) {                                // centralizada em 8 casas
+    int l = (int)strlen(p); if (l > 8) l = 8;
+    memset(out, ' ', 8); memcpy(out + (8 - l) / 2, p, l); out[8] = 0;
+}
+// placa pendente no modelo so durante a criacao de um carro; o que havia antes (de uma missao) volta depois
+struct PlateSave { char* mi; BYTE saved[9]; BYTE savedType; };
+static PlateSave PlateBegin(int model, const char* plate) {
+    PlateSave ps = {};
+    if (!plate || !plate[0]) return ps;
+    char* m = ModelInfo(model);
+    if (!m || !Rd<void*>(m, 0x24)) return ps;                                  // modelo sem placa (ou nao carregado)
+    ps.mi = m; memcpy(ps.saved, m + 0x28, 9); ps.savedType = Rd<BYTE>(m, 0x31);
+    char t[9]; Plate8(plate, t); SetPlateText(m, t);
+    return ps;
+}
+static void PlateEnd(const PlateSave& ps) { if (ps.mi) { memcpy(ps.mi + 0x28, ps.saved, 9); *(BYTE*)(ps.mi + 0x31) = ps.savedType; } }
+// troca a placa de um carro que ja existe (fora do desenho do quadro); "" volta a placa sorteada do modelo
+static bool ApplyPlateNow(char* v, const char* plate) {
+    char* mi = ModelInfo(Rd<short>(v, 0x22));
+    void* mat = mi ? Rd<void*>(mi, 0x24) : nullptr;
+    if (!mat) return false;
+    void* tex;
+    if (plate && plate[0]) { char t[9]; Plate8(plate, t); tex = CreatePlate(t, 0xFF); }
+    else { tex = Rd<void*>(mat, 0); if (tex) ++*(int*)((char*)tex + 0x54); }   // RwTexture::refCount
+    if (!tex) return false;
+    PlateDestroy(v);
+    *(void**)(v + 0x588) = tex;
+    return true;
+}
+
+// ---- tamanho dos carros e lugar livre dentro de uma garagem
+static float g_dimW[212], g_dimL[212];                                        // meia largura / meio comprimento (400-611)
+static void NoteDims(const char* v) {                                         // so com o modelo carregado (carro vivo)
+    int m = Rd<short>(v, 0x22);
+    char* mi = (m >= 400 && m <= 611) ? ModelInfo(m) : nullptr;
+    const float* c = mi ? Rd<const float*>(mi, 0x14) : nullptr;               // CColModel: caixa min (0) e max (0xC)
+    if (!c) return;
+    float w = fmaxf(fabsf(c[0]), fabsf(c[3])), l = fmaxf(fabsf(c[1]), fabsf(c[4]));
+    if (w > 0.4f && w < 4.f && l > 0.8f && l < 12.f) { g_dimW[m - 400] = w; g_dimL[m - 400] = l; }
+}
+static void Dims(int m, float* w, float* l) {
+    *w = 1.1f; *l = 2.6f;
+    if (m >= 400 && m <= 611 && g_dimW[m - 400] > 0.f) { *w = g_dimW[m - 400]; *l = g_dimL[m - 400]; }
+}
+struct Box2 { float x, y, fx, fy, w, l; };                                    // centro, frente (unitaria), meias medidas
+static void UnitDir(float x, float y, float* fx, float* fy) {
+    float n = sqrtf(x * x + y * y);
+    if (n < 0.01f) { *fx = 0.f; *fy = 1.f; } else { *fx = x / n; *fy = y / n; }
+}
+static bool BoxOverlap(const Box2& a, const Box2& b, float gap) {
+    const float ax[4][2] = { { a.fx, a.fy }, { -a.fy, a.fx }, { b.fx, b.fy }, { -b.fy, b.fx } };
+    float dx = b.x - a.x, dy = b.y - a.y;
+    for (const auto& n : ax) {
+        float d  = fabsf(dx * n[0] + dy * n[1]);
+        float ra = a.l * fabsf(a.fx * n[0] + a.fy * n[1]) + a.w * fabsf(-a.fy * n[0] + a.fx * n[1]);
+        float rb = b.l * fabsf(b.fx * n[0] + b.fy * n[1]) + b.w * fabsf(-b.fy * n[0] + b.fx * n[1]);
+        if (d > ra + rb + gap) return false;
+    }
+    return true;
+}
+// CGarage: canto +0, eixo A +0xC (x,y), eixo B +0x14, largura (A) +0x20, fundo (B) +0x24
+static bool BoxInGarage(const char* gr, const Box2& b, float tol) {
+    const float* o = (const float*)gr;
+    float Ax = Rd<float>(gr, 0xC), Ay = Rd<float>(gr, 0x10), Bx = Rd<float>(gr, 0x14), By = Rd<float>(gr, 0x18);
+    float W = Rd<float>(gr, 0x20), D = Rd<float>(gr, 0x24);
+    for (int k = 0; k < 4; k++) {
+        float sl = (k & 1) ? b.l : -b.l, sw = (k & 2) ? b.w : -b.w;
+        float px = b.x + b.fx * sl - b.fy * sw - o[0], py = b.y + b.fy * sl + b.fx * sw - o[1];
+        float u = px * Ax + py * Ay, v = px * Bx + py * By;
+        if (u < -tol || u > W + tol || v < -tol || v > D + tol) return false;
+    }
+    return true;
+}
+// lugar livre para um carro (w, l): primeiro onde ele estava, senao o mais perto disso; no maximo 4 carros
+static bool FindFreeSpot(const char* gr, float w, float l, V3 pref, float pfx, float pfy, const Box2* obs, int nObs, Box2* out) {
+    if (nObs >= 4) return false;
+    const float gap = 0.5f, tol = 0.2f;                                   // folga entre carros; quanto pode passar da parede
+    // a porta fica no lado do eixo A (grge: canto, ponto da frente, ponto do fundo): os carros entram ao longo de B
+    float hd[3][2]; int nh = 0;
+    UnitDir(pfx, pfy, &hd[0][0], &hd[0][1]); nh = 1;
+    float Ax = Rd<float>(gr, 0xC), Ay = Rd<float>(gr, 0x10), Bx = Rd<float>(gr, 0x14), By = Rd<float>(gr, 0x18);
+    hd[1][0] = Bx; hd[1][1] = By; hd[2][0] = -Bx; hd[2][1] = -By; nh = 3;
+    auto ok = [&](const Box2& c) {
+        if (!BoxInGarage(gr, c, tol)) return false;
+        for (int j = 0; j < nObs; j++) if (BoxOverlap(c, obs[j], gap)) return false;
+        return true;
+    };
+    Box2 c = { pref.x, pref.y, hd[0][0], hd[0][1], w, l };
+    if (ok(c)) { *out = c; return true; }
+    const float* o = (const float*)gr;
+    float W = Rd<float>(gr, 0x20), D = Rd<float>(gr, 0x24);
+    float step = fmaxf(0.25f, fmaxf(W, D) / 60.f), best = 1e9f;
+    for (int k = 0; k < nh; k++)
+        for (float u = 0.f; u <= W; u += step)
+            for (float v = 0.f; v <= D; v += step) {
+                c = { o[0] + Ax * u + Bx * v, o[1] + Ay * u + By * v, hd[k][0], hd[k][1], w, l };
+                if (!ok(c)) continue;
+                float dx = c.x - pref.x, dy = c.y - pref.y, sc = sqrtf(dx * dx + dy * dy) + (k ? 1.5f : 0.f);
+                if (sc < best) { best = sc; *out = c; }
+            }
+    return best < 1e8f;
+}
+
+// ---- amassados do LocalDent: o LocalDent nosso exporta as batidas aceitas de cada carro e reaplica depois
+typedef int (__cdecl* LdExport_t)(void* veh, void* buf, int cap);
+typedef int (__cdecl* LdImport_t)(void* veh, const void* buf, int size);
+static LdExport_t g_ldExport = nullptr;
+static LdImport_t g_ldImport = nullptr;
+static bool g_ldChecked = false;
+static void LdResolve() {
+    if (g_ldChecked) return;
+    g_ldChecked = true;
+    HMODULE m = GetModuleHandleA("LocalDent.asi");
+    if (m) { g_ldExport = (LdExport_t)GetProcAddress(m, "LocalDentExport"); g_ldImport = (LdImport_t)GetProcAddress(m, "LocalDentImport"); }
+    if (!g_ldExport || !g_ldImport) g_ldExport = nullptr, g_ldImport = nullptr;
+    Log("garagem: amassados do LocalDent %s", g_ldExport ? "salvos com os carros" : m ? "NAO salvos (LocalDent sem LocalDentExport; use o LocalDent da pasta para-iphone)" : "nao salvos (sem LocalDent)");
+}
+
+// estado atual do carro vivo para o registro (posicao, pecas, cores, marcas, vida, danos e amassados)
+static void CaptureCar(GarCar& g, char* v) {
+    if (!v) return;
+    float prevHealth = g.health;
+    g_garInternal = true; g_origStoreCar(g.blob, v); g_garInternal = false;
+    g.health = Rd<float>(v, 0x4C0);
+    g.hasDmg = IsAutomobile(v) ? 1 : 0;
+    if (g.hasDmg) memcpy(g.dmg, v + 0x5A0, sizeof g.dmg);
+    if (!g_ldExport) return;
+    int need = g_ldExport(v, nullptr, 0);
+    if (need < 0) {
+        need = -need;
+        if (need > g.dentCap) { BYTE* p = (BYTE*)realloc(g.dent, need); if (!p) return; g.dent = p; g.dentCap = need; }
+        int n = g_ldExport(v, g.dent, g.dentCap);
+        g.dentLen = n > 0 ? n : 0;
+    } else if (g.dentLen && prevHealth > 0.f && g.health > prevHealth + 25.f) {
+        g.dentLen = 0;                                                        // consertado (Pay 'n' Spray, TransFender)
+    }
+}
+// cria o carro do registro (modelos ja carregados)
+static char* SpawnCar(GarCar& g, const BYTE* blob) {
+    BYTE b[0x40]; memcpy(b, blob, sizeof b);
+    char* v;
+    PlateSave ps = PlateBegin(BlobModel(b), g.plate);
+    g_garInternal = true; v = g_origRestoreCar(b); g_garInternal = false;
+    PlateEnd(ps);
+    if (!v) return nullptr;
+    NoteDims(v);
+    WorldAdd(v);
+    *(BYTE*)(v + 0x4A4) = 2;                                                  // m_nCreatedBy = MISSION_VEHICLE: nao some
+    if (g.health > 0.f) *(float*)(v + 0x4C0) = g.health;
+    if (g.hasDmg && IsAutomobile(v)) { memcpy(v + 0x5A0, g.dmg, sizeof g.dmg); SetupDamageAfterLoad(v); }
+    if (g.dentLen && g_ldImport) g_ldImport(v, g.dent, g.dentLen);           // o LocalDent reaplica no proximo quadro
+    Cmd c(0x0249); c.I(BlobModel(b)); RunCmd(c);                              // o carro segura o modelo; o pedido sai
+    return v;
+}
+static void RemoveGar(int i) {
+    free(g_gar[i].dent);
+    if (g_errand == i) { g_errand = -1; g_errandKind = ER_NONE; }
+    else if (g_errand > i) g_errand--;
+    memmove(&g_gar[i], &g_gar[i + 1], (g_nGar - i - 1) * sizeof(GarCar));
+    g_nGar--;
+}
+static int FindGarVeh(const char* v) {
+    int h = VehRef(v);
+    for (int i = 0; i < g_nGar; i++) if ((g_gar[i].state == GS_LIVE || g_gar[i].state == GS_DELIVER || g_gar[i].state == GS_PICKUP) && g_gar[i].veh == h) return i;
+    return -1;
+}
+static GarCar* NewGar(int house, int slot, const BYTE* homeBlob) {
+    if (g_nGar >= 80) return nullptr;
+    GarCar& g = g_gar[g_nGar++];
+    memset(&g, 0, sizeof g);
+    g.house = (BYTE)house; g.slot = (BYTE)slot; g.veh = -1; g.ped = -1; g.blip = -1;
+    memcpy(g.blob, homeBlob, sizeof g.blob);
+    memcpy(g.home, homeBlob, 12); memcpy(g.homeDir, homeBlob + 0x3C, 3);
+    return &g;
+}
+
+// a garagem cria os carros dela quando voce chega perto: viram meus, vivos, ainda dentro da garagem
+// (a placa da vaga vai para o modelo antes; a garagem limpa a vaga depois de criar o carro)
+static char* __fastcall RestoreCarDetour(void* stored, void*) {
+    BYTE before[0x40]; memcpy(before, stored, sizeof before);
+    int h = -1, s = -1;
+    bool slot = !g_garInternal && SlotOf(stored, &h, &s);
+    char plate[9] = "";
+    if (slot) memcpy(plate, g_slotPlate[h][s], 9);
+    char* v;
+    PlateSave ps = PlateBegin(BlobModel(before), plate);
+    v = g_origRestoreCar(stored);
+    PlateEnd(ps);
+    if (slot && v) {
+        NoteDims(v);
+        g_slotPlate[h][s][0] = 0;
+        if (!IsImpoundHouse(h)) if (GarCar* g = NewGar(h, s, before)) { g->state = GS_LIVE; g->veh = VehRef(v); g->inGarage = 1; memcpy(g->plate, plate, 9); }
+    }
+    return v;
+}
+// a garagem guarda os carros que estao dentro dela quando a porta fecha (ou antes de salvar): zera as 4 vagas e
+// guarda, em ordem, todo carro que nao e de missao e esta inteiro dentro dela, ate 4; os outros sao apagados
+static void __fastcall StoreCarDetour(void* stored, void*, void* v) {
+    g_origStoreCar(stored, v);
+    int h, s;
+    if (g_garInternal || !v || !SlotOf(stored, &h, &s)) return;
+    NoteDims((char*)v);
+    int i = FindGarVeh((char*)v);
+    if (IsImpoundHouse(h)) {                                                  // patio: nao e garagem sua
+        if (i >= 0) {                                                         // um carro seu nao vai para o patio
+            *(WORD*)((BYTE*)stored + 0x12) = 0;
+            if (char* car = VehByRef(g_gar[i].veh)) CaptureCar(g_gar[i], car);
+            Log("garagem: %s seu iria para o patio da policia; continua seu, onde estava", CarName(BlobModel(g_gar[i].blob)));
+        }
+        return;
+    }
+    g_slotPlate[h][s][0] = 0;
+    if (i >= 0) { memcpy(g_slotPlate[h][s], g_gar[i].plate, 9); RemoveGar(i); return; }   // um meu voltou para a garagem
+    // carro novo na garagem: os seus que estao fora continuam seus (se faltar espaco, ficam "sem vaga")
+    Log("garagem: %s guardado na casa %d vaga %d", CarName(Rd<short>(v, 0x22)), h, s + 1);
+}
+
+// ---- garagens das casas
+typedef bool (__thiscall* InsideGarage_t)(void* garage, V3 pos);
+typedef int  (__cdecl* SafeHouseIdx_t)(int type);
+static const InsideGarage_t IsPointInsideGarage = (InsideGarage_t)0x448740;  // CGarage::IsPointInsideGarage
+static const SafeHouseIdx_t SafeHouseIndex = (SafeHouseIdx_t)0x4489F0;       // CGarages::FindSafeHouseIndexForGarageType
+static bool IsHideoutType(int t) { return t == 0x10 || t == 0x11 || t == 0x12 || (t >= 0x18 && t <= 0x20) || (t >= 0x27 && t <= 0x2A) || t == 0x2D; }   // sem os patios 0x21-0x23
+static char* HideoutGarageAt(V3 p) {
+    int n = *(int*)0x96C024;
+    for (int i = 0; i < n && i < 50; i++) {
+        char* gr = (char*)0x96C048 + i * 0xD8;
+        if (IsHideoutType(Rd<BYTE>(gr, 0x4C)) && IsPointInsideGarage(gr, p)) return gr;
+    }
+    return nullptr;
+}
+static char* GarageOfHouse(int house, V3 nearPos) {
+    int n = *(int*)0x96C024; char* best = nullptr; float bd = 1e9f;
+    for (int i = 0; i < n && i < 50; i++) {
+        char* gr = (char*)0x96C048 + i * 0xD8; int t = Rd<BYTE>(gr, 0x4C);
+        if (!IsHideoutType(t) || SafeHouseIndex(t) != house) continue;
+        float d = Dist2(*(V3*)gr, nearPos);
+        if (d < bd) { bd = d; best = gr; }
+    }
+    return best;
+}
+
+// ---- preco no mercado negro: o valor do modelo no jogo (handling, +0xD8) x porcentagem x estado do carro
+static int CarValue(int model) {
+    if (model < 400 || model > 611) return 0;
+    const char* mi = ((char**)0xA9B0C8)[model];
+    if (!mi) return 0;
+    return Rd<int>((void*)0xC2B9DC, Rd<BYTE>(mi, 0x4A) * 0xE0 + 0xD8);      // mod_HandlingManager[m_nHandlingId].m_nMonetaryValue
+}
+static int SellPrice(int model, float health) {
+    float f = health <= 0.f ? 1.f : health / 1000.f;
+    if (f < .5f) f = .5f;
+    if (f > 1.f) f = 1.f;
+    int p = (int)((float)CarValue(model) * (float)g_garSellPct / 100.f * f);
+    p = (p + 25) / 50 * 50;
+    return p < 50 ? 50 : p;
+}
+
+// ---------------------------------------------------------------- lista (menu do jogo)
+struct GarItem { int kind; int house, slot, gi, model; };                    // kind 0 vaga da garagem, 1 registro
+enum { AC_CALL = 1, AC_TOGARAGE, AC_SELL, AC_REPOR, AC_YES, AC_NO, AC_PLATE };
+static GarItem g_items[90], g_sel;
+static int g_nItems = 0, g_page = 0, g_menu = -1, g_level = 0, g_acts[12], g_nActs = 0, g_price = 0;
+static bool g_menuOpen = false;
+static volatile bool g_garReq = false, g_garSel = false, g_garCancel = false;
+static DWORD g_phoneOffAt = 0, g_menuOpenAt = 0;
+
+static int PlayerRef() { char* p = PlayerPed(); return p ? PedRef(p) : -1; }
+static void Phone(bool on) { int pr = PlayerRef(); if (pr >= 0) { Cmd c(0x0729); c.I(pr).I(on ? 1 : 0); RunCmd(c); } }
+static void PlayerControl(bool on) { Cmd c(0x01B4); c.I(0).I(on ? 1 : 0); RunCmd(c); }
+static void SetText(const char* key, const char* text) { Cmd c(0x0ADF); c.Str(key).Str(text); RunCmd(c); }
+static void AddMoney(int v) { Cmd c(0x0109); c.I(0).I(v); RunCmd(c); }
+
+static BYTE* SlotPtr(int h, int s) { return (BYTE*)SafeCars + h * 0x100 + s * 0x40; }
+
+// ---- espaco nas garagens: carros guardados nas vagas + carros do mundo dentro dela (porta aberta)
+static Box2 BlobBox(const BYTE* b) {
+    Box2 x; float w, l; Dims(BlobModel(b), &w, &l);
+    const float* p = (const float*)b; const signed char* d = (const signed char*)(b + 0x3C);
+    x.x = p[0]; x.y = p[1]; UnitDir(d[0], d[1], &x.fx, &x.fy); x.w = w; x.l = l;
+    return x;
+}
+static Box2 VehBox(const char* v) {
+    Box2 x; float w, l; Dims(Rd<short>(v, 0x22), &w, &l);
+    V3 p = EntityPos(v); x.x = p.x; x.y = p.y; x.w = w; x.l = l;
+    const float* m = Rd<const float*>(v, 0x14);
+    if (m) UnitDir(m[4], m[5], &x.fx, &x.fy); else { float h = Rd<float>(v, 0x10); x.fx = -sinf(h); x.fy = cosf(h); }
+    return x;
+}
+static int GarageObstacles(int house, const char* gr, Box2* out, int cap) {
+    int n = 0;
+    for (int s = 0; s < 4 && n < cap; s++) if (BlobModel(SlotPtr(house, s))) out[n++] = BlobBox(SlotPtr(house, s));
+    char* pool = *(char**)0xB74494;
+    if (!pool) return n;
+    int size = Rd<int>(pool, 8);
+    for (int i = 0; i < size && n < cap; i++) {
+        if (Rd<BYTE*>(pool, 4)[i] & 0x80) continue;
+        char* v = Rd<char*>(pool, 0) + i * 0xA18;
+        if (!IsPointInsideGarage((void*)gr, EntityPos(v))) continue;
+        NoteDims(v); out[n++] = VehBox(v);
+    }
+    return n;
+}
+static DWORD g_capLogged = 0;
+static void LogCapacity(int house, const char* gr) {                         // uma vez por garagem: quantos cabem
+    if (g_capLogged & (1u << house)) return;
+    g_capLogged |= 1u << house;
+    Box2 obs[4]; int n = 0;
+    const float* o = (const float*)gr;
+    V3 corner = { o[0], o[1], o[2] };
+    while (n < 4 && FindFreeSpot(gr, 1.05f, 2.5f, corner, Rd<float>(gr, 0x14), Rd<float>(gr, 0x18), obs, n, &obs[n])) n++;
+    char name[9] = {}; memcpy(name, gr + 0x44, 8);
+    Log("garagem: casa %d (%s) tem %.1f x %.1f m: cabem uns %d carros (o jogo guarda ate 4)", house, name[0] ? name : "?", Rd<float>(gr, 0x20), Rd<float>(gr, 0x24), n);
+}
+static bool IsOutCar(int i) {
+    const GarCar& g = g_gar[i];
+    if (g.state == GS_PICKUP) return !(g_errand == i && g_errandKind == ER_SOLD);
+    return (g.state == GS_LIVE && !g.inGarage) || g.state == GS_AWAY || g.state == GS_TOGARAGE || g.state == GS_DELIVER;
+}
+// quais carros seus fora da garagem ainda tem lugar para voltar (os que vao para a garagem primeiro)
+static void ComputeSpots() {
+    for (int h = 0; h < 20; h++) {
+        if (IsImpoundHouse(h)) continue;
+        int first = -1;
+        for (int i = 0; i < g_nGar && first < 0; i++) if (g_gar[i].house == h && IsOutCar(i)) first = i;
+        if (first < 0) continue;
+        char* gr = GarageOfHouse(h, *(V3*)g_gar[first].home);
+        if (gr) LogCapacity(h, gr);
+        Box2 obs[12]; int n = gr ? GarageObstacles(h, gr, obs, 8) : 0;
+        for (int pass = 0; pass < 2; pass++)
+            for (int i = 0; i < g_nGar; i++) {
+                GarCar& g = g_gar[i];
+                if (g.house != h || !IsOutCar(i) || (g.state == GS_TOGARAGE) != (pass == 0)) continue;
+                bool spot = true;
+                char* v = VehByRef(g.veh);
+                if (gr && !(v && IsPointInsideGarage(gr, EntityPos(v)))) {   // ja la dentro: conta como guardado
+                    float w, l; Dims(BlobModel(g.blob), &w, &l);
+                    Box2 b;
+                    spot = n < 8 && FindFreeSpot(gr, w, l, *(V3*)g.home, g.homeDir[0], g.homeDir[1], obs, n, &b);
+                    if (spot) obs[n++] = b;
+                }
+                if (spot != !g.noSpot) {
+                    g.noSpot = !spot;
+                    Log("garagem: %s (casa %d) %s", CarName(BlobModel(g.blob)), h, spot ? "tem vaga na garagem de novo" : "ficou sem vaga (nao sobra espaco livre ao lado dos carros que estao la); continua seu");
+                }
+            }
+    }
+}
+static void BuildItems() {
+    ComputeSpots();
+    g_nItems = 0;
+    for (int h = 0; h < 20; h++) for (int s = 0; s < 4; s++)
+        if (!IsImpoundHouse(h)) if (int m = BlobModel(SlotPtr(h, s))) g_items[g_nItems++] = { 0, h, s, -1, m };
+    for (int i = 0; i < g_nGar && g_nItems < 88; i++)
+        if (g_gar[i].state != GS_DELIVER && g_gar[i].state != GS_PICKUP) g_items[g_nItems++] = { 1, g_gar[i].house, g_gar[i].slot, i, BlobModel(g_gar[i].blob) };
+}
+static bool ItemValid(const GarItem& it) {
+    if (it.kind == 0) return BlobModel(SlotPtr(it.house, it.slot)) == it.model;
+    return it.gi >= 0 && it.gi < g_nGar && g_gar[it.gi].house == it.house && g_gar[it.gi].slot == it.slot &&
+           BlobModel(g_gar[it.gi].blob) == it.model && g_gar[it.gi].state != GS_DELIVER && g_gar[it.gi].state != GS_PICKUP;
+}
+static const char* ItemStatus(const GarItem& it) {
+    if (it.kind == 0) return "garagem";
+    const GarCar& g = g_gar[it.gi];
+    if (g.state == GS_DEAD) return "destruido";
+    if (g.state == GS_LIVE && g.inGarage) return "garagem";
+    if (g.state == GS_TOGARAGE) return g.noSpot ? "esperando vaga" : kGarState[g.state];
+    if (g.noSpot && g.state == GS_LIVE) return "na rua, sem vaga";
+    if (g.noSpot && g.state == GS_AWAY) return "longe, sem vaga";
+    return kGarState[g.state];
+}
+static const char* ItemPlate(const GarItem& it) { return it.kind == 0 ? g_slotPlate[it.house][it.slot] : g_gar[it.gi].plate; }
+static float ItemHealth(const GarItem& it) {
+    if (it.kind == 0) return 1000.f;
+    const GarCar& g = g_gar[it.gi];
+    if (char* v = VehByRef(g.veh)) return Rd<float>(v, 0x4C0);
+    return g.health;
+}
+static void CloseMenu(bool keepPhone) {
+    if (g_menu >= 0) { Cmd c(0x08DA); c.I(g_menu); RunCmd(c); }
+    g_menu = -1; g_menuOpen = false; g_level = 0;
+    PlayerControl(true);
+    if (keepPhone) g_phoneOffAt = GetTickCount() + 2500; else Phone(false);
+}
+static void ShowRows(const char* title, const char* header, const char* const* rows, int n) {
+    if (g_menu >= 0) { Cmd c(0x08DA); c.I(g_menu); RunCmd(c); g_menu = -1; }
+    static char keyBuf[12][8];
+    const char* keys[12];
+    SetText("GTMGT", title);
+    SetText("GTMGH", header);
+    for (int r = 0; r < 12; r++) {
+        snprintf(keyBuf[r], 8, "GTMG%d", r);
+        keys[r] = "DUMMY";
+        if (r < n) { SetText(keyBuf[r], rows[r]); keys[r] = keyBuf[r]; }
+    }
+    int id = -1;
+    { Cmd c(0x08D4); c.Key("GTMGT").F(29.f).F(140.f).F(220.f).I(1).I(1).I(1).I(0).Out(0); RunCmd(c, &id, 1); }
+    g_menu = id;
+    Cmd c(0x08DB); c.I(id).I(0).Key("GTMGH");
+    for (int r = 0; r < 12; r++) c.Key(keys[r]);
+    RunCmd(c);
+}
+static void ShowList() {
+    g_level = 0;
+    int first = g_page * 11, n = g_nItems - first; if (n > 11) n = 11;
+    static char text[12][96];
+    const char* rows[12];
+    for (int r = 0; r < n; r++) {
+        const GarItem& it = g_items[first + r];
+        if (it.kind == 1 && g_gar[it.gi].state == GS_DEAD) snprintf(text[r], 96, "%s - repor $%d", CarName(it.model), g_garPrice);
+        else snprintf(text[r], 96, "%s - %s", CarName(it.model), ItemStatus(it));
+        rows[r] = text[r];
+    }
+    int total = n;
+    if (g_nItems > 11) { rows[total++] = g_nItems > first + 11 ? "Mais..." : "Voltar ao inicio"; }
+    ShowRows("Meus carros", g_page ? "Carro (mais)" : "Carro", rows, total);
+}
+static void ShowActions() {
+    g_level = 1; g_nActs = 0;
+    static char text[6][96];
+    const char* rows[6];
+    int n = 0;
+    auto add = [&](int act, const char* t) { g_acts[g_nActs++] = act; snprintf(text[n], 96, "%s", t); rows[n] = text[n]; n++; };
+    bool dead = g_sel.kind == 1 && g_gar[g_sel.gi].state == GS_DEAD;
+    if (dead) {
+        char t[96]; snprintf(t, sizeof t, "Repor na garagem ($%d)", g_garPrice); add(AC_REPOR, t);
+    } else {
+        add(AC_CALL, "Chamar");
+        bool out = g_sel.kind == 1 && g_gar[g_sel.gi].state != GS_TOGARAGE && !(g_gar[g_sel.gi].state == GS_LIVE && g_gar[g_sel.gi].inGarage);
+        if (out) add(AC_TOGARAGE, "Mandar para a garagem");
+        if (PlateCapable(g_sel.model)) add(AC_PLATE, "Trocar placa");
+        g_price = SellPrice(g_sel.model, ItemHealth(g_sel));
+        char t[96]; snprintf(t, sizeof t, "Vender ($%d)", g_price); add(AC_SELL, t);
+    }
+    char title[96];
+    if (ItemPlate(g_sel)[0]) snprintf(title, sizeof title, "%s (%s)", CarName(g_sel.model), ItemPlate(g_sel));
+    else snprintf(title, sizeof title, "%s", CarName(g_sel.model));
+    ShowRows(title, ItemStatus(g_sel), rows, n);
+}
+static void ShowConfirm() {
+    g_level = 2; g_nActs = 0;
+    static char yes[96];
+    snprintf(yes, sizeof yes, "Sim, vender por $%d", g_price);
+    const char* rows[2] = { yes, "Nao" };
+    g_acts[g_nActs++] = AC_YES; g_acts[g_nActs++] = AC_NO;
+    ShowRows("Tem certeza?", CarName(g_sel.model), rows, 2);
+}
+static bool g_garHooked = false;
+static void OpenMenu() {
+    if (!g_garHooked) { GarHelp("Garagem desligada: os ganchos nao entraram (veja o GTMTouchSA.log)."); return; }
+    BuildItems();
+    if (!g_nItems) { GarHelp("Voce ainda nao tem carros guardados nas suas garagens."); return; }
+    g_page = 0; g_menuOpen = true; g_menuOpenAt = GetTickCount(); g_garSel = g_garCancel = false;
+    if (!ModelLoaded(330)) { RequestModel(330, 2); LoadAllRequestedModels(false); }   // celular
+    PlayerControl(false);
+    Phone(true);
+    ShowList();
+    Log("garagem: lista aberta (%d carros)", g_nItems);
+}
+
+// ---------------------------------------------------------------- entrega (Grove dirigindo ate voce)
+static bool FindSpawnNode(V3 p, const float* m, V3* out, float* heading) {
+    float fx = m ? m[4] : 0.f, fy = m ? m[5] : 1.f;
+    static const float ang[] = { 180.f, 140.f, 220.f, 100.f, 260.f, 0.f };
+    static const float dist[] = { 150.f, 120.f, 190.f };
+    for (float d : dist) for (float a : ang) {
+        float r = a * 3.14159265f / 180.f, c = cosf(r), s = sinf(r);
+        float x = p.x + (fx * c - fy * s) * d, y = p.y + (fx * s + fy * c) * d;
+        int o[4] = {};
+        Cmd cmd(0x03D3); cmd.F(x).F(y).F(p.z).Out(0).Out(1).Out(2).Out(3);
+        RunCmd(cmd, o, 4);
+        V3 n = { AsF(o[0]), AsF(o[1]), AsF(o[2]) };
+        float dd = Dist2(n, p);
+        if (dd > 70.f && dd < 260.f) { *out = n; *heading = AsF(o[3]); return true; }
+    }
+    return false;
+}
+static void DriveTo(GarCar& g, V3 p) {
+    Cmd c(0x00A7); c.I(g.veh).F(p.x).F(p.y).F(p.z); RunCmd(c);
+    g.lastTarget = p; g.tTarget = GetTickCount();
+}
+static bool LoadModelsNow(const BYTE* blob, int ped) {
+    if (blob) RequestBlobModels(blob);
+    if (ped > 0) RequestModel(ped, 2);
+    LoadAllRequestedModels(false);
+    return (!blob || BlobModelsLoaded(blob)) && (ped <= 0 || ModelLoaded(ped));
+}
+static bool StartDelivery(int i) {
+    GarCar& g = g_gar[i];
+    char* ped = PlayerPed();
+    if (!ped) return false;
+    V3 p = EntityPos(ped), node; float hd = 0.f;
+    if (!FindSpawnNode(p, Rd<const float*>(ped, 0x14), &node, &hd)) { GarHelp("Nao achei uma rua para o carro vir. Tente de outro lugar."); return false; }
+    static const int kFam[3] = { 105, 106, 107 };
+    int fam = kFam[GetTickCount() % 3];
+    if (!LoadModelsNow(g.blob, fam)) { GarHelp("O carro nao carregou. Tente de novo."); return false; }
+    BYTE b[0x40]; memcpy(b, g.blob, sizeof b);
+    float* pos = (float*)b; pos[0] = node.x; pos[1] = node.y; pos[2] = node.z + 1.0f;
+    float r = hd * 3.14159265f / 180.f;
+    b[0x3C] = (BYTE)(signed char)(-sinf(r) * 100.f); b[0x3D] = (BYTE)(signed char)(cosf(r) * 100.f); b[0x3E] = 0;
+    char* v = SpawnCar(g, b);
+    if (!v) { GarHelp("O carro nao pode ser criado agora. Tente de novo."); return false; }
+    g.veh = VehRef(v);
+    g.flags40 = Rd<DWORD>(v, 0x40); g.b42B = Rd<BYTE>(v, 0x42B);
+    *(DWORD*)(v + 0x40) |= kProofMask;                                        // bala, fogo, colisao, golpe, explosao
+    *(BYTE*)(v + 0x42B) |= 0x80;                                              // pneus nao furam
+    int o = -1;
+    { Cmd c(0x0129); c.I(g.veh).I(8).I(fam).Out(0); RunCmd(c, &o, 1); }
+    g.ped = o;
+    { Cmd c(0x0249); c.I(fam); RunCmd(c); }
+    { Cmd c(0x00AD); c.I(g.veh).F(22.f); RunCmd(c); }
+    { Cmd c(0x00AE); c.I(g.veh).I(2); RunCmd(c); }
+    { Cmd c(0x0186); c.I(g.veh).Out(0); RunCmd(c, &o, 1); g.blip = o; }
+    DriveTo(g, p);
+    g.state = GS_DELIVER; g.phase = 0; g.t0 = g.tPhase = GetTickCount(); g.inGarage = 0;
+    g_errand = i; g_errandKind = ER_DELIVER;
+    Log("garagem: %s a caminho, saindo de (%.0f, %.0f), %.0f m, motorista %d%s", CarName(BlobModel(g.blob)), node.x, node.y, Dist2(node, p), fam, g.dentLen ? ", com os amassados" : "");
+    GarHelp("%s a caminho.", CarName(BlobModel(g.blob)));
+    return true;
+}
+static void EndDelivery(GarCar& g, const char* how) {
+    char* v = VehByRef(g.veh);
+    if (v) {                                                                  // volta as marcas que ele tinha
+        *(DWORD*)(v + 0x40) = (Rd<DWORD>(v, 0x40) & ~kProofMask) | (g.flags40 & kProofMask);
+        *(BYTE*)(v + 0x42B) = (Rd<BYTE>(v, 0x42B) & 0x7F) | (g.b42B & 0x80);
+        Cmd c(0x020A); c.I(g.veh).I(1); RunCmd(c);
+    }
+    if (g.blip >= 0) { Cmd c(0x0164); c.I(g.blip); RunCmd(c); g.blip = -1; }
+    if (PedByRef(g.ped)) { Cmd c(0x01C2); c.I(g.ped); RunCmd(c); }
+    g.ped = -1;
+    g.state = v ? GS_LIVE : GS_AWAY;
+    g_errand = -1; g_errandKind = ER_NONE;
+    Log("garagem: entrega terminada (%s)", how);
+}
+static void DeliveryTick(GarCar& g) {
+    char* v = VehByRef(g.veh); char* d = PedByRef(g.ped); char* me = PlayerPed();
+    DWORD now = GetTickCount();
+    if (!v) { EndDelivery(g, "o carro sumiu"); return; }
+    if (!me) return;
+    V3 vp = EntityPos(v), pp = EntityPos(me);
+    float dist = Dist2(vp, pp);
+    bool driverIn = d && Rd<float>(d, 0x540) > 0.f && (Rd<BYTE>(d, 0x46D) & 1) && Rd<char*>(d, 0x58C) == v;
+    if (g.phase < 2 && !driverIn) { int pr = g.ped; EndDelivery(g, "o motorista saiu ou morreu"); if (PedByRef(pr)) { Cmd c(0x01C2); c.I(pr); RunCmd(c); } return; }
+    if (g.phase == 0) {
+        if (now - g.tTarget > 3000 && Dist2(g.lastTarget, pp) > 15.f) DriveTo(g, pp);
+        if (dist < 14.f) { Cmd c(0x00AD); c.I(g.veh).F(0.f); RunCmd(c); g.phase = 1; g.tPhase = now; }
+        else if (now - g.t0 > 100000) {                                       // preso no transito: aparece numa rua perto
+            int o[4] = {};
+            Cmd cn(0x03D3); cn.F(pp.x).F(pp.y).F(pp.z).Out(0).Out(1).Out(2).Out(3); RunCmd(cn, o, 4);
+            { Cmd c(0x00AB); c.I(g.veh).F(AsF(o[0])).F(AsF(o[1])).F(AsF(o[2]) + 1.f); RunCmd(c); }
+            { Cmd c(0x0175); c.I(g.veh).F(AsF(o[3])); RunCmd(c); }
+            Log("garagem: o carro demorou; apareceu na rua mais perto");
+            g.t0 = now;
+        }
+    } else if (g.phase == 1) {
+        const float* mv = (const float*)(v + 0x44);
+        float sp = sqrtf(mv[0] * mv[0] + mv[1] * mv[1] + mv[2] * mv[2]);
+        if (sp < 0.02f || now - g.tPhase > 4000) { Cmd c(0x0633); c.I(g.ped); RunCmd(c); g.phase = 2; g.tPhase = now; }
+    } else if (g.phase == 2) {
+        bool out = !d || !(Rd<BYTE>(d, 0x46D) & 1);
+        if (out || now - g.tPhase > 6000) {
+            if (d) { Cmd c(0x05DE); c.I(g.ped); RunCmd(c); }
+            Log("garagem: %s entregue a %.0f m", CarName(BlobModel(g.blob)), dist);
+            GarHelp("%s entregue.", CarName(BlobModel(g.blob)));
+            EndDelivery(g, "entregue");
+        }
+    }
+}
+
+// ---------------------------------------------------------------- busca a pe (Grove leva para a garagem, comprador leva o vendido)
+static bool StartPickup(int i, bool sold) {
+    GarCar& g = g_gar[i];
+    char* v = VehByRef(g.veh); char* me = PlayerPed();
+    if (!v || !me) return false;
+    V3 cp = EntityPos(v), pp = EntityPos(me);
+    float dx = cp.x - pp.x, dy = cp.y - pp.y, l = sqrtf(dx * dx + dy * dy); if (l < 1.f) { dx = 0.f; dy = 1.f; l = 1.f; }
+    V3 spot = cp;
+    static const float side[] = { 0.f, 90.f, -90.f, 180.f };
+    for (float a : side) {                                                   // calcada a uns 35 m do carro, do lado oposto ao seu
+        float r = a * 3.14159265f / 180.f, ux = dx / l, uy = dy / l;
+        float tx = cp.x + (ux * cosf(r) - uy * sinf(r)) * 35.f, ty = cp.y + (ux * sinf(r) + uy * cosf(r)) * 35.f;
+        int o[3] = {};
+        Cmd c(0x02C0); c.F(tx).F(ty).F(cp.z).Out(0).Out(1).Out(2); RunCmd(c, o, 3);
+        V3 n = { AsF(o[0]), AsF(o[1]), AsF(o[2]) };
+        if (Dist2(n, pp) > 25.f && Dist2(n, cp) < 80.f) { spot = n; break; }
+    }
+    static const int kFam[3] = { 105, 106, 107 }, kBuyer[3] = { 28, 29, 30 };   // Grove / traficantes
+    int model = sold ? kBuyer[GetTickCount() % 3] : kFam[GetTickCount() % 3];
+    if (!LoadModelsNow(nullptr, model)) { GarHelp("Ninguem disponivel agora. Tente de novo."); return false; }
+    int o = -1;
+    { Cmd c(0x009A); c.I(sold ? 4 : 8).I(model).F(spot.x).F(spot.y).F(spot.z + 1.f).Out(0); RunCmd(c, &o, 1); }
+    { Cmd c(0x0249); c.I(model); RunCmd(c); }
+    if (!PedByRef(o)) { GarHelp("Ninguem disponivel agora. Tente de novo."); return false; }
+    g.ped = o;
+    { Cmd c(0x020A); c.I(g.veh).I(1); RunCmd(c); }                           // destranca
+    { Cmd c(0x05CB); c.I(g.ped).I(g.veh).I(30000); RunCmd(c); }               // entrar como motorista
+    g.state = GS_PICKUP; g.phase = 0; g.t0 = g.tPhase = GetTickCount(); g.inGarage = 0;
+    g_errand = i; g_errandKind = sold ? ER_SOLD : ER_TOGARAGE;
+    Log("garagem: %s vem buscar o %s", sold ? "o comprador" : "um membro da Grove", CarName(BlobModel(g.blob)));
+    return true;
+}
+static void FinishPickup(GarCar& g, bool vanish, const char* how) {
+    int i = (int)(&g - g_gar);
+    bool sold = g_errandKind == ER_SOLD;
+    char* v = VehByRef(g.veh);
+    if (vanish) {
+        if (v && !sold) CaptureCar(g, v);
+        if (PedByRef(g.ped)) { Cmd c(0x009B); c.I(g.ped); RunCmd(c); }
+        if (v) { Cmd c(0x00A6); c.I(g.veh); RunCmd(c); }
+        g.ped = -1; g.veh = -1;
+        g_errand = -1; g_errandKind = ER_NONE;
+        Log("garagem: %s levado (%s)", CarName(BlobModel(g.blob)), how);
+        if (sold) RemoveGar(i); else g.state = GS_TOGARAGE;
+        return;
+    }
+    if (PedByRef(g.ped)) { Cmd c(0x01C2); c.I(g.ped); RunCmd(c); }           // desistiu: o carro fica onde esta
+    g.ped = -1;
+    g_errand = -1; g_errandKind = ER_NONE;
+    Log("garagem: busca interrompida (%s)", how);
+    if (sold) { if (v) *(BYTE*)(v + 0x4A4) = 1; RemoveGar(i); }                 // vendido e pago: vira carro comum
+    else g.state = v ? GS_LIVE : GS_AWAY;
+}
+static void PickupTick(GarCar& g) {
+    char* v = VehByRef(g.veh); char* d = PedByRef(g.ped); char* me = PlayerPed();
+    DWORD now = GetTickCount();
+    if (!me) return;
+    if (!v) { FinishPickup(g, true, "o carro sumiu"); return; }
+    if (v == PlayerVehicle()) { FinishPickup(g, false, "voce entrou no carro"); return; }
+    if (!d || Rd<float>(d, 0x540) <= 0.f) { FinishPickup(g, false, "quem vinha buscar morreu"); return; }
+    V3 vp = EntityPos(v), pp = EntityPos(me);
+    float dist = Dist2(vp, pp);
+    bool onScreen = false;
+    { Cmd c(0x02CA); c.I(g.veh); onScreen = RunCmd(c); }
+    bool in = (Rd<BYTE>(d, 0x46D) & 1) && Rd<char*>(d, 0x58C) == v;
+    if (g.phase == 0) {
+        if (in) {
+            { Cmd c(0x00AD); c.I(g.veh).F(18.f); RunCmd(c); }
+            { Cmd c(0x00AE); c.I(g.veh).I(2); RunCmd(c); }
+            { Cmd c(0x00A8); c.I(g.veh); RunCmd(c); }                         // sai dirigindo pela cidade
+            g.phase = 1; g.tPhase = now;
+        } else if (now - g.t0 > 40000 && !onScreen) FinishPickup(g, true, "fora de vista");
+        else if (now - g.t0 > 90000) FinishPickup(g, true, "demorou");
+    } else {
+        if (dist > 90.f || (!onScreen && dist > 40.f) || now - g.tPhase > 60000) FinishPickup(g, true, "saiu dirigindo");
+    }
+}
+
+// ---------------------------------------------------------------- acoes da lista
+static bool CanUseNow(const GarItem& it, char** liveVeh) {
+    *liveVeh = nullptr;
+    if (it.kind == 1 && g_gar[it.gi].state == GS_LIVE) {
+        char* v = VehByRef(g_gar[it.gi].veh);
+        if (v && v == PlayerVehicle()) { GarHelp("Saia do carro antes."); return false; }
+        *liveVeh = v;
+    }
+    return true;
+}
+static void DoCall() {
+    if (g_errand >= 0) { GarHelp("A Grove ja esta ocupada com outro carro seu."); return; }
+    if (*(volatile int*)0xB72914 != 0) { GarHelp("Chame o carro ao ar livre."); return; }
+    char* v; if (!CanUseNow(g_sel, &v)) return;
+    V3 pp = EntityPos(PlayerPed());
+    if (g_sel.kind == 0) {
+        BYTE* slot = SlotPtr(g_sel.house, g_sel.slot);
+        GarCar* g = NewGar(g_sel.house, g_sel.slot, slot);
+        if (!g) return;
+        g->state = GS_AWAY;
+        memcpy(g->plate, g_slotPlate[g_sel.house][g_sel.slot], 9);
+        int gi = (int)(g - g_gar);
+        if (StartDelivery(gi)) { *(WORD*)(slot + 0x12) = 0; g_slotPlate[g_sel.house][g_sel.slot][0] = 0; }   // sai da vaga
+        else RemoveGar(gi);
+        return;
+    }
+    GarCar& g = g_gar[g_sel.gi];
+    if (g.state == GS_LIVE && v) {
+        if (Dist2(EntityPos(v), pp) < 70.f) { GarHelp("%s esta aqui perto.", CarName(g_sel.model)); return; }
+        CaptureCar(g, v); Cmd c(0x00A6); c.I(g.veh); RunCmd(c);
+    }
+    g.veh = -1; g.state = GS_AWAY;
+    StartDelivery(g_sel.gi);
+}
+static void DoToGarage() {
+    char* v; if (!CanUseNow(g_sel, &v)) return;
+    GarCar& g = g_gar[g_sel.gi];
+    if (g.state == GS_LIVE && v && Dist2(EntityPos(v), EntityPos(PlayerPed())) < 70.f) {
+        if (g_errand >= 0) { GarHelp("A Grove ja esta ocupada com outro carro seu."); return; }
+        if (StartPickup(g_sel.gi, false)) GarHelp("Um membro da Grove vem buscar o %s.", CarName(g_sel.model));
+        return;
+    }
+    if (g.state == GS_LIVE && v) { CaptureCar(g, v); Cmd c(0x00A6); c.I(g.veh); RunCmd(c); }
+    g.veh = -1; g.state = GS_TOGARAGE; g.waitLogged = 0;
+    Log("garagem: %s indo para a garagem (casa %d)%s", CarName(g_sel.model), g.house, g.noSpot ? "; sem vaga agora, espera abrir espaco" : "");
+    if (g.noSpot) GarHelp("A garagem do %s esta cheia. Ele entra quando abrir espaco.", CarName(g_sel.model));
+    else GarHelp("%s vai para a garagem.", CarName(g_sel.model));
+}
+static void DoSell() {
+    char* v; if (!CanUseNow(g_sel, &v)) return;
+    int price = g_price;
+    if (g_sel.kind == 0) {
+        *(WORD*)(SlotPtr(g_sel.house, g_sel.slot) + 0x12) = 0;
+        g_slotPlate[g_sel.house][g_sel.slot][0] = 0;
+    } else {
+        GarCar& g = g_gar[g_sel.gi];
+        if (g.state == GS_LIVE && v && Dist2(EntityPos(v), EntityPos(PlayerPed())) < 70.f) {
+            if (g_errand >= 0) { GarHelp("O comprador so pode vir depois do servico da Grove em andamento."); return; }
+            if (!StartPickup(g_sel.gi, true)) return;
+            AddMoney(price);
+            Log("garagem: %s vendido por $%d; o comprador vem buscar", CarName(g_sel.model), price);
+            GarHelp("%s vendido por $%d. O comprador vem buscar.", CarName(g_sel.model), price);
+            return;
+        }
+        if (g.state == GS_LIVE && v) { Cmd c(0x00A6); c.I(g.veh); RunCmd(c); }
+        RemoveGar(g_sel.gi);
+    }
+    AddMoney(price);
+    Log("garagem: %s vendido por $%d", CarName(g_sel.model), price);
+    GarHelp("%s vendido por $%d.", CarName(g_sel.model), price);
+}
+static void DoRepor() {
+    GarCar& g = g_gar[g_sel.gi];
+    int* money = (int*)(PlayerInfo() + 0xB8);
+    if (*money < g_garPrice) { GarHelp("Repor custa $%d. Dinheiro insuficiente.", g_garPrice); return; }
+    AddMoney(-g_garPrice);
+    // novo e inteiro; entra na garagem pelo mesmo caminho do "mandar para a garagem" (porta fechada, lugar livre)
+    g.state = GS_TOGARAGE; g.veh = -1; g.hasDmg = 0; g.health = 0.f; g.dentLen = 0; g.waitLogged = 0;
+    Log("garagem: %s reposto por $%d; vai para a garagem (casa %d)", CarName(g_sel.model), g_garPrice, g.house);
+    GarHelp("%s reposto por $%d. Ele aparece na garagem.", CarName(g_sel.model), g_garPrice);
+}
+// ---------------------------------------------------------------- trocar placa (teclado do iPhone pelo overlay, ou do PC)
+// Arquivo compartilhado: [128..191] pedido do jogo (GTMK), [192..255] resposta do overlay (GTMA).
+#pragma pack(push, 1)
+struct KbReqBlock { DWORD magic, seq; BYTE maxLen, kind, pad[2]; char title[32]; char text[16]; BYTE pad2[4]; };
+struct KbAnsBlock { DWORD magic, seq, result; char text[16]; BYTE pad[36]; };   // result 1 salvar, 2 cancelar
+#pragma pack(pop)
+static_assert(sizeof(KbReqBlock) == 64 && sizeof(KbAnsBlock) == 64, "layout kb");
+static const DWORD KBREQ_MAGIC = 0x4B4D5447, KBANS_MAGIC = 0x414D5447;          // "GTMK", "GTMA"
+static volatile int g_kbMode = 0;                                                  // 0 nada, 1 iPhone, 2 PC
+static DWORD g_kbSeq = 0, g_kbT0 = 0, g_kbShowT = 0, g_kbDeadSince = 0;
+static GarItem g_kbItem;
+static char  g_kbBuf[9];
+static bool  g_kbPrev[256];
+static volatile bool g_kbCancel = false;
+static void KbWriteReq(const KbReqBlock& r) {
+    if (g_file == INVALID_HANDLE_VALUE) return;
+    EnterCriticalSection(&g_io);
+    OVERLAPPED o = {}; o.Offset = 128; DWORD n;
+    WriteFile(g_file, &r, sizeof r, &n, &o);
+    LeaveCriticalSection(&g_io);
+}
+static bool KbReadAns(KbAnsBlock* a) {
+    if (g_file == INVALID_HANDLE_VALUE) return false;
+    EnterCriticalSection(&g_io);
+    OVERLAPPED o = {}; o.Offset = 192; DWORD n = 0;
+    BOOL ok = ReadFile(g_file, a, sizeof *a, &n, &o);
+    LeaveCriticalSection(&g_io);
+    return ok && n == sizeof *a && a->magic == KBANS_MAGIC;
+}
+static void KbSnapshotKeys() {
+    for (int k = 0; k < 256; k++) g_kbPrev[k] = (GetAsyncKeyState(k) & 0x8000) != 0;
+}
+static void StartPlate() {
+    if (g_menu >= 0) { Cmd c(0x08DA); c.I(g_menu); RunCmd(c); g_menu = -1; }
+    g_menuOpen = false; g_level = 0;                                          // o telefone fica no ouvido
+    g_kbItem = g_sel; g_kbT0 = GetTickCount(); g_kbCancel = false; g_kbDeadSince = 0;
+    const char* cur = ItemPlate(g_kbItem);
+    HostBlock h;
+    bool overlay = ReadHost(&h);
+    if (overlay && h.version < 4) {                                           // overlay antigo: sem teclado
+        PlayerControl(true); g_phoneOffAt = GetTickCount() + 1200;
+        Log("garagem: overlay de toque protocolo %u nao tem o teclado da placa (precisa do 3.3)", (unsigned)h.version);
+        GarHelp("Para digitar a placa no iPhone, instale o IPA novo (overlay 3.3).");
+        return;
+    }
+    if (overlay) {
+        DWORD seq = GetTickCount() | 1; if (seq == g_kbSeq) seq += 2;
+        g_kbSeq = seq; g_kbMode = 1;
+        KbReqBlock r = {};
+        r.magic = KBREQ_MAGIC; r.seq = seq; r.maxLen = 8; r.kind = 1;
+        snprintf(r.title, sizeof r.title, "Placa do %s", CarName(g_kbItem.model));
+        snprintf(r.text, sizeof r.text, "%s", cur);
+        KbWriteReq(r);
+        Log("garagem: placa do %s pelo teclado do iPhone", CarName(g_kbItem.model));
+    } else {
+        g_kbMode = 2; snprintf(g_kbBuf, sizeof g_kbBuf, "%s", cur); g_kbShowT = 0;
+        KbSnapshotKeys();
+        Log("garagem: placa do %s pelo teclado do PC", CarName(g_kbItem.model));
+    }
+}
+static void ApplyPlate(const GarItem& it, const char* p) {
+    const char* name = CarName(it.model);
+    if (!ItemValid(it)) { GarHelp("A situacao do %s mudou. Tente de novo.", name); return; }
+    if (it.kind == 0) {
+        memcpy(g_slotPlate[it.house][it.slot], p, 9);
+        Log("garagem: placa do %s (casa %d vaga %d): \"%s\"", name, it.house, it.slot + 1, p);
+        if (p[0]) GarHelp("Placa do %s: %s. Aparece quando ele sair da garagem.", name, p);
+        else GarHelp("O %s volta a usar a placa do jogo.", name);
+        return;
+    }
+    GarCar& g = g_gar[it.gi];
+    char* v = g.state == GS_LIVE ? VehByRef(g.veh) : nullptr;
+    if (v && !ApplyPlateNow(v, p)) { GarHelp("O %s nao tem placa.", name); return; }
+    memcpy(g.plate, p, 9);
+    Log("garagem: placa do %s: \"%s\"%s", name, p, v ? " (trocada na hora)" : " (quando ele surgir)");
+    if (!p[0]) GarHelp("O %s volta a usar a placa do jogo.", name);
+    else if (v) GarHelp("Placa do %s: %s.", name, p);
+    else GarHelp("Placa do %s: %s. Aparece quando ele surgir.", name, p);
+}
+static void EndPlate(bool ok, const char* text) {
+    if (g_kbMode == 1) { KbReqBlock r = {}; r.magic = KBREQ_MAGIC; KbWriteReq(r); }   // seq 0: overlay fecha o teclado
+    g_kbMode = 0;
+    PlayerControl(true);
+    g_phoneOffAt = GetTickCount() + 1200;
+    if (!ok) { Log("garagem: troca de placa cancelada"); GarHelp("Placa mantida."); return; }
+    char p[9]; CleanPlate(text, p);
+    ApplyPlate(g_kbItem, p);
+}
+static void PlateTick() {
+    if (!g_kbMode) return;
+    char* me = PlayerPed();
+    DWORD now = GetTickCount();
+    if (!me || Rd<float>(me, 0x540) <= 0.f || PlayerVehicle() || g_kbCancel || now - g_kbT0 > 180000) { EndPlate(false, ""); return; }
+    if (g_kbMode == 1) {
+        KbAnsBlock a;
+        if (KbReadAns(&a) && a.seq == g_kbSeq) { a.text[15] = 0; EndPlate(a.result == 1, a.text); return; }
+        HostBlock h;
+        if (ReadHost(&h)) g_kbDeadSince = 0;
+        else if (!g_kbDeadSince) g_kbDeadSince = now;
+        else if (now - g_kbDeadSince > 3000) { Log("garagem: o overlay parou de responder"); EndPlate(false, ""); }
+        return;
+    }
+    // teclado do PC: letras, numeros, espaco; Backspace apaga; Enter salva; Esc cancela
+    if (MenuActive()) { EndPlate(false, ""); return; }
+    bool changed = false;
+    for (int k = 0; k < 256; k++) {
+        bool down = (GetAsyncKeyState(k) & 0x8000) != 0, edge = down && !g_kbPrev[k];
+        g_kbPrev[k] = down;
+        if (!edge) continue;
+        int len = (int)strlen(g_kbBuf);
+        char c = 0;
+        if (k >= 'A' && k <= 'Z') c = (char)k;
+        else if (k >= '0' && k <= '9') c = (char)k;
+        else if (k >= VK_NUMPAD0 && k <= VK_NUMPAD9) c = (char)('0' + k - VK_NUMPAD0);
+        else if (k == VK_SPACE) c = ' ';
+        if (c) { if (len < 8 && !(c == ' ' && len == 0)) { g_kbBuf[len] = c; g_kbBuf[len + 1] = 0; changed = true; } }
+        else if (k == VK_BACK) { if (len) { g_kbBuf[len - 1] = 0; changed = true; } }
+        else if (k == VK_RETURN) { EndPlate(true, g_kbBuf); return; }
+        else if (k == VK_ESCAPE) { EndPlate(false, ""); return; }
+    }
+    if (changed || now - g_kbShowT > 4000) {
+        g_kbShowT = now;
+        GarHelp("Placa do %s: %s_  (Enter salva, Esc cancela)", CarName(g_kbItem.model), g_kbBuf);
+    }
+}
+static void PickRow(int row) {
+    if (g_level == 0) {
+        int first = g_page * 11, n = g_nItems - first; if (n > 11) n = 11;
+        if (row >= n) {                                                       // "Mais..." / "Voltar ao inicio"
+            if (g_nItems > 11) { g_page = g_nItems > first + 11 ? g_page + 1 : 0; ShowList(); }
+            return;
+        }
+        g_sel = g_items[first + row];
+        if (!ItemValid(g_sel)) { BuildItems(); ShowList(); return; }
+        ShowActions();
+        return;
+    }
+    if (row < 0 || row >= g_nActs) return;
+    int act = g_acts[row];
+    if (act == AC_NO) { ShowActions(); return; }
+    if (act == AC_SELL) { ShowConfirm(); return; }
+    if (!ItemValid(g_sel)) { CloseMenu(false); GarHelp("A situacao desse carro mudou. Abra a lista de novo."); return; }
+    if (act == AC_PLATE) { StartPlate(); return; }
+    CloseMenu(true);                                                          // todas as acoes sao uma ligacao
+    if (act == AC_CALL) DoCall();
+    else if (act == AC_TOGARAGE) DoToGarage();
+    else if (act == AC_YES) DoSell();
+    else if (act == AC_REPOR) DoRepor();
+}
+static void MenuTick() {
+    if (!g_menuOpen) return;
+    char* me = PlayerPed();
+    if (!me || MenuActive() || PlayerVehicle() || Rd<float>(me, 0x540) <= 0.f) { CloseMenu(false); return; }
+    if (g_garCancel) {                                                        // Pular volta um nivel
+        g_garCancel = false;
+        if (g_level == 2) ShowActions();
+        else if (g_level == 1) { BuildItems(); if (!g_nItems) CloseMenu(false); else { if (g_page * 11 >= g_nItems) g_page = 0; ShowList(); } }
+        else { CloseMenu(false); Log("garagem: lista fechada"); }
+        return;
+    }
+    if (g_garSel) {
+        g_garSel = false;
+        int row = 0;
+        { Cmd c(0x08D7); c.I(g_menu).Out(0); RunCmd(c, &row, 1); }
+        PickRow(row);
+    }
+}
+
+// carros meus na rua: nao somem, saem da memoria quando longe, voltam quando perto, destruidos ficam para repor
+static DWORD g_garTick = 0;
+static void CarsTick() {
+    DWORD now = GetTickCount();
+    if (now - g_garTick < 500) return;
+    g_garTick = now;
+    char* me = PlayerPed();
+    if (!me) return;
+    V3 pp = EntityPos(me);
+    bool outside = *(volatile int*)0xB72914 == 0;
+    char* pv = PlayerVehicle();
+    static DWORD spotTick = 0;
+    if (now - spotTick > 2000) { spotTick = now; ComputeSpots(); }
+    for (int i = g_nGar - 1; i >= 0; i--) {
+        GarCar& g = g_gar[i];
+        if (g.state == GS_LIVE) {
+            char* v = VehByRef(g.veh);
+            if (!v && g.parked) {                                           // a garagem apagou sem guardar: nao coube
+                g.state = GS_TOGARAGE; g.veh = -1; g.parked = 0; g.waitLogged = 0;
+                Log("garagem: %s nao coube na garagem onde voce deixou; vai para a garagem dele quando houver espaco", CarName(BlobModel(g.blob)));
+                continue;
+            }
+            if (!v) { g.state = GS_AWAY; g.veh = -1; Log("garagem: %s saiu da memoria; volta quando voce chegar perto", CarName(BlobModel(g.blob))); continue; }
+            if ((Rd<BYTE>(v, 0x36) >> 3) == 5) {                              // STATUS_WRECKED
+                g.state = GS_DEAD; *(BYTE*)(v + 0x4A4) = 1; g.veh = -1; g.dentLen = 0;
+                Log("garagem: %s destruido", CarName(BlobModel(g.blob)));
+                GarHelp("Seu %s foi destruido. Reponha pelo telefone por $%d.", CarName(BlobModel(g.blob)), g_garPrice);
+                continue;
+            }
+            V3 vp = EntityPos(v);
+            if (g.inGarage && Dist2(vp, *(V3*)g.home) > 25.f) { g.inGarage = 0; *(BYTE*)(v + 0x4A4) = 2; }
+            if (g.inGarage) continue;
+            // parado dentro de uma garagem sua: o jogo so guarda carros que nao sao de script
+            bool parked = v != pv && HideoutGarageAt(vp) != nullptr;
+            if (parked != (g.parked != 0)) { g.parked = parked; *(BYTE*)(v + 0x4A4) = parked ? 1 : 2; if (parked) Log("garagem: %s estacionado numa garagem sua; ela guarda quando voce sair", CarName(BlobModel(g.blob))); }
+            if (!parked && Rd<BYTE>(v, 0x4A4) != 2) *(BYTE*)(v + 0x4A4) = 2;
+            CaptureCar(g, v);
+            if (!parked && v != pv && Dist2(vp, pp) > 350.f) {
+                Cmd c(0x00A6); c.I(g.veh); RunCmd(c);
+                g.state = GS_AWAY; g.veh = -1;
+                Log("garagem: %s longe; guardado na memoria em (%.0f, %.0f)", CarName(BlobModel(g.blob)), vp.x, vp.y);
+            }
+        } else if (g.state == GS_AWAY && outside && g_errand != i) {
+            if (Dist2(BlobPos(g.blob), pp) > 180.f) continue;
+            RequestBlobModels(g.blob);
+            if (!BlobModelsLoaded(g.blob)) continue;
+            if (char* v = SpawnCar(g, g.blob)) {
+                g.veh = VehRef(v); g.state = GS_LIVE; g.parked = 0;
+                Log("garagem: %s de volta em (%.0f, %.0f)%s", CarName(BlobModel(g.blob)), BlobPos(g.blob).x, BlobPos(g.blob).y, g.dentLen ? " com os amassados" : "");
+            }
+        } else if (g.state == GS_TOGARAGE) {
+            // so entra na vaga com a garagem fechada e voce longe dela (a garagem apaga as vagas antes de guardar)
+            V3 home = *(V3*)g.home;
+            if (Dist2(home, pp) < 60.f) continue;
+            char* gr = GarageOfHouse(g.house, home);
+            if (gr && Rd<BYTE>(gr, 0x4D) != 0) continue;                       // porta aberta: os carros dela estao no mundo
+            int s = -1;
+            for (int k = 0; k < 4 && s < 0; k++) if (!BlobModel(SlotPtr(g.house, k))) s = k;
+            BYTE b[0x40]; memcpy(b, g.blob, sizeof b);
+            memcpy(b, g.home, 12); memcpy(b + 0x3C, g.homeDir, 3);
+            bool moved = false;
+            if (s >= 0 && gr) {                                                // lugar livre, sem encostar nos que estao la
+                Box2 obs[8]; int n = GarageObstacles(g.house, gr, obs, 8);
+                float w, l; Dims(BlobModel(b), &w, &l);
+                Box2 c;
+                if (!FindFreeSpot(gr, w, l, home, g.homeDir[0], g.homeDir[1], obs, n, &c)) s = -2;
+                else if (fabsf(c.x - home.x) > 0.05f || fabsf(c.y - home.y) > 0.05f || c.fx * g.homeDir[0] + c.fy * g.homeDir[1] < 0.f) {
+                    float* bp = (float*)b; bp[0] = c.x; bp[1] = c.y;
+                    b[0x3C] = (BYTE)(signed char)(int)floorf(c.fx * 100.f + .5f); b[0x3D] = (BYTE)(signed char)(int)floorf(c.fy * 100.f + .5f); b[0x3E] = 0;
+                    moved = true;
+                }
+            }
+            if (s < 0) {
+                if (!g.waitLogged) { g.waitLogged = 1; Log("garagem: %s espera vaga na casa %d (%s)", CarName(BlobModel(b)), g.house, s == -1 ? "as 4 vagas estao ocupadas" : "nao ha espaco livre dentro dela"); }
+                continue;
+            }
+            memcpy(SlotPtr(g.house, s), b, sizeof b);
+            memcpy(g_slotPlate[g.house][s], g.plate, 9);
+            Log("garagem: %s chegou na garagem (casa %d vaga %d%s)", CarName(BlobModel(b)), g.house, s + 1, moved ? ", num lugar livre ao lado" : "");
+            RemoveGar(i);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- junto do save: GTASAsfN.b.gtmgar
+// versao 3: cabecalho, placas das 80 vagas (8 letras cada), e para cada carro seu fora da garagem: registro,
+// amassados (tamanho + dados) e placa (8). A versao 2 nao tem as placas; a 1 nem os amassados.
+#pragma pack(push, 1)
+struct GarFileRec { BYTE state, house, slot, playerCar, hasDmg, pad[3]; BYTE blob[0x40]; float home[3]; signed char homeDir[3], pad2; float health; BYTE dmg[0x18]; };
+#pragma pack(pop)
+static const DWORD GAR_MAGIC = 0x52414747;                                    // 'GGAR'
+static GenericSave_t g_origGenericSave = (GenericSave_t)0x5D13E0;
+static bool __cdecl GenericSaveDetour(int a) {
+    bool ok = g_origGenericSave(a);
+    if (!ok || !g_garOn) return ok;
+    char path[MAX_PATH]; snprintf(path, MAX_PATH, "%s.gtmgar", SaveFileName);
+    char* pv = PlayerVehicle() ? PlayerVehicle() : g_saveVeh;                  // o DoSave tira o CJ do carro so para gravar
+    FILE* f = fopen(path, "wb");
+    if (!f) { Log("garagem: nao gravou %s", path); return ok; }
+    DWORD hdr[4] = { GAR_MAGIC, 3, *TimeMs, 0 };
+    fwrite(hdr, sizeof hdr, 1, f);
+    int plates = 0;
+    for (int h = 0; h < 20; h++) for (int s = 0; s < 4; s++) {
+        char t[8] = {};
+        if (BlobModel(SlotPtr(h, s)) && g_slotPlate[h][s][0]) { memcpy(t, g_slotPlate[h][s], 8); plates++; }
+        fwrite(t, 8, 1, f);
+    }
+    int n = 0, dents = 0;
+    for (int i = 0; i < g_nGar; i++) {
+        GarCar& g = g_gar[i];
+        if (g.state == GS_NONE || (g.state == GS_PICKUP && g_errandKind == ER_SOLD && g_errand == i)) continue;
+        char* v = VehByRef(g.veh);
+        if (v && g.state == GS_DELIVER) { V3 vp = EntityPos(v); memcpy(g.blob, &vp, 12); }   // as marcas de entrega nao vao
+        else if (v && g.state != GS_DEAD) CaptureCar(g, v);
+        if (g.state == GS_LIVE && g.inGarage) continue;                       // a garagem guarda esse
+        GarFileRec r;
+        memset(&r, 0, sizeof r);
+        r.state = g.state == GS_DEAD ? GS_DEAD : g.state == GS_TOGARAGE ? GS_TOGARAGE : GS_AWAY;
+        r.house = g.house; r.slot = g.slot;
+        r.playerCar = v && v == pv; r.hasDmg = g.hasDmg;
+        memcpy(r.blob, g.blob, sizeof r.blob); memcpy(r.home, g.home, 12); memcpy(r.homeDir, g.homeDir, 3);
+        r.health = g.health; memcpy(r.dmg, g.dmg, sizeof r.dmg);
+        int dl = g.state == GS_DEAD ? 0 : g.dentLen;
+        fwrite(&r, sizeof r, 1, f);
+        fwrite(&dl, 4, 1, f);
+        if (dl) { fwrite(g.dent, dl, 1, f); dents++; }
+        char t[8] = {}; memcpy(t, g.plate, 8);
+        fwrite(t, 8, 1, f);
+        if (t[0]) plates++;
+        n++;
+    }
+    fseek(f, 12, SEEK_SET); fwrite(&n, 4, 1, f);
+    fclose(f);
+    Log("garagem: %d carros seus fora da garagem gravados junto do save (%d com amassados, %d placas)", n, dents, plates);
+    return ok;
+}
+// o arquivo do save carregado e lido logo depois do load (as placas das vagas valem antes de a garagem abrir);
+// os carros de fora entram uns quadros depois, quando o CJ ja voltou (e o carro dele, pelo .gtmveh)
+static int   g_garLoadPending = 0;
+static BYTE* g_garFile = nullptr;
+static long  g_garFileLen = 0;
+static int   g_garFileSlot = 0;
+static void GarOnLoad() {                                                    // logo depois de carregar: o mundo e outro
+    for (int i = 0; i < g_nGar; i++) free(g_gar[i].dent);
+    g_nGar = 0; g_errand = -1; g_errandKind = ER_NONE; g_menuOpen = false; g_menu = -1; g_phoneOffAt = 0; g_level = 0;
+    g_kbMode = 0;
+    memset(g_slotPlate, 0, sizeof g_slotPlate);
+    free(g_garFile); g_garFile = nullptr; g_garFileLen = 0;
+    g_garLoadPending = 0;
+    if (!g_garOn) return;
+    char saved[MAX_PATH]; snprintf(saved, sizeof saved, "%s", SaveFileName);
+    for (int s = 0; s < 8 && !g_garFile; s++) {
+        MakeValidSaveName(s);
+        char path[MAX_PATH]; snprintf(path, MAX_PATH, "%s.gtmgar", SaveFileName);
+        FILE* f = fopen(path, "rb");
+        if (!f) continue;
+        DWORD hdr[4] = {};
+        if (fread(hdr, sizeof hdr, 1, f) == 1 && hdr[0] == GAR_MAGIC && hdr[1] >= 1 && hdr[1] <= 3 && hdr[2] == g_loadedTimeMs && hdr[3] <= 80) {
+            fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+            if (len > 0 && len < 40000000) {
+                g_garFile = (BYTE*)malloc(len);
+                if (g_garFile && fread(g_garFile, len, 1, f) == 1) { g_garFileLen = len; g_garFileSlot = s; }
+                else { free(g_garFile); g_garFile = nullptr; }
+            }
+        }
+        fclose(f);
+    }
+    strcpy(SaveFileName, saved);
+    if (!g_garFile) { g_garLoadPending = 3; return; }
+    const DWORD* hdr = (const DWORD*)g_garFile;
+    int plates = 0;
+    if (hdr[1] >= 3 && g_garFileLen >= 16 + 640) {
+        for (int h = 0; h < 20; h++) for (int s = 0; s < 4; s++) {
+            char t[9] = {}; memcpy(t, g_garFile + 16 + (h * 4 + s) * 8, 8);
+            CleanPlate(t, g_slotPlate[h][s]);
+            if (g_slotPlate[h][s][0]) plates++;
+        }
+    }
+    if (plates) Log("garagem: %d placas das vagas carregadas", plates);
+    g_garLoadPending = 3;
+}
+static void GarLoadTick() {
+    if (!g_garLoadPending) return;
+    if (g_pendingRestore || !PlayerPed()) return;                             // depois do veiculo do autosave
+    if (--g_garLoadPending > 1) return;
+    g_garLoadPending = 0;
+    if (!g_garFile) return;
+    const DWORD* hdr = (const DWORD*)g_garFile;
+    DWORD ver = hdr[1];
+    long pos = 16 + (ver >= 3 ? 640 : 0);
+    int dents = 0, n0 = g_nGar;
+    auto take = [&](void* dst, long len) { if (pos + len > g_garFileLen) return false; if (dst) memcpy(dst, g_garFile + pos, len); pos += len; return true; };
+    for (DWORD k = 0; k < hdr[3]; k++) {
+        GarFileRec r; int dl = 0; char t[9] = {};
+        if (!take(&r, sizeof r)) break;
+        if (ver >= 2 && (!take(&dl, 4) || dl < 0 || dl > 400000 || pos + dl > g_garFileLen)) break;
+        const BYTE* dentData = g_garFile + pos; pos += dl;
+        if (ver >= 3 && !take(t, 8)) break;
+        if (IsImpoundHouse(r.house)) continue;                                // de versoes antigas: patio nao e seu
+        GarCar* g = NewGar(r.house, r.slot, r.blob);
+        if (!g) break;
+        g->state = r.state; g->hasDmg = r.hasDmg; g->health = r.health;
+        memcpy(g->dmg, r.dmg, sizeof g->dmg); memcpy(g->home, r.home, 12); memcpy(g->homeDir, r.homeDir, 3);
+        CleanPlate(t, g->plate);
+        if (dl && (g->dent = (BYTE*)malloc(dl)) != nullptr) { memcpy(g->dent, dentData, dl); g->dentLen = g->dentCap = dl; dents++; }
+        if (r.playerCar) {                                                   // o CJ voltou dentro dele pelo .gtmveh
+            char* pv = PlayerVehicle();
+            if (pv && Rd<short>(pv, 0x22) == BlobModel(r.blob)) {
+                g->state = GS_LIVE; g->veh = VehRef(pv); *(BYTE*)(pv + 0x4A4) = 2;
+                NoteDims(pv);
+                if (g->dentLen && g_ldImport) g_ldImport(pv, g->dent, g->dentLen);
+                if (g->plate[0]) ApplyPlateNow(pv, g->plate);
+            }
+        }
+    }
+    Log("garagem: %d carros seus fora da garagem carregados (slot %d, versao %u, %d com amassados)", g_nGar - n0, g_garFileSlot + 1, (unsigned)ver, dents);
+    free(g_garFile); g_garFile = nullptr; g_garFileLen = 0;
+}
+
+// Status + Pular abre a lista; com a lista aberta, Atirar escolhe e Pular volta
+static bool g_garCombo = false, g_garFireWas = false, g_garJumpWas = true;
+static void GarageCombo(WORD buttons, PadState& p) {
+    if (!g_garOn) return;
+    const WORD LB = 0x0100, FIRE = 0x2000, JUMP = 0x4000;
+    if (g_kbMode) {                                                           // digitando a placa: Pular cancela
+        bool jump = (buttons & JUMP) != 0;
+        if (jump && !g_garJumpWas) g_garCancel = false, g_kbCancel = true;
+        g_garJumpWas = jump; g_garFireWas = true;
+        p.wButtons &= (WORD)~(FIRE | JUMP);
+        return;
+    }
+    if (g_menuOpen) {
+        bool fire = (buttons & FIRE) != 0, jump = (buttons & JUMP) != 0;
+        if (fire && !g_garFireWas) g_garSel = true;
+        if (jump && !g_garJumpWas && GetTickCount() - g_menuOpenAt > 400) g_garCancel = true;
+        g_garFireWas = fire; g_garJumpWas = jump;
+        p.wButtons &= (WORD)~(FIRE | JUMP);
+        return;
+    }
+    g_garFireWas = true; g_garJumpWas = true;
+    if (!(buttons & LB)) { g_garCombo = false; return; }
+    if (!g_garCombo) {
+        if (!(buttons & JUMP)) return;
+        if (g_ctxCache != CTX_FOOT || (g_info.state & (S_ACTPHONE | S_ACTWEAPON | S_ACTOTHER))) return;
+        g_garCombo = true;
+        g_garReq = true;
+        Log("garagem: Status + Pular");
+    }
+    p.wButtons &= (WORD)~JUMP;
+}
+
+static void GarageTick() {
+    if (!g_garOn) return;
+    LdResolve();
+    GarLoadTick();
+    if (g_phoneOffAt && !g_kbMode && GetTickCount() > g_phoneOffAt) { g_phoneOffAt = 0; Phone(false); }
+    if (g_garReq) {
+        g_garReq = false;
+        char* me = PlayerPed();
+        if (me && !g_menuOpen && !g_kbMode && !PlayerVehicle() && !MenuActive()) OpenMenu();
+    }
+    PlateTick();
+    MenuTick();
+    if (g_errand >= 0 && g_errand < g_nGar) {
+        GarCar& g = g_gar[g_errand];
+        if (g_errandKind == ER_DELIVER) DeliveryTick(g); else PickupTick(g);
+    }
+    CarsTick();
+}
+static void InstallGarage() {
+    bool a = MH_CreateHook((void*)0x447E40, (void*)&RestoreCarDetour, (void**)&g_origRestoreCar) == MH_OK && MH_EnableHook((void*)0x447E40) == MH_OK;
+    bool b = MH_CreateHook((void*)0x449760, (void*)&StoreCarDetour, (void**)&g_origStoreCar) == MH_OK && MH_EnableHook((void*)0x449760) == MH_OK;
+    bool c = MH_CreateHook((void*)0x5D13E0, (void*)&GenericSaveDetour, (void**)&g_origGenericSave) == MH_OK && MH_EnableHook((void*)0x5D13E0) == MH_OK;
+    g_garHooked = a && b;
+    Log("garagem: ganchos RestoreCar=%s StoreCar=%s save=%s", a ? "ok" : "FALHOU", b ? "ok" : "FALHOU", c ? "ok" : "FALHOU");
 }
 
 // ---------------------------------------------------------------- precisao do x87 ([Fixes] X87=1)
@@ -1874,6 +3291,7 @@ static DWORD WINAPI StartupThread(LPVOID) {
     HookGame(0x485B10, (void*)&GetPadStateDetour, (void**)&g_origGetPadState, "das setas dos scripts");
     HookGame(0x588BE0, (void*)&SetHelpDetour, (void**)&g_origSetHelp, "do texto de ajuda");
     HookGame(0x588E30, (void*)&SetHelpNumDetour, (void**)&g_origSetHelpNum, "do texto de ajuda com numero");
+    if (g_garOn) InstallGarage();                                             // depois do MH_Initialize
     InstallXInputHooks();
     if (g_audioHash) { HANDLE t = CreateThread(nullptr, 0, AudioHashThread, nullptr, 0, nullptr); if (t) CloseHandle(t); }
     return 0;
@@ -1904,6 +3322,10 @@ static void LoadConfig(HMODULE self) {
     g_skinOn       = GetPrivateProfileIntA("Skins", "Menu",         1, ini);
     g_skinAnims    = GetPrivateProfileIntA("Skins", "Anims",        1, ini);
     g_skinVoice    = GetPrivateProfileIntA("Skins", "Voice",        1, ini);
+    g_skinClothes  = GetPrivateProfileIntA("Skins", "KeepSkin",     1, ini);
+    g_garOn        = GetPrivateProfileIntA("Garage", "Enabled",     1, ini);
+    g_garPrice     = GetPrivateProfileIntA("Garage", "Price",    1250, ini);
+    g_garSellPct   = GetPrivateProfileIntA("Garage", "SellPercent", 15, ini);
     g_saveSlot  = GetPrivateProfileIntA("Save",  "Slot",      8,   ini);
     g_autosaveMin  = GetPrivateProfileIntA("Save", "AutosaveMinutes", 5, ini);
     g_afterMission = GetPrivateProfileIntA("Save", "AfterMission",    1, ini);
@@ -1937,8 +3359,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     InitializeCriticalSection(&g_hookCs);
     LoadConfig(inst);
     QueryPerformanceFrequency(&g_qpf);
-    Log("GTMTouchSA 3.12 carregado (direcao=%d rampa=%d retorno=%d toque=%d sim/nao por script=%d diag toque=%d ragdoll=%d contagem=%d audio=%d x87=%d pular abertura=%d radar no alto=%d protecao da arma=%d menu de skins=%d andar da skin=%d voz da skin=%d)",
-        g_steerOn, g_rampMs, g_releaseMs, g_touchOn, g_ynScripts, g_traceTouch, g_traceRagdoll, g_countRagdoll, g_audioHash, g_fixX87, g_skipIntro, g_radarTop, g_weaponGuard, g_skinOn, g_skinAnims, g_skinVoice);
+    Log("GTMTouchSA 3.16 carregado (direcao=%d rampa=%d retorno=%d toque=%d sim/nao por script=%d diag toque=%d ragdoll=%d contagem=%d audio=%d x87=%d pular abertura=%d radar no alto=%d protecao da arma=%d menu de skins=%d andar da skin=%d voz da skin=%d skin nas roupas de missao=%d garagem=%d)",
+        g_steerOn, g_rampMs, g_releaseMs, g_touchOn, g_ynScripts, g_traceTouch, g_traceRagdoll, g_countRagdoll, g_audioHash, g_fixX87, g_skipIntro, g_radarTop, g_weaponGuard, g_skinOn, g_skinAnims, g_skinVoice, g_skinClothes, g_garOn);
     if (GetModuleHandleA("GTMSteerSA.asi")) Log("AVISO: GTMSteerSA.asi tambem esta carregado; apague ele da pasta scripts");
     if (!IsSupportedExe()) { Log("executavel nao e o 1.0 US: nada foi alterado"); return TRUE; }
     OpenShared();
@@ -1948,6 +3370,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     if (g_radarTop > 0) ApplyRadarTop(g_radarTop);
     if (g_weaponGuard) ApplyWeaponGuard();
     if (g_skinAnims) ApplySkinAnims();
+    if (g_skinClothes) ApplySkinClothes();
     g_mhReady = (MH_Initialize() == MH_OK);
     if (!g_mhReady) { Log("MinHook nao iniciou"); return TRUE; }
     HANDLE t = CreateThread(nullptr, 0, StartupThread, nullptr, 0, nullptr);
