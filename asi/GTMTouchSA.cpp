@@ -1,4 +1,4 @@
-// GTMTouchSA.asi 3.8 - controles de toque contextuais para GTA San Andreas 1.0 US no Madeira
+// GTMTouchSA.asi 3.12 - controles de toque contextuais para GTA San Andreas 1.0 US no Madeira
 //
 // 1) Contexto: a cada quadro escreve em C:\gtmtouch.bin em que situacao o CJ esta (a pe,
 //    nadando, de jetpack, carro, moto, helicoptero, aviao, barco, passageiro, cutscene,
@@ -11,7 +11,9 @@
 // 3) Direcao: dentro de veiculo, D-pad esquerda/direita vira esterco total com rampa.
 // 4) Salvar: na hora (botao), autosave a cada N minutos e ao passar missao, sempre no
 //    mesmo slot. Se salvou dentro de um veiculo, recria o veiculo ao carregar.
-// 5) Comandos do overlay: 1 salvar, 2 detonar as satchels, 3 voltar para a satchel.
+// 5) Comandos do overlay: 1 salvar, 2 detonar as satchels, 3 voltar para a satchel, 4 recarregar.
+// 6) Skin Selector (3.10/3.12): Status + Atirar abre o menu; a skin escolhida anda e fala como o
+//    personagem do modelo; o save daqui grava a skin no slot do save.
 //
 // Interceptacoes: XInputGetState (instalada logo na carga, para valer no menu tambem),
 // CALL em 0x53C077 dentro de CGame::Process (por quadro: CCranes::UpdateCranes, depois dos
@@ -146,6 +148,7 @@ enum State : DWORD {
     S_ACTPHONE     = 1u << 17,  // o TAB (acao) atende o telefone
     S_ACTWEAPON    = 1u << 18,  // o TAB troca pela arma do chao
     S_ACTOTHER     = 1u << 19,  // o jogo pede o TAB para outra coisa (comprar, presente, foto...)
+    S_RELOAD       = 1u << 20,  // a pe, a arma na mao pode ser recarregada agora (toque no icone da arma)
 };
 
 struct Info { int ctx; DWORD state; BYTE weapon, nearVeh; };
@@ -303,12 +306,22 @@ static GetPadState_t g_origGetPadState = nullptr;
 static volatile DWORD g_scriptTabTick = 0;
 static char g_loggedTab[32][9];
 static int  g_nLoggedTab = 0;
+static char g_skinScripts[128] = ",skin_o,skin_c,skin_n,";             // [Skins] Scripts
+static volatile DWORD g_skinTick = 0;                                   // um Skin Selector leu o TAB
+static char* volatile g_skinScript = nullptr;                          // CRunningScript do Skin Selector
+static char g_skinScriptName[9] = "";
 static void NoteScriptTab(const char* script) {
     char name[9] = "";
     if (script) { memcpy(name, script + 8, 8); name[8] = 0; }
     for (char* c = name; *c; c++) *c = (char)tolower((unsigned char)*c);
     if (name[0]) {
         char key[12]; snprintf(key, sizeof key, ",%s,", name);
+        if (strstr(g_skinScripts, key)) {
+            if (!g_skinTick) Log("skins: Skin Selector ativo (script '%s'); segure o Status e toque no Atirar para abrir o menu dele", name);
+            g_skinTick = GetTickCount();
+            g_skinScript = (char*)script; memcpy(g_skinScriptName, name, sizeof name);
+            return;                                                     // le o TAB o tempo todo: nao e pedido de acao
+        }
         if (strstr(g_ignoreTabScripts, key)) return;
     }
     g_scriptTabTick = GetTickCount();
@@ -403,6 +416,43 @@ static int NearestVehicleClass(const char* ped) {
     return bestCls;
 }
 
+// ---------------------------------------------------------------- recarregar (comando 4 do overlay)
+// O jogo recarrega sozinho quando o pente acaba: CWeapon::Fire (0x73FACB) poe a arma em RELOADING com
+// m_nTimeForNextShot = agora + CWeaponInfo::GetWeaponReloadTime, e o CWeapon::Update toca a animacao (se o
+// CJ estiver mirando), os sons e enche o pente no fim. O toque no icone da arma faz o mesmo antes do pente acabar.
+// A animacao quem comeca e a tarefa de mirar (CTaskSimpleUseGun, 0x62515F); sem mirar o jogo so conta o tempo.
+// Sem mirar, o toque comeca a mesma animacao de recarga em pe (id 0xE2 do grupo da arma, que so mexe da coluna
+// para cima, entao o CJ continua andando ou correndo); o CWeapon::Update ve a animacao, toca os sons no tempo
+// dela e enche o pente quando ela chega a 90%. A agachada (0xE3) mexe nas pernas e nao e usada aqui.
+typedef char* (__cdecl* GetWeaponInfo_t)(int type, int skill);
+typedef int   (__thiscall* GetWeaponSkill_t)(void* ped, int type);
+typedef int   (__thiscall* GetReloadTime_t)(void* info);
+static const GetWeaponInfo_t  GetWeaponInfo  = (GetWeaponInfo_t)0x743C60;   // CWeaponInfo::GetWeaponInfo(tipo, habilidade)
+static const GetWeaponSkill_t GetWeaponSkill = (GetWeaponSkill_t)0x5E3B60;  // CPed::GetWeaponSkill(tipo)
+static const GetReloadTime_t  GetReloadTime  = (GetReloadTime_t)0x743D70;   // CWeaponInfo::GetWeaponReloadTime
+typedef void* (__cdecl* BlendAnimation_t)(void* clump, int group, int id, float delta);
+typedef void  (__thiscall* AssocStart_t)(void* assoc, float time);
+typedef void* (__thiscall* GetTaskUseGun_t)(void* intelligence);
+static const BlendAnimation_t BlendAnimation = (BlendAnimation_t)0x4D4610;  // CAnimManager::BlendAnimation
+static const AssocStart_t     AssocStart     = (AssocStart_t)0x4CEB70;      // CAnimBlendAssociation::Start
+static const GetTaskUseGun_t  GetTaskUseGun  = (GetTaskUseGun_t)0x600F70;   // CPedIntelligence::GetTaskUseGun
+
+// a arma na mao pode ser recarregada agora? (pronta, pente que recarrega e nao esta cheio, municao de reserva)
+static bool CanReload(char* ped, int* reloadMs) {
+    int slot = Rd<BYTE>(ped, 0x718); if (slot > 12) return false;
+    const char* w = ped + 0x5A0 + slot * W_STRIDE;                            // CWeapon
+    int type = Rd<int>(w, 0), state = Rd<int>(w, 4), clip = Rd<int>(w, 8), total = Rd<int>(w, 0xC);
+    if (type < 22 || type > 38 || state != 0) return false;                  // armas de fogo, WEAPONSTATE_READY
+    const char* info = GetWeaponInfo(type, GetWeaponSkill(ped, type) & 0xFF);
+    if (!info || !(Rd<DWORD>(info, 0x18) & 0x1000)) return false;             // m_nFlags: bReload
+    int size = Rd<short>(info, 0x20);                                         // m_nAmmoClip (ja com a habilidade)
+    if (size <= 1) return false;
+    int full = total < size ? total : size;                                   // o total inclui o pente
+    if (clip >= full) return false;
+    if (reloadMs) *reloadMs = GetReloadTime((void*)info);
+    return true;
+}
+
 static void ComputeInfo(Info& in) {
     in = {};
     if (MenuActive()) { in.ctx = CTX_MENU; return; }
@@ -461,7 +511,7 @@ static void ComputeInfo(Info& in) {
         if (!(jetGun && activeAmmo > 0)) in.state &= ~(DWORD)S_ARMED;
     }
     else if (intel && GetTaskSwim(intel)) in.ctx = CTX_SWIM;
-    else in.ctx = CTX_FOOT;
+    else { in.ctx = CTX_FOOT; if (CanReload(ped, nullptr)) in.state |= S_RELOAD; }
 
     bool hasDet = WeaponType(ped, 12) == 40 && WeaponAmmo(ped, 12) > 0;
     bool hasSatchel = WeaponType(ped, 8) == 39 && WeaponAmmo(ped, 8) > 0;
@@ -514,6 +564,28 @@ static bool g_menuNoted = false;
 
 static SHORT Stronger(SHORT a, SHORT b) { return (abs((int)b) > abs((int)a)) ? b : a; }
 
+// Skin Selector: o menu dele abre com TAB + arma anterior + proxima arma juntos (LB + LT + RT).
+// Com o Status (TAB) do overlay segurado, um toque no Atirar abre o menu: a pe, sem o jogo pedir o TAB
+// para outra coisa e com um Skin Selector rodando. Esse Atirar nao chega ao jogo; os dois gatilhos entram
+// juntos ate o Status ser solto. Segurar o Status sozinho continua mostrando o status do CJ.
+static int  g_skinOn = 1, g_skinAnims = 1, g_skinVoice = 1;
+static bool g_skinCombo = false;
+static void SkinCombo(WORD buttons, PadState& p, DWORD now) {
+    if (!g_skinOn) return;
+    const WORD LB = 0x0100, FIRE = 0x2000;
+    if (!(buttons & LB)) { g_skinCombo = false; return; }
+    if (!g_skinCombo) {
+        if (!(buttons & FIRE)) return;
+        bool armed = g_skinTick && now - g_skinTick < 2000 && g_ctxCache == CTX_FOOT &&
+                     !(g_info.state & (S_ACTPHONE | S_ACTWEAPON | S_ACTOTHER));
+        if (!armed) return;
+        g_skinCombo = true;
+        Log("skins: Status + Atirar, abrindo o menu do Skin Selector");
+    }
+    p.wButtons &= (WORD)~FIRE;
+    p.bLeftTrigger = p.bRightTrigger = 255;
+}
+
 static DWORD Filter(DWORD ret, DWORD idx, XState* st) {
     if (idx != 0 || !st) return ret;
     InterlockedIncrement(&g_xinputCalls);
@@ -542,6 +614,7 @@ static DWORD Filter(DWORD ret, DWORD idx, XState* st) {
         if (h.rt > p.bRightTrigger) p.bRightTrigger = h.rt;
         p.sThumbLX = Stronger(p.sThumbLX, h.lx); p.sThumbLY = Stronger(p.sThumbLY, h.ly);
         p.sThumbRX = Stronger(p.sThumbRX, h.rx); p.sThumbRY = Stronger(p.sThumbRY, h.ry);
+        SkinCombo(h.buttons, p, now);
     }
     if (ret != ERROR_SUCCESS) return ret;
 
@@ -752,6 +825,43 @@ static void WriteVehicleSidecar(unsigned timeMs) {
     Log("veiculo guardado: modelo %d em (%.1f, %.1f, %.1f) %s", v.model, v.x, v.y, v.z, path);
 }
 
+// Skin Selector (o): guarda a skin de cada slot em cleo\skin_o\skin_o.sav (assinatura 0x43010253 e 8
+// registros de 32 bytes: tipo 8@, numero 9@, 0, nome da skin adicional 24@..28@). O script so grava quando o
+// menu do jogo abre, no ultimo slot escolhido no menu (FrontEndMenuManager.m_bSelectedSaveGame, 0xBA68A7).
+// O save daqui nao passa pelo menu: grava o registro do slot do save com a skin atual do script e marca esse
+// slot no menu, para o script continuar gravando no mesmo lugar.
+static void SkinSaveRecord(int slotIdx) {
+    char* sc = g_skinScript;
+    if (!sc || !g_skinTick || GetTickCount() - g_skinTick > 3000 || strcmp(g_skinScriptName, "skin_o")) return;
+    if (slotIdx < 0 || slotIdx > 7) return;
+    const int* lv = (const int*)(sc + 0x3C);                                  // CRunningScript::m_aLocalVars
+    int rec[8] = { lv[8], lv[9], 0, lv[24], lv[25], lv[26], lv[27], lv[28] };
+    if (rec[0] < 0 || rec[0] > 3) { Log("skins: Skin Selector ainda iniciando; skin nao gravada no save"); return; }
+    char path[MAX_PATH];
+    GetModuleFileNameA(nullptr, path, MAX_PATH);
+    char* sl = strrchr(path, '\\'); if (sl) sl[1] = 0; else path[0] = 0;
+    char dir[MAX_PATH]; snprintf(dir, sizeof dir, "%scleo\\skin_o", path);
+    CreateDirectoryA(dir, nullptr);
+    strncat(path, "cleo\\skin_o\\skin_o.sav", MAX_PATH - strlen(path) - 1);
+    const DWORD kMagic = 0x43010253;
+    FILE* f = fopen(path, "r+b");
+    DWORD magic = 0;
+    if (f && (fread(&magic, 4, 1, f) != 1 || magic != kMagic)) { fclose(f); f = nullptr; }
+    if (!f) {                                                                 // arquivo novo, como o script cria
+        f = fopen(path, "wb");
+        if (!f) { Log("skins: nao abriu %s", path); return; }
+        int zero[8] = {};
+        fwrite(&kMagic, 4, 1, f);
+        for (int i = 0; i < 8; i++) fwrite(zero, sizeof zero, 1, f);
+    }
+    fseek(f, 4 + slotIdx * 32, SEEK_SET);
+    bool ok = fwrite(rec, sizeof rec, 1, f) == 1;
+    fclose(f);
+    *(volatile BYTE*)0xBA68A7 = (BYTE)slotIdx;
+    static const char* kKind[4] = { "CJ", "pedestre", "especial", "adicional" };
+    Log("skins: skin gravada no slot %d (%s %d)%s", slotIdx + 1, kKind[rec[0]], rec[1], ok ? "" : " ERRO ao gravar");
+}
+
 static void DoSave(int kind) {
     const char* why = "";
     g_saveInfo.saveSeq++;
@@ -765,12 +875,52 @@ static void DoSave(int kind) {
     RemovePickupObjects();                             // como o save normal: os objetos dos pickups voltam sozinhos
     MakeValidSaveName(g_saveSlot - 1);
     SetDirMyDocuments();
+    // CPools::SavePedPool (0x5D4B40) so grava o CJ se ele NAO estiver num veiculo (bInVehicle, bit 0x100
+    // de +0x46C). Salvando dentro do carro, o save sai sem o jogador e o jogo trava ao carregar. CPed::Save
+    // guarda so posicao, vida, colete, armas e area: durante o save o CJ conta como fora do carro, na
+    // posicao em que esta; ao carregar, o veiculo e recriado pelo .gtmveh e o CJ volta para dentro.
+    char* sp = PlayerPed();
+    DWORD* pedFlags = sp ? (DWORD*)(sp + 0x46C) : nullptr;
+    bool inVeh = pedFlags && (*pedFlags & 0x100);
+    if (inVeh) *pedFlags &= ~0x100u;
     bool ok = GenericSave(0);
+    if (inVeh) *pedFlags |= 0x100u;
     SetDir("");
     if (ok) WriteVehicleSidecar(t);
+    if (ok) SkinSaveRecord(g_saveSlot - 1);
     g_saveInfo.saveResult = ok ? 0 : 3;
     g_lastAutosaveTick = GetTickCount();
-    Log("salvar (%d) no slot %d: %s (%s)", kind, g_saveSlot, ok ? "ok" : "ERRO", SaveFileName);
+    Log("salvar (%d) no slot %d: %s%s (%s)", kind, g_saveSlot, ok ? "ok" : "ERRO", inVeh ? ", CJ gravado fora do veiculo" : "", SaveFileName);
+}
+
+static void DoReload() {
+    char* ped = PlayerPed();
+    if (!ped || PlayerVehicle() || g_info.ctx != CTX_FOOT) { Log("recarregar: so a pe"); return; }
+    int ms = 0;
+    if (!CanReload(ped, &ms)) { Log("recarregar: a arma nao precisa ou nao da agora"); return; }
+    int slot = Rd<BYTE>(ped, 0x718);
+    char* w = ped + 0x5A0 + slot * W_STRIDE;
+    *(int*)(w + 4) = 2;                                                       // WEAPONSTATE_RELOADING
+    *(unsigned*)(w + 0x10) = *TimeMs + (unsigned)ms;                          // m_nTimeForNextShot
+    const char* anim = "a do jogo, mirando";
+    void* intel = Rd<void*>(ped, 0x47C);                                      // CPed::m_pIntelligence
+    if (!intel || !GetTaskUseGun(intel)) {                                    // sem mirar: comeca a animacao aqui
+        int type = *(int*)w;
+        const char* info = GetWeaponInfo(type, GetWeaponSkill(ped, type) & 0xFF);
+        int grp = info ? Rd<int>(info, 0x1C) : -1;                            // m_nAnimToPlay (grupo da arma)
+        const char* base = *(char**)0xB4EA34;                                 // CAnimManager::ms_aAnimAssocGroups
+        void* clump = Rd<void*>(ped, 0x18);                                   // CEntity::m_pRwClump
+        anim = "nenhuma (animacoes da arma fora da memoria)";
+        if (clump && base && grp > 0 && grp < 118) {
+            const char* g = base + grp * 0x14;
+            int first = Rd<int>(g, 0xC), count = Rd<int>(g, 8);
+            if (Rd<char*>(g, 4) && 0xE2 >= first && 0xE2 < first + count) {
+                void* a = BlendAnimation(clump, grp, 0xE2, 8.0f);             // igual a tarefa de mirar
+                if (a) { AssocStart(a, 0.0f); anim = "tocada aqui, sem mirar"; }
+            }
+        }
+    }
+    Log("recarregar: arma %d, pente com %d de %d, %d ms, animacao %s", *(int*)w, *(int*)(w + 8), *(int*)(w + 0xC), ms, anim);
 }
 
 static void DoDetonate() {
@@ -855,6 +1005,7 @@ static void SaveTick() {
                 case 1: DoSave(1); break;
                 case 2: DoDetonate(); break;
                 case 3: DoSelectSatchel(); break;
+                case 4: DoReload(); break;
                 default: break;
             }
         }
@@ -1190,6 +1341,7 @@ static const DWORD kFrameCall = 0x53C077;              // CALL CCranes::UpdateCr
 static bool g_firstFrame = true, g_fallbackNoted = false, g_lastYN = false;
 
 static void WeaponGuardTick();
+static void SkinVoiceTick();
 static void __cdecl FrameTick() {
     if (g_origFrameCall) g_origFrameCall();
     if (g_firstFrame) {                                 // reserva, se a thread de inicio nao conseguiu
@@ -1201,6 +1353,7 @@ static void __cdecl FrameTick() {
     ComputeInfo(g_info);
     g_ctxCache = g_info.ctx;
     if (g_weaponGuard) WeaponGuardTick();
+    if (g_skinVoice) SkinVoiceTick();
     if (g_info.ctx != g_lastCtx) { Log("contexto: %s", g_info.ctx >= 0 && g_info.ctx <= CTX_CUTSCENE ? kCtxName[g_info.ctx] : "?"); g_lastCtx = g_info.ctx; }
     bool yn = (g_info.state & S_YESNO) != 0;
     if (yn != g_lastYN) {
@@ -1405,6 +1558,99 @@ static void WeaponGuardTick() {
         }
         g_weapFix = 0;
     }
+}
+
+// ---------------------------------------------------------------- animacoes e voz da skin ([Skins] Anims=1 Voice=1)
+// Animacoes: CPlayerPed::ProcessAnimGroups (0x6098F0, todo quadro) escolhe o jeito de andar do jogador. Para o
+// jogador 1 usa sempre o do CJ pelos status (normal, gordo ou forte); so o jogador 2 do modo de dois jogadores
+// usa o do modelo (m_nAnimType). Os desvios em 0x609A1A/0x609A1F fazem o jogador 1 com uma skin usar o jeito de
+// andar do modelo dela (os do animgrp.dat: man, woman, gang1...; as mesmas 6 animacoes do grupo do CJ). Com o
+// modelo do CJ, nas armas pesadas, de jetpack etc. o caminho original continua. Se o pacote do jeito de andar
+// nao estiver na memoria, pede de novo e usa o do CJ ate ele chegar.
+// Voz: CAEPedSpeechAudioEntity::Initialise (0x4E68D0) escolhe a voz pelo modelo, mas o jogo so chama ao criar o
+// personagem. Quando o modelo do CJ muda, chama de novo; se o modelo nao tem voz, volta a voz anterior.
+static DWORD g_skinAnimReq[160];
+extern "C" int __cdecl SkinAnimGroup(char* ped) {
+    if (!g_skinAnims || !ped || Rd<int>(ped, 0x598) != 0) return -1;         // so o jogador 1 (m_nPedType)
+    int model = Rd<short>(ped, 0x22);
+    if (model <= 0 || model >= 20000) return -1;                              // 0 = CJ
+    const char* mi = ((char**)0xA9B0C8)[model];                               // CModelInfo::ms_modelInfoPtrs
+    if (!mi) return -1;
+    int g = Rd<int>(mi, 0x24);                                                // CPedModelInfo::m_nAnimType
+    if (g < 0x76 || g >= 145) return -1;                                      // so os jeitos de andar do animgrp.dat
+    const char* base = *(char**)0xB4EA34;                                     // CAnimManager::ms_aAnimAssocGroups
+    if (!base) return -1;
+    const char* grp = base + g * 0x14;
+    if (Rd<int>(grp, 8) != 6) return -1;                                      // m_nNumAnimations do ciclo de andar
+    if (!Rd<char*>(grp, 4)) {                                                 // pacote fora da memoria
+        DWORD now = GetTickCount();
+        if (now - g_skinAnimReq[g] > 1000) {
+            const char* block = (const char*)(0x8AA5B8 + g * 0x30);           // ms_aAnimAssocDefinitions[g].blockName
+            int idx = block[0] ? GameAnimBlockIndex(block) : -1;
+            if (idx >= 0) RequestModel(idx + 25575, kKeep);
+            if (!g_skinAnimReq[g]) Log("skins: animacoes do grupo %d (%.16s) fora da memoria; pedi o pacote", g, block);
+            g_skinAnimReq[g] = now;
+        }
+        return -1;
+    }
+    return g;
+}
+// entrada em 0x609A1A: edi = grupo atual (caminho em que o jogo mantem o grupo)
+extern "C" int __cdecl SkinAnimGroupKeep(char* ped, int cur) {
+    int g = SkinAnimGroup(ped);
+    if (g >= 0 && (cur == 0x36 || cur == g)) return g;
+    if (cur >= 0x76) return -2;                                               // sobrou o andar de uma skin: volta ao do CJ
+    return -1;
+}
+extern "C" void AnimGroupStubA();
+extern "C" void AnimGroupStubB();
+asm(".text\n"
+    ".globl _AnimGroupStubA\n_AnimGroupStubA:\n"
+    "  pushl %edi\n  pushl %esi\n  call _SkinAnimGroupKeep\n  addl $8, %esp\n"
+    "  testl %eax, %eax\n  jge 2f\n"
+    "  cmpl $-2, %eax\n  jne 1f\n  movl $0x36, %edi\n"
+    "1:\n  cmpl $0x36, %edi\n  jne 3f\n"                                     // original: cmp edi, 0x36 / jne 0x609A3B
+    ".globl _AnimGroupStubB\n_AnimGroupStubB:\n"
+    "  pushl %esi\n  call _SkinAnimGroup\n  addl $4, %esp\n"
+    "  testl %eax, %eax\n  jge 2f\n"
+    "  cmpl $1, 0x598(%esi)\n  jne 3f\n"                                      // original: jogador 2 usa o do modelo
+    "  pushl $0x609A28\n  ret\n"
+    "2:\n  pushl $0x609A44\n  ret\n"                                          // grava eax como grupo e reaplica
+    "3:\n  pushl $0x609A3B\n  ret\n");                                        // grupo do CJ pelos status
+
+static void ApplySkinAnims() {
+    static const BYTE orig[] = { 0x83,0xFF,0x36, 0x75,0x1C, 0x83,0xBE,0x98,0x05,0x00,0x00,0x01, 0x75,0x13 };
+    BYTE r[10];
+    r[0] = 0xE9; *(int*)(r + 1) = (int)((DWORD)&AnimGroupStubA - (0x609A1A + 5));
+    r[5] = 0xE9; *(int*)(r + 6) = (int)((DWORD)&AnimGroupStubB - (0x609A1F + 5));
+    PatchBytes(0x609A1A, orig, sizeof orig, r, sizeof r, "skins: jeito de andar da skin (CPlayerPed::ProcessAnimGroups)");
+}
+
+typedef void (__thiscall* SpeechInit_t)(void* speech, void* entity);
+static const SpeechInit_t SpeechInit = (SpeechInit_t)0x4E68D0;               // CAEPedSpeechAudioEntity::Initialise
+static char* g_voicePed = nullptr;
+static int   g_voiceModel = 0;
+static bool  g_voiceChanged = false;
+static void SkinVoiceTick() {
+    char* ped = PlayerPed();
+    if (!ped) return;
+    if (ped != g_voicePed) { g_voicePed = ped; g_voiceModel = 0; g_voiceChanged = false; }   // CJ novo (jogo carregado): voz do CJ
+    int model = Rd<short>(ped, 0x22);
+    if (model == g_voiceModel) return;
+    if (model == 0 && !g_voiceChanged) { g_voiceModel = 0; return; }
+    char* sp = ped + 0x294;                                                   // CPed::m_pedSpeech (0x100 bytes)
+    if (Rd<BYTE>(sp, 0x98)) return;                                           // falando agora: espera terminar
+    g_voiceModel = model;
+    BYTE snap[0x100]; memcpy(snap, sp, sizeof snap);
+    sp[0x90] = 0;
+    SpeechInit(sp, ped);
+    if (!sp[0x90]) {                                                          // o modelo nao tem voz: fica a anterior
+        memcpy(sp, snap, sizeof snap);
+        Log("skins: o modelo %d nao tem voz propria; ficou a voz anterior", model);
+        return;
+    }
+    g_voiceChanged = model != 0;
+    Log("skins: voz do modelo %d (tipo %d, voz %d)", model, Rd<short>(sp, 0x92), Rd<short>(sp, 0x94));
 }
 
 // ---------------------------------------------------------------- precisao do x87 ([Fixes] X87=1)
@@ -1655,6 +1901,9 @@ static void LoadConfig(HMODULE self) {
     g_skipIntro    = GetPrivateProfileIntA("Fixes", "SkipIntro",    1, ini);
     g_radarTop     = GetPrivateProfileIntA("Hud",   "RadarTop",     16, ini);
     g_weaponGuard  = GetPrivateProfileIntA("Fixes", "WeaponGuard",  1, ini);
+    g_skinOn       = GetPrivateProfileIntA("Skins", "Menu",         1, ini);
+    g_skinAnims    = GetPrivateProfileIntA("Skins", "Anims",        1, ini);
+    g_skinVoice    = GetPrivateProfileIntA("Skins", "Voice",        1, ini);
     g_saveSlot  = GetPrivateProfileIntA("Save",  "Slot",      8,   ini);
     g_autosaveMin  = GetPrivateProfileIntA("Save", "AutosaveMinutes", 5, ini);
     g_afterMission = GetPrivateProfileIntA("Save", "AfterMission",    1, ini);
@@ -1666,6 +1915,9 @@ static void LoadConfig(HMODULE self) {
     GetPrivateProfileStringA("YesNo", "IgnoreScripts", "", buf, sizeof buf, ini);
     snprintf(g_ignoreScripts, sizeof g_ignoreScripts, ",%s,", buf);
     for (char* c = g_ignoreScripts; *c; c++) { *c = (char)tolower((unsigned char)*c); if (*c == ' ' || *c == ';') *c = ','; }
+    GetPrivateProfileStringA("Skins", "Scripts", "skin_o,skin_c,skin_n", buf, sizeof buf, ini);
+    snprintf(g_skinScripts, sizeof g_skinScripts, ",%s,", buf);
+    for (char* c = g_skinScripts; *c; c++) { *c = (char)tolower((unsigned char)*c); if (*c == ' ' || *c == ';') *c = ','; }
     GetPrivateProfileStringA("Action", "IgnoreScripts", "", buf, sizeof buf, ini);
     snprintf(g_ignoreTabScripts, sizeof g_ignoreTabScripts, ",%s,", buf);
     for (char* c = g_ignoreTabScripts; *c; c++) { *c = (char)tolower((unsigned char)*c); if (*c == ' ' || *c == ';') *c = ','; }
@@ -1685,8 +1937,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     InitializeCriticalSection(&g_hookCs);
     LoadConfig(inst);
     QueryPerformanceFrequency(&g_qpf);
-    Log("GTMTouchSA 3.9 carregado (direcao=%d rampa=%d retorno=%d toque=%d sim/nao por script=%d diag toque=%d ragdoll=%d contagem=%d audio=%d x87=%d pular abertura=%d radar no alto=%d protecao da arma=%d)",
-        g_steerOn, g_rampMs, g_releaseMs, g_touchOn, g_ynScripts, g_traceTouch, g_traceRagdoll, g_countRagdoll, g_audioHash, g_fixX87, g_skipIntro, g_radarTop, g_weaponGuard);
+    Log("GTMTouchSA 3.12 carregado (direcao=%d rampa=%d retorno=%d toque=%d sim/nao por script=%d diag toque=%d ragdoll=%d contagem=%d audio=%d x87=%d pular abertura=%d radar no alto=%d protecao da arma=%d menu de skins=%d andar da skin=%d voz da skin=%d)",
+        g_steerOn, g_rampMs, g_releaseMs, g_touchOn, g_ynScripts, g_traceTouch, g_traceRagdoll, g_countRagdoll, g_audioHash, g_fixX87, g_skipIntro, g_radarTop, g_weaponGuard, g_skinOn, g_skinAnims, g_skinVoice);
     if (GetModuleHandleA("GTMSteerSA.asi")) Log("AVISO: GTMSteerSA.asi tambem esta carregado; apague ele da pasta scripts");
     if (!IsSupportedExe()) { Log("executavel nao e o 1.0 US: nada foi alterado"); return TRUE; }
     OpenShared();
@@ -1695,6 +1947,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     if (g_skipIntro) ApplySkipIntro();
     if (g_radarTop > 0) ApplyRadarTop(g_radarTop);
     if (g_weaponGuard) ApplyWeaponGuard();
+    if (g_skinAnims) ApplySkinAnims();
     g_mhReady = (MH_Initialize() == MH_OK);
     if (!g_mhReady) { Log("MinHook nao iniciou"); return TRUE; }
     HANDLE t = CreateThread(nullptr, 0, StartupThread, nullptr, 0, nullptr);

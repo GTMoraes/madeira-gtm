@@ -1,4 +1,4 @@
-// GTMTouch.dylib 3.1 - overlay de toque contextual para o GTA San Andreas no Madeira.
+// GTMTouch.dylib 3.2 - overlay de toque contextual para o GTA San Andreas no Madeira.
 //
 // Injetado no IPA oficial do Madeira. Desenha os controles por cima do jogo e troca o
 // conjunto de botoes sozinho conforme o contexto que o GTMTouchSA.asi escreve em
@@ -23,6 +23,8 @@
 // esquerda volta, para a direita ou um toque avanca); o botao TAB mostra os status do CJ e vira
 // telefone ou troca pela arma do chao quando o jogo pede; botoes do canto de cima a esquerda
 // abriram espaco para o radar, que o GTMTouchSA 3.8 desenha no alto.
+// 3.2: um toque no icone da arma, sem deslizar, recarrega a arma na mao quando o GTMTouchSA 3.12
+// diz que da (S_RELOAD); se nao precisar ou nao der, nao faz nada. A troca de arma fica so no deslizar.
 //
 // Sem jogo rodando o overlay some e todo toque passa direto para o Madeira. No menu e na
 // cutscene so os botoes recebem toque; o resto da tela continua sendo do Madeira.
@@ -66,7 +68,7 @@ enum {
     S_VEHNEAR = 1u << 5, S_FIRE = 1u << 6, S_FIRE2 = 1u << 7, S_NITRO = 1u << 8, S_HYDRAULICS = 1u << 9,
     S_SUBMISSION = 1u << 10, S_GROUP = 1u << 11, S_TARGETPED = 1u << 12, S_ARMED = 1u << 13,
     S_REMOTE = 1u << 14, S_GROUPMEMBERS = 1u << 15, S_DRIVEBY = 1u << 16,
-    S_ACTPHONE = 1u << 17, S_ACTWEAPON = 1u << 18, S_ACTOTHER = 1u << 19,
+    S_ACTPHONE = 1u << 17, S_ACTWEAPON = 1u << 18, S_ACTOTHER = 1u << 19, S_RELOAD = 1u << 20,
 };
 #define S_CANSAVE 0x80000000u
 // .asi 2.0 nao manda estado: mostra o que a 2.0 mostrava
@@ -79,7 +81,7 @@ enum {
     B_X = 0x4000, B_Y = 0x8000, B_LT = 0x10000, B_RT = 0x20000, B_RAWL = 0x40000, B_RAWR = 0x80000,
     B_STKUP = 0x100000, B_STKDN = 0x200000      // analogico esquerdo para cima/baixo, com rampa (cruz das aeronaves)
 };
-enum { CMD_NONE = 0, CMD_SAVE = 1, CMD_DETONATE = 2, CMD_SATCHEL = 3 };
+enum { CMD_NONE = 0, CMD_SAVE = 1, CMD_DETONATE = 2, CMD_SATCHEL = 3, CMD_RELOAD = 4 };
 enum { DYN_NONE = 0, DYN_WEAPON, DYN_VEHICLE, DYN_GROUP, DYN_ACTION };
 
 // ------------------------------------------------------------------ layouts padrao
@@ -89,7 +91,7 @@ typedef struct {
     const char *key, *label, *icon, *badge;
     uint32_t bits;
     uint8_t cmd, dyn;
-    uint8_t swipe;                  // area de deslizar (invisivel no jogo): esquerda = LT, direita/toque = RT
+    uint8_t swipe;                  // area de deslizar (invisivel no jogo): esquerda = LT, direita = RT, toque = recarregar
     uint32_t need, lit;
     double x, y, d;
 } GTMBtnDef;
@@ -709,11 +711,16 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
     for (UITouch *t in touches) {
         GTMSlot *s = [self slotFor:t create:NO];
         if (!s) continue;
-        if (s->kind == T_SWIPE) {                       // para a esquerda volta a arma; direita ou toque avanca
-            CGFloat dx = s->cur.x - s->start.x;
-            _pulseBits = (dx < -18 * [self sy]) ? B_LT : B_RT;
-            _pulseUntil = CACurrentMediaTime() + 0.12;
-            [_haptic impactOccurred];
+        if (s->kind == T_SWIPE) {                       // esquerda volta a arma, direita avanca, toque recarrega
+            CGFloat dx = s->cur.x - s->start.x, minDx = 18 * [self sy];
+            if (dx < -minDx || dx > minDx) {
+                _pulseBits = dx < 0 ? B_LT : B_RT;
+                _pulseUntil = CACurrentMediaTime() + 0.12;
+                [_haptic impactOccurred];
+            } else if (_state & S_RELOAD) {             // so quando o jogo diz que da; senao nada (nem vibra)
+                _cmdSeq++; _hostCmd = CMD_RELOAD;
+                [_haptic impactOccurred];
+            }
         }
         s->kind = T_NONE; s->touch = nil;
     }
