@@ -1,4 +1,4 @@
-// GTMTouchSA.asi 3.16 - controles de toque contextuais para GTA San Andreas 1.0 US no Madeira
+// GTMTouchSA.asi 3.17 - controles de toque contextuais para GTA San Andreas 1.0 US no Madeira
 //
 // 1) Contexto: a cada quadro escreve em C:\gtmtouch.bin em que situacao o CJ esta (a pe,
 //    nadando, de jetpack, carro, moto, helicoptero, aviao, barco, passageiro, cutscene,
@@ -19,6 +19,8 @@
 //    3.15: patios da policia fora. 3.16: capacidade pelo tamanho de cada garagem (o carro que nao cabe fica
 //    seu, "sem vaga"), lugar livre ao voltar, e "Trocar placa" (teclado do iPhone pelo overlay 3.3, ou do PC).
 // 8) Arquivo compartilhado, parte do teclado: [128..191] pedido do jogo, [192..255] resposta do overlay.
+// 9) Giroscopio (3.17, overlay 3.4): [96..127] escrito pelo overlay; gira so a camera, na mira e, se quiser,
+//    tambem a pe e dirigindo.
 //
 // Interceptacoes: XInputGetState (instalada logo na carga, para valer no menu tambem),
 // CALL em 0x53C077 dentro de CGame::Process (por quadro: CCranes::UpdateCranes, depois dos
@@ -1356,6 +1358,7 @@ static void WeaponGuardTick();
 static void SkinVoiceTick();
 static void SkinClothesTick();
 static void GarageTick();
+static void GyroTick();
 static void __cdecl FrameTick() {
     if (g_origFrameCall) g_origFrameCall();
     if (g_firstFrame) {                                 // reserva, se a thread de inicio nao conseguiu
@@ -1370,6 +1373,7 @@ static void __cdecl FrameTick() {
     if (g_skinVoice) SkinVoiceTick();
     if (g_skinClothes) SkinClothesTick();
     GarageTick();
+    GyroTick();
     if (g_info.ctx != g_lastCtx) { Log("contexto: %s", g_info.ctx >= 0 && g_info.ctx <= CTX_CUTSCENE ? kCtxName[g_info.ctx] : "?"); g_lastCtx = g_info.ctx; }
     bool yn = (g_info.state & S_YESNO) != 0;
     if (yn != g_lastYN) {
@@ -3070,6 +3074,87 @@ static void InstallGarage() {
     Log("garagem: ganchos RestoreCar=%s StoreCar=%s save=%s", a ? "ok" : "FALHOU", b ? "ok" : "FALHOU", c ? "ok" : "FALHOU");
 }
 
+// ---------------------------------------------------------------- giroscopio ([Gyro] Enabled=1; overlay 3.4)
+// O overlay le o giroscopio do iPhone (100 vezes por segundo, ja suavizado nos movimentos bem pequenos) e escreve
+// em [96..127] do arquivo compartilhado o quanto o telefone girou desde o inicio (microrradianos, para a direita e
+// para cima) e os ajustes do painel. Aqui, a cada quadro, a diferenca gira a camera ativa do jeito que o mouse faz:
+// soma no angulo horizontal (CCam +0xBC, para a direita diminui) e no vertical (+0xAC, para cima aumenta), que sao
+// os mesmos campos em que o codigo do mouse do jogo soma (0x523F55, 0x525648, 0x510BA6). Vale em qualquer
+// configuracao de controle. So gira a camera: o personagem e o carro nao recebem nada.
+//  - mira (sempre): mira livre (53), M4/AK (34), rifle (7), lanca-foguetes (8, 51), camera (46), canhao do
+//    helicoptero (45), mira de dentro do carro (55) e as variantes "runabout" (39-42, 52);
+//  - fora da mira (opcao do painel): a pe (4), carro e moto (18), barco (22). No carro, com o mouse na terceira
+//    pessoa ligado no jogo, segura a camera onde voce virou por 1 s, como o mouse (0xB70118).
+// Com zoom, o giro diminui na mesma proporcao do zoom (tan(FOV/2)), para a mira andar o mesmo tanto na tela.
+#pragma pack(push, 1)
+struct GyroBlock { DWORD magic, seq, yaw, pitch; WORD sensH, sensV, aimPct; BYTE flags, pad0; BYTE pad[8]; };
+#pragma pack(pop)
+static_assert(sizeof(GyroBlock) == 32, "layout gyro");
+static const DWORD GYRO_MAGIC = 0x594D5447;                                   // "GTMY"
+enum { GY_ON = 1, GY_ALWAYS = 2, GY_INVERT = 4, GY_ZOOM = 8, GY_RUN = 16 };
+static int   g_gyroOn = 1;
+static bool  g_gyHave = false;
+static DWORD g_gyPrevYaw = 0, g_gyPrevPitch = 0, g_gyCfgLogged = 0xFFFFFFFF;
+static unsigned long long g_gyModesLogged = 0;
+static bool ReadGyro(GyroBlock* b) {
+    if (g_file == INVALID_HANDLE_VALUE) return false;
+    EnterCriticalSection(&g_io);
+    OVERLAPPED o = {}; o.Offset = 96; DWORD n = 0;
+    BOOL ok = ReadFile(g_file, b, sizeof *b, &n, &o);
+    LeaveCriticalSection(&g_io);
+    return ok && n == sizeof *b && b->magic == GYRO_MAGIC;
+}
+static bool IsAimCam(int m) {
+    switch (m) { case 7: case 8: case 34: case 39: case 40: case 41: case 42: case 45: case 46: case 51: case 52: case 53: case 55: return true; }
+    return false;
+}
+static bool IsFreeCam(int m) { return m == 4 || m == 18 || m == 22; }
+static void GyroTick() {
+    if (!g_gyroOn || !g_touchOn) return;
+    GyroBlock b;
+    if (!ReadGyro(&b) || !(b.flags & GY_ON) || !(b.flags & GY_RUN)) { g_gyHave = false; return; }
+    DWORD cfg = (DWORD)b.sensH | ((DWORD)b.sensV << 10) | ((DWORD)b.aimPct << 20) | ((DWORD)(b.flags & 0xF) << 28);
+    if (cfg != g_gyCfgLogged) {
+        g_gyCfgLogged = cfg;
+        Log("giroscopio: horizontal %.2fx, vertical %.2fx, na mira %u%%, fora da mira %s, inverter %s, zoom %s (mouse na 3a pessoa do jogo: %s)",
+            b.sensH / 100.f, b.sensV / 100.f, (unsigned)b.aimPct, (b.flags & GY_ALWAYS) ? "sim" : "nao", (b.flags & GY_INVERT) ? "sim" : "nao",
+            (b.flags & GY_ZOOM) ? "sim" : "nao", *(volatile BYTE*)0xB6EC2E ? "sim" : "nao");
+    }
+    if (!g_gyHave) { g_gyPrevYaw = b.yaw; g_gyPrevPitch = b.pitch; g_gyHave = true; return; }
+    int dy = (int)(b.yaw - g_gyPrevYaw), dp = (int)(b.pitch - g_gyPrevPitch);
+    g_gyPrevYaw = b.yaw; g_gyPrevPitch = b.pitch;
+    if (!dy && !dp) return;
+    if (dy > 600000 || dy < -600000 || dp > 600000 || dp < -600000) return;   // salto (overlay reiniciou)
+    if (!PlayerPed() || *(volatile signed char*)0xB5F851) return;             // sem CJ / cutscene
+    if (Rd<WORD>((void*)0xB73458, 0x10E)) return;                             // CPad 0: controles desligados por script
+    int active = *(volatile BYTE*)0xB6F081;                                   // TheCamera.m_nActiveCam
+    if (active > 2) return;
+    char* cam = (char*)0xB6F19C + active * 0x238;                              // TheCamera.m_aCams[ativa]
+    int mode = Rd<short>(cam, 0xC);
+    bool aim = IsAimCam(mode), free = IsFreeCam(mode);
+    if (!aim && mode == 4) {                                                  // mira com controle sem alvo: camera a pe, arma em uso
+        char* intel = Rd<char*>(PlayerPed(), 0x47C);                          // CPed::m_pIntelligence
+        if (intel && GetTaskUseGun(intel)) aim = true;
+    }
+    if (!aim && !(free && (b.flags & GY_ALWAYS))) return;
+    float sh = b.sensH / 100.f, sv = b.sensV / 100.f;
+    if (aim) { float a = b.aimPct / 100.f; sh *= a; sv *= a; }
+    float k = 1.f;
+    if (b.flags & GY_ZOOM) {
+        float fov = Rd<float>(cam, 0xB4);
+        if (fov > 1.f && fov < 150.f) { k = tanf(fov * 0.008726646f) / 0.7002075f; if (k < 0.05f) k = 0.05f; if (k > 2.f) k = 2.f; }
+    }
+    float yaw = dy * 1e-6f * sh * k, pitch = dp * 1e-6f * sv * k;
+    if (b.flags & GY_INVERT) pitch = -pitch;
+    *(float*)(cam + 0xBC) -= yaw;                                             // Beta: frente = (-cos B, -sin B): para a direita diminui
+    *(float*)(cam + 0xAC) += pitch;                                           // Alpha: frente.z = sin A (0x524206): para cima aumenta
+    if (mode == 18 || mode == 22) *(float*)0xB70118 = 50.f;
+    if (mode < 64 && !(g_gyModesLogged & (1ull << mode))) {
+        g_gyModesLogged |= 1ull << mode;
+        Log("giroscopio: girando a camera no modo %d (%s)", mode, aim ? "mira" : "fora da mira");
+    }
+}
+
 // ---------------------------------------------------------------- precisao do x87 ([Fixes] X87=1)
 // No Windows, o Direct3D 9 poe o x87 do jogo em precisao simples (24 bits) e o jogo depende disso.
 // No iPhone o emulador (FEX) calcula com mais precisao e ignora esse ajuste. Dois lugares quebram:
@@ -3326,6 +3411,7 @@ static void LoadConfig(HMODULE self) {
     g_garOn        = GetPrivateProfileIntA("Garage", "Enabled",     1, ini);
     g_garPrice     = GetPrivateProfileIntA("Garage", "Price",    1250, ini);
     g_garSellPct   = GetPrivateProfileIntA("Garage", "SellPercent", 15, ini);
+    g_gyroOn       = GetPrivateProfileIntA("Gyro", "Enabled",        1, ini);
     g_saveSlot  = GetPrivateProfileIntA("Save",  "Slot",      8,   ini);
     g_autosaveMin  = GetPrivateProfileIntA("Save", "AutosaveMinutes", 5, ini);
     g_afterMission = GetPrivateProfileIntA("Save", "AfterMission",    1, ini);
@@ -3359,8 +3445,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     InitializeCriticalSection(&g_hookCs);
     LoadConfig(inst);
     QueryPerformanceFrequency(&g_qpf);
-    Log("GTMTouchSA 3.16 carregado (direcao=%d rampa=%d retorno=%d toque=%d sim/nao por script=%d diag toque=%d ragdoll=%d contagem=%d audio=%d x87=%d pular abertura=%d radar no alto=%d protecao da arma=%d menu de skins=%d andar da skin=%d voz da skin=%d skin nas roupas de missao=%d garagem=%d)",
-        g_steerOn, g_rampMs, g_releaseMs, g_touchOn, g_ynScripts, g_traceTouch, g_traceRagdoll, g_countRagdoll, g_audioHash, g_fixX87, g_skipIntro, g_radarTop, g_weaponGuard, g_skinOn, g_skinAnims, g_skinVoice, g_skinClothes, g_garOn);
+    Log("GTMTouchSA 3.17 carregado (direcao=%d rampa=%d retorno=%d toque=%d sim/nao por script=%d diag toque=%d ragdoll=%d contagem=%d audio=%d x87=%d pular abertura=%d radar no alto=%d protecao da arma=%d menu de skins=%d andar da skin=%d voz da skin=%d skin nas roupas de missao=%d garagem=%d giroscopio=%d)",
+        g_steerOn, g_rampMs, g_releaseMs, g_touchOn, g_ynScripts, g_traceTouch, g_traceRagdoll, g_countRagdoll, g_audioHash, g_fixX87, g_skipIntro, g_radarTop, g_weaponGuard, g_skinOn, g_skinAnims, g_skinVoice, g_skinClothes, g_garOn, g_gyroOn);
     if (GetModuleHandleA("GTMSteerSA.asi")) Log("AVISO: GTMSteerSA.asi tambem esta carregado; apague ele da pasta scripts");
     if (!IsSupportedExe()) { Log("executavel nao e o 1.0 US: nada foi alterado"); return TRUE; }
     OpenShared();

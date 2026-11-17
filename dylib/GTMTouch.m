@@ -1,4 +1,4 @@
-// GTMTouch.dylib 3.3 - overlay de toque contextual para o GTA San Andreas no Madeira.
+// GTMTouch.dylib 3.4 - overlay de toque contextual para o GTA San Andreas no Madeira.
 //
 // Injetado no IPA oficial do Madeira. Desenha os controles por cima do jogo e troca o
 // conjunto de botoes sozinho conforme o contexto que o GTMTouchSA.asi escreve em
@@ -28,11 +28,18 @@
 // 3.3: teclado para o GTMTouchSA 3.16 ("Trocar placa" da garagem). O jogo pede em [128..191] do arquivo
 // (GTMK: numero do pedido, titulo, texto atual); o overlay abre um alerta com o teclado do iPhone (ate 8
 // letras ou numeros, maiusculas) e responde em [192..255] (GTMA: 1 salvar, 2 cancelar). Protocolo 4.
+// 3.4: giroscopio (GTMTouchSA 3.17). Com o jogo rodando (fora do menu e da cutscene) e o giroscopio ligado no
+// painel, le o sensor 100 vezes por segundo, passa para os eixos da tela (virar para os lados usa a vertical do
+// mundo, entao funciona com o telefone em pe ou inclinado), suaviza so os movimentos bem pequenos (tremido da mao)
+// e escreve em [96..127] (GTMY) o giro acumulado e os ajustes. O jogo gira so a camera, como um mouse. Painel no
+// editor (lapis > Giroscopio). Protocolo 5: o bloco do overlay passa a gravar so os 32 bytes dele em [64..95].
+//      Botao "Olhar atrás" dirigindo (carro, moto, barco) e de passageiro: aperta os dois gatilhos juntos.
 //
 // Sem jogo rodando o overlay some e todo toque passa direto para o Madeira. No menu e na
 // cutscene so os botoes recebem toque; o resto da tela continua sendo do Madeira.
 
 #import <UIKit/UIKit.h>
+#import <CoreMotion/CoreMotion.h>
 #include <fcntl.h>
 #include <string.h>
 #include <unistd.h>
@@ -67,6 +74,16 @@ _Static_assert(sizeof(GTMKbRequest) == 64 && sizeof(GTMKbAnswer) == 64, "layout 
 static const uint32_t kKbReqMagic = 0x4B4D5447;  // "GTMK"
 static const uint32_t kKbAnsMagic = 0x414D5447;  // "GTMA"
 static const off_t kKbReqOffset = 128, kKbAnsOffset = 192;
+// giroscopio (protocolo 5): escrito pelo overlay em 96, dentro do espaco livre do bloco do overlay
+typedef struct __attribute__((packed)) {
+    uint32_t magic, seq, yaw, pitch;                    // giro acumulado em microrradianos: direita +, cima + (mod 2^32)
+    uint16_t sensH, sensV, aimPct; uint8_t flags, pad0; // sensibilidade x100, mira em %, GY_*
+    uint8_t pad[8];
+} GTMGyroBlock;
+_Static_assert(sizeof(GTMGyroBlock) == 32, "layout gyro");
+static const uint32_t kGyroMagic = 0x594D5447;   // "GTMY"
+static const off_t kGyroOffset = 96;
+enum { GY_ON = 1, GY_ALWAYS = 2, GY_INVERT = 4, GY_ZOOM = 8, GY_RUN = 16 };
 static const uint32_t kGameMagic = 0x544D5447;   // "GTMT"
 static const uint32_t kHostMagic = 0x484D5447;   // "GTMH"
 static const off_t kHostOffset = 64;
@@ -125,6 +142,9 @@ static const double kRefW = 874.0, kRefH = 402.0;
 #define LOOK_BTNS \
     {.key = "lookl", .label = "Olhar ◀", .icon = "hud_left",  .bits = B_LT, .need = S_DRIVEBY, .x = 600, .y = 160, .d = 46}, \
     {.key = "lookr", .label = "Olhar ▶", .icon = "hud_right", .bits = B_RT, .need = S_DRIVEBY, .x = 680, .y = 160, .d = 46}
+// olhar para tras: os dois gatilhos juntos (L2 + R2 do controle do jogo); sem icone no SA mobile, vai o texto
+#define LOOKBACK_AT(xx, yy) \
+    {.key = "lookb", .label = "Olhar\natrás", .bits = B_LT | B_RT, .x = xx, .y = yy, .d = 50}
 #define DRIVE_COMMON \
     {.key = "left",  .label = "◀", .icon = "hud_left",  .bits = B_LEFT,  .x = 130, .y = 315, .d = 83}, \
     {.key = "right", .label = "▶", .icon = "hud_right", .bits = B_RIGHT, .x = 245, .y = 315, .d = 83}, \
@@ -183,6 +203,7 @@ static const GTMBtnDef kCar[] = {
     {.key = "nitro", .label = "Nitro",      .icon = "hud_nitro",  .bits = B_B, .need = S_NITRO, .x = 580, .y = 300, .d = 58},
     {.key = "hydraulics", .label = "Hidráulica", .icon = "hydraulicCar", .bits = B_R3, .need = S_HYDRAULICS, .x = 300, .y = 225, .d = 58},
     LOOK_BTNS,
+    LOOKBACK_AT(580, 225),
     DRIVE_COMMON,
 };
 static const GTMBtnDef kHeli[] = {
@@ -205,6 +226,7 @@ static const GTMBtnDef kPassenger[] = {
     {.key = "fire", .label = "Atirar", .icon = "shoot",        .bits = B_B, .need = S_FIRE, .x = 765, .y = 315, .d = 74},
     {.key = "exit", .label = "Sair",   .icon = "enterandexit", .bits = B_Y, .x = 770, .y = 140, .d = 54},
     LOOK_BTNS,
+    LOOKBACK_AT(640, 235),
     RADIO_BTNS, YESNO_AT(165), CAM_BTN, PAUSE_BTN,
 };
 static const GTMBtnDef kMenu[] = {
@@ -309,6 +331,134 @@ static void GTMSaveOverrides(void) {
                                                 options:NSJSONWritingPrettyPrinted error:nil];
     [d writeToFile:GTMLayoutPath() atomically:YES];
 }
+
+// ------------------------------------------------------------------ giroscopio
+typedef struct { BOOL on, always, invert, zoom; double sensH, sensV, aim; } GTMGyroCfg;
+static GTMGyroCfg GTMGyroDefaults(void) { return (GTMGyroCfg){ YES, NO, NO, YES, 1.0, 1.0, 1.0 }; }
+static GTMGyroCfg gGyro;
+static NSString *GTMGyroPath(void) { return [GTMDataDir() stringByAppendingPathComponent:@"gyro.json"]; }
+static double GTMClamp(double v, double lo, double hi) { return v < lo ? lo : v > hi ? hi : v; }
+static void GTMLoadGyro(void) {
+    gGyro = GTMGyroDefaults();
+    NSData *d = [NSData dataWithContentsOfFile:GTMGyroPath()];
+    NSDictionary *j = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+    if (![j isKindOfClass:NSDictionary.class]) return;
+    if ([j[@"on"] isKindOfClass:NSNumber.class]) gGyro.on = [j[@"on"] boolValue];
+    if ([j[@"always"] isKindOfClass:NSNumber.class]) gGyro.always = [j[@"always"] boolValue];
+    if ([j[@"invert"] isKindOfClass:NSNumber.class]) gGyro.invert = [j[@"invert"] boolValue];
+    if ([j[@"zoom"] isKindOfClass:NSNumber.class]) gGyro.zoom = [j[@"zoom"] boolValue];
+    if ([j[@"horizontal"] isKindOfClass:NSNumber.class]) gGyro.sensH = GTMClamp([j[@"horizontal"] doubleValue], 0.2, 4.0);
+    if ([j[@"vertical"] isKindOfClass:NSNumber.class]) gGyro.sensV = GTMClamp([j[@"vertical"] doubleValue], 0.2, 4.0);
+    if ([j[@"aim"] isKindOfClass:NSNumber.class]) gGyro.aim = GTMClamp([j[@"aim"] doubleValue], 0.2, 1.5);
+}
+static void GTMSaveGyro(void) {
+    [[NSFileManager defaultManager] createDirectoryAtPath:GTMDataDir() withIntermediateDirectories:YES attributes:nil error:nil];
+    NSDictionary *j = @{ @"version": @1, @"on": @(gGyro.on), @"always": @(gGyro.always), @"invert": @(gGyro.invert),
+                         @"zoom": @(gGyro.zoom), @"horizontal": @(round(gGyro.sensH * 100) / 100),
+                         @"vertical": @(round(gGyro.sensV * 100) / 100), @"aim": @(round(gGyro.aim * 100) / 100) };
+    NSData *d = [NSJSONSerialization dataWithJSONObject:j options:NSJSONWritingPrettyPrinted error:nil];
+    [d writeToFile:GTMGyroPath() atomically:YES];
+}
+
+// Sensor numa fila propria (100 Hz). Tudo o que a fila usa (_cfg, acumulados, suavizacao) so e mexido nela.
+enum { kGyroSmoothN = 12 };                            // ~0,12 s de suavizacao para o tremido
+@interface GTMGyro : NSObject
++ (instancetype)shared;
+- (void)setRunning:(BOOL)run;
+- (void)setConfig:(GTMGyroCfg)cfg;
+- (void)setOrientation:(UIInterfaceOrientation)o;
+@end
+@implementation GTMGyro {
+    CMMotionManager *_mm;
+    NSOperationQueue *_q;
+    GTMGyroCfg _cfg;
+    double _yaw, _pitch, _lastTs;
+    double _ring[kGyroSmoothN][2];
+    int _ringPos;
+    uint32_t _seq;
+    BOOL _running, _qRunning;
+    volatile int _orient;
+}
++ (instancetype)shared { static GTMGyro *g; static dispatch_once_t once; dispatch_once(&once, ^{ g = [GTMGyro new]; }); return g; }
+- (instancetype)init {
+    if ((self = [super init])) {
+        _mm = [CMMotionManager new];
+        _mm.deviceMotionUpdateInterval = 1.0 / 100;
+        _q = [NSOperationQueue new];
+        _q.maxConcurrentOperationCount = 1;
+        _q.qualityOfService = NSQualityOfServiceUserInteractive;
+        _cfg = GTMGyroDefaults();
+        _orient = (int)UIInterfaceOrientationLandscapeRight;
+        [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil
+                                                         queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { [self setRunning:NO]; }];
+    }
+    return self;
+}
+- (void)setOrientation:(UIInterfaceOrientation)o { if (o != UIInterfaceOrientationUnknown) _orient = (int)o; }
+- (void)setConfig:(GTMGyroCfg)cfg { [_q addOperationWithBlock:^{ self->_cfg = cfg; [self writeBlock]; }]; }
+- (void)setRunning:(BOOL)run {
+    if (run == _running) return;
+    if (run && !_mm.deviceMotionAvailable) return;
+    _running = run;
+    if (run) {
+        [_q addOperationWithBlock:^{
+            self->_qRunning = YES; self->_lastTs = 0; self->_ringPos = 0;
+            memset(self->_ring, 0, sizeof self->_ring);
+        }];
+        [_mm startDeviceMotionUpdatesToQueue:_q withHandler:^(CMDeviceMotion *m, NSError *e) { if (m) [self sample:m]; }];
+    } else {
+        [_mm stopDeviceMotionUpdates];
+        [_q addOperationWithBlock:^{ self->_qRunning = NO; [self writeBlock]; }];
+    }
+}
+- (void)sample:(CMDeviceMotion *)m {
+    double dt = _lastTs > 0 ? m.timestamp - _lastTs : 0;
+    _lastTs = m.timestamp;
+    if (dt < 0) dt = 0;
+    if (dt > 0.05) dt = 0.05;
+    double U[3] = { 1, 0, 0 }, R[3] = { 0, -1, 0 };    // tela deitada com o botao inicial a direita
+    switch (_orient) {
+        case UIInterfaceOrientationLandscapeLeft:      U[0] = -1; U[1] = 0; R[0] = 0; R[1] = 1; break;
+        case UIInterfaceOrientationPortrait:           U[0] = 0; U[1] = 1; R[0] = 1; R[1] = 0; break;
+        case UIInterfaceOrientationPortraitUpsideDown: U[0] = 0; U[1] = -1; R[0] = -1; R[1] = 0; break;
+        default: break;
+    }
+    CMRotationRate r = m.rotationRate;
+    CMAcceleration g = m.gravity;
+    double gU = r.x * U[0] + r.y * U[1], gR = r.x * R[0] + r.y * R[1], gZ = r.z;
+    // virar para os lados: pela vertical do mundo (gravidade), limitado ao giro dos eixos da tela ("player space")
+    double yawLeft = gU, gn = sqrt(g.x * g.x + g.y * g.y + g.z * g.z);
+    if (gn > 0.5) {
+        double wU = -(g.x * U[0] + g.y * U[1]) / gn, wZ = -g.z / gn;
+        double world = gU * wU + gZ * wZ, mag = sqrt(gU * gU + gZ * gZ);
+        yawLeft = copysign(fmin(fabs(world) * 1.41, mag), world);
+    }
+    double yawRate = -yawLeft, pitchRate = gR;         // rad/s: direita +, cima +
+    // suavizacao em degraus: abaixo de 2,5 graus/s tudo suavizado, acima de 5 graus/s nada
+    double speed = sqrt(yawRate * yawRate + pitchRate * pitchRate);
+    double w = GTMClamp((speed - 2.5 * M_PI / 180) / (2.5 * M_PI / 180), 0, 1);
+    double dy = yawRate * dt, dp = pitchRate * dt;
+    _ring[_ringPos][0] = dy * (1 - w); _ring[_ringPos][1] = dp * (1 - w);
+    _ringPos = (_ringPos + 1) % kGyroSmoothN;
+    double sy = 0, sp = 0;
+    for (int i = 0; i < kGyroSmoothN; i++) { sy += _ring[i][0]; sp += _ring[i][1]; }
+    _yaw += dy * w + sy / kGyroSmoothN;
+    _pitch += dp * w + sp / kGyroSmoothN;
+    [self writeBlock];
+}
+- (void)writeBlock {
+    if (gFd < 0) return;
+    GTMGyroBlock b = {0};
+    b.magic = kGyroMagic; b.seq = ++_seq;
+    b.yaw = (uint32_t)(int64_t)llround(_yaw * 1e6);
+    b.pitch = (uint32_t)(int64_t)llround(_pitch * 1e6);
+    b.sensH = (uint16_t)lround(_cfg.sensH * 100); b.sensV = (uint16_t)lround(_cfg.sensV * 100);
+    b.aimPct = (uint16_t)lround(_cfg.aim * 100);
+    b.flags = (_cfg.on ? GY_ON : 0) | (_cfg.always ? GY_ALWAYS : 0) | (_cfg.invert ? GY_INVERT : 0) |
+              (_cfg.zoom ? GY_ZOOM : 0) | (_qRunning ? GY_RUN : 0);
+    pwrite(gFd, &b, sizeof b, kGyroOffset);
+}
+@end
 
 // ------------------------------------------------------------------ botao na tela
 typedef struct { double x, y, d; } GTMPlace;
@@ -434,6 +584,7 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
     UIAlertController *_kbAlert;
     __weak UIWindow *_kbPrevKey;
     int _kbMax;
+    UIView *_gyroPanel;
     CFTimeInterval _lastGameChange;
     UIImpactFeedbackGenerator *_haptic;
     UIButton *_pencil;
@@ -464,6 +615,8 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
         _state = S_CANSAVE;
         _weapon = 0xFF;
         GTMLoadOverrides();
+        GTMLoadGyro();
+        [GTMGyro.shared setConfig:gGyro];
 
         _pencil = [UIButton buttonWithType:UIButtonTypeSystem];
         [_pencil setImage:[UIImage systemImageNamed:@"pencil"] forState:UIControlStateNormal];
@@ -494,9 +647,12 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
         [reset setTitleColor:[UIColor colorWithRed:1 green:0.45 blue:0.4 alpha:1] forState:UIControlStateNormal];
         UIButton *move = [self toolButton:@"Caixa para baixo" action:@selector(moveToolbar)];
         move.tag = 13;
+        UIButton *gyro = [self toolButton:@"Giroscópio" action:@selector(toggleGyroPanel)];
+        gyro.tag = 14;
         [_toolbar addSubview:done];
         [_toolbar addSubview:reset];
         [_toolbar addSubview:move];
+        [_toolbar addSubview:gyro];
         [self addSubview:_toolbar];
 
         _toast = [UILabel new];
@@ -526,6 +682,8 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
     [b setTitle:title forState:UIControlStateNormal];
     b.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
     [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    b.titleLabel.adjustsFontSizeToFitWidth = YES;
+    b.titleLabel.minimumScaleFactor = 0.7;
     [b addTarget:self action:sel forControlEvents:UIControlEventTouchUpInside];
     return b;
 }
@@ -620,10 +778,16 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
     _toolbar.frame = CGRectMake((W - tw) / 2, ty, tw, th);
     UILabel *hint = [_toolbar viewWithTag:10];
     hint.frame = CGRectMake(12, 6, tw - 24, 40);
-    CGFloat bw = (tw - 40) / 3;                         // Restaurar | Caixa para cima/baixo | Concluir
+    CGFloat bw = (tw - 40) / 4;                         // Restaurar | Caixa para cima/baixo | Giroscopio | Concluir
     [_toolbar viewWithTag:12].frame = CGRectMake(20, 50, bw, 34);
     [_toolbar viewWithTag:13].frame = CGRectMake(20 + bw, 50, bw, 34);
-    [_toolbar viewWithTag:11].frame = CGRectMake(20 + 2 * bw, 50, bw, 34);
+    [_toolbar viewWithTag:14].frame = CGRectMake(20 + 2 * bw, 50, bw, 34);
+    [_toolbar viewWithTag:11].frame = CGRectMake(20 + 3 * bw, 50, bw, 34);
+    if (_gyroPanel) {
+        CGFloat pw = MIN(440, W - 40), ph = MIN(360, self.bounds.size.height - 24);
+        _gyroPanel.frame = CGRectMake((W - pw) / 2, (self.bounds.size.height - ph) / 2, pw, ph);
+        [self layoutGyroPanel];
+    }
     [self layoutToast];
 }
 
@@ -679,6 +843,7 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
         CGPoint p = [t locationInView:self];
         if (_editing) {
             if (CGRectContainsPoint(_toolbar.frame, p)) continue;
+            if (_gyroPanel && !_gyroPanel.hidden && CGRectContainsPoint(_gyroPanel.frame, p)) continue;
             int b = [self buttonAt:p];
             [self selectForEdit:b];
             if (b < 0) continue;
@@ -835,12 +1000,145 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
 }
 
 - (void)leaveEditing {
+    if (_gyroPanel && !_gyroPanel.hidden) { _gyroPanel.hidden = YES; GTMSaveGyro(); }
     _editing = NO;
     _pinch.enabled = NO;
     _toolbar.hidden = YES;
     [self selectForEdit:-1];
     for (int s = 0; s < 12; s++) _slots[s].kind = T_NONE, _slots[s].touch = nil;
     [self rebuild];
+}
+
+// ---- painel do giroscopio (no editor)
+enum { GYT_ON = 101, GYT_ALWAYS, GYT_H, GYT_V, GYT_AIM, GYT_INVERT, GYT_ZOOM, GYT_HL, GYT_VL, GYT_AIML };
+- (UILabel *)gyroLabel:(NSString *)text frame:(CGRect)f {
+    UILabel *l = [[UILabel alloc] initWithFrame:f];
+    l.text = text; l.textColor = UIColor.whiteColor; l.font = [UIFont systemFontOfSize:14];
+    l.adjustsFontSizeToFitWidth = YES; l.minimumScaleFactor = 0.75;
+    return l;
+}
+- (void)buildGyroPanel {
+    UIView *p = [UIView new];
+    p.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.94];
+    p.layer.cornerRadius = 14;
+    p.layer.borderWidth = 1;
+    p.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.2].CGColor;
+    p.hidden = YES;
+    UIScrollView *sc = [UIScrollView new];
+    sc.tag = 100;
+    [p addSubview:sc];
+    CGFloat W = 400, y = 8;
+    UILabel *t = [self gyroLabel:@"Giroscópio" frame:CGRectMake(16, y, W - 32, 26)];
+    t.font = [UIFont systemFontOfSize:17 weight:UIFontWeightBold];
+    [sc addSubview:t]; y += 32;
+    static const struct { const char *text; int tag; int kind; double lo, hi; int labelTag; } rows[] = {
+        { "Ligado", GYT_ON, 0, 0, 0, 0 },
+        { "Fora da mira também (só a câmera)", GYT_ALWAYS, 0, 0, 0, 0 },
+        { "Horizontal", GYT_H, 1, 0.2, 4.0, GYT_HL },
+        { "Vertical", GYT_V, 1, 0.2, 4.0, GYT_VL },
+        { "Na mira (mais preciso)", GYT_AIM, 1, 0.2, 1.5, GYT_AIML },
+        { "Inverter vertical", GYT_INVERT, 0, 0, 0, 0 },
+        { "Mais lento com zoom", GYT_ZOOM, 0, 0, 0, 0 },
+    };
+    for (unsigned i = 0; i < sizeof rows / sizeof rows[0]; i++) {
+        NSString *text = [NSString stringWithUTF8String:rows[i].text];
+        if (rows[i].kind == 0) {
+            [sc addSubview:[self gyroLabel:text frame:CGRectMake(16, y, W - 100, 31)]];
+            UISwitch *sw = [UISwitch new];
+            sw.tag = rows[i].tag;
+            sw.frame = CGRectMake(W - 16 - 51, y, 51, 31);
+            [sw addTarget:self action:@selector(gyroChanged:) forControlEvents:UIControlEventValueChanged];
+            [sc addSubview:sw];
+        } else {
+            [sc addSubview:[self gyroLabel:text frame:CGRectMake(16, y, 150, 31)]];
+            UISlider *sl = [[UISlider alloc] initWithFrame:CGRectMake(166, y, W - 166 - 70, 31)];
+            sl.tag = rows[i].tag; sl.minimumValue = rows[i].lo; sl.maximumValue = rows[i].hi;
+            [sl addTarget:self action:@selector(gyroChanged:) forControlEvents:UIControlEventValueChanged];
+            [sl addTarget:self action:@selector(gyroSave) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
+            [sc addSubview:sl];
+            UILabel *v = [self gyroLabel:@"" frame:CGRectMake(W - 64, y, 50, 31)];
+            v.tag = rows[i].labelTag; v.textAlignment = NSTextAlignmentRight;
+            v.font = [UIFont monospacedDigitSystemFontOfSize:14 weight:UIFontWeightSemibold];
+            [sc addSubview:v];
+        }
+        y += 38;
+    }
+    UIButton *def = [self toolButton:@"Valores padrão" action:@selector(askGyroDefaults)];
+    [def setTitleColor:[UIColor colorWithRed:1 green:0.45 blue:0.4 alpha:1] forState:UIControlStateNormal];
+    def.frame = CGRectMake(16, y, (W - 32) / 2, 34);
+    UIButton *close = [self toolButton:@"Fechar" action:@selector(toggleGyroPanel)];
+    close.frame = CGRectMake(16 + (W - 32) / 2, y, (W - 32) / 2, 34);
+    [sc addSubview:def]; [sc addSubview:close];
+    y += 44;
+    sc.contentSize = CGSizeMake(W, y);
+    _gyroPanel = p;
+    [self addSubview:p];
+}
+- (void)layoutGyroPanel {
+    UIScrollView *sc = [_gyroPanel viewWithTag:100];
+    CGFloat W = 400;
+    sc.frame = CGRectMake((_gyroPanel.bounds.size.width - W) / 2, 0, W, _gyroPanel.bounds.size.height);
+}
+- (void)showGyroValues {
+    ((UISwitch *)[_gyroPanel viewWithTag:GYT_ON]).on = gGyro.on;
+    ((UISwitch *)[_gyroPanel viewWithTag:GYT_ALWAYS]).on = gGyro.always;
+    ((UISwitch *)[_gyroPanel viewWithTag:GYT_INVERT]).on = gGyro.invert;
+    ((UISwitch *)[_gyroPanel viewWithTag:GYT_ZOOM]).on = gGyro.zoom;
+    ((UISlider *)[_gyroPanel viewWithTag:GYT_H]).value = gGyro.sensH;
+    ((UISlider *)[_gyroPanel viewWithTag:GYT_V]).value = gGyro.sensV;
+    ((UISlider *)[_gyroPanel viewWithTag:GYT_AIM]).value = gGyro.aim;
+    [self showGyroNumbers];
+}
+- (void)showGyroNumbers {
+    NSString *(^x)(double) = ^NSString *(double v) { return [[NSString stringWithFormat:@"%.1fx", v] stringByReplacingOccurrencesOfString:@"." withString:@","]; };
+    ((UILabel *)[_gyroPanel viewWithTag:GYT_HL]).text = x(gGyro.sensH);
+    ((UILabel *)[_gyroPanel viewWithTag:GYT_VL]).text = x(gGyro.sensV);
+    ((UILabel *)[_gyroPanel viewWithTag:GYT_AIML]).text = [NSString stringWithFormat:@"%d%%", (int)lround(gGyro.aim * 100)];
+    BOOL on = gGyro.on;
+    for (int tag = GYT_ALWAYS; tag <= GYT_AIML; tag++) {
+        UIView *v = [_gyroPanel viewWithTag:tag];
+        v.alpha = on ? 1 : 0.4;
+        if ([v isKindOfClass:UIControl.class]) ((UIControl *)v).enabled = on;
+    }
+}
+- (void)toggleGyroPanel {
+    if (!_gyroPanel) [self buildGyroPanel];
+    BOOL show = _gyroPanel.hidden;
+    if (!show) GTMSaveGyro();
+    _gyroPanel.hidden = !show;
+    _toolbar.hidden = show;                             // a caixa do editor volta quando o painel fecha
+    if (show) { [self showGyroValues]; [self bringSubviewToFront:_gyroPanel]; }
+    [self setNeedsLayout];
+    [self layoutIfNeeded];
+}
+- (void)gyroChanged:(UIControl *)c {
+    // sliders andam de 0,1 em 0,1 (na mira, de 5 em 5%)
+    switch (c.tag) {
+        case GYT_ON:     gGyro.on = ((UISwitch *)c).on; break;
+        case GYT_ALWAYS: gGyro.always = ((UISwitch *)c).on; break;
+        case GYT_INVERT: gGyro.invert = ((UISwitch *)c).on; break;
+        case GYT_ZOOM:   gGyro.zoom = ((UISwitch *)c).on; break;
+        case GYT_H:      gGyro.sensH = round(((UISlider *)c).value * 10) / 10; break;
+        case GYT_V:      gGyro.sensV = round(((UISlider *)c).value * 10) / 10; break;
+        case GYT_AIM:    gGyro.aim = round(((UISlider *)c).value * 20) / 20; break;
+    }
+    [GTMGyro.shared setConfig:gGyro];
+    [self showGyroNumbers];
+    if ([c isKindOfClass:UISwitch.class]) GTMSaveGyro();
+}
+- (void)gyroSave { GTMSaveGyro(); }
+- (void)askGyroDefaults {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Tem certeza?" message:@"O giroscópio volta aos ajustes originais."
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancelar" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Restaurar" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
+        gGyro = GTMGyroDefaults();
+        GTMSaveGyro();
+        [GTMGyro.shared setConfig:gGyro];
+        [self showGyroValues];
+        [self showToast:@"Giroscópio no padrão"];
+    }]];
+    [self.host presentViewController:a animated:YES completion:nil];
 }
 
 - (void)askReset {
@@ -988,6 +1286,10 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
         [self rebuild];                                 // ja aplica o estado novo
         [UIView animateWithDuration:0.15 animations:^{ self.alpha = (ctx == CTX_NONE) ? 0 : 1; }];
     } else if (stateChanged) [self applyState];
+    int gameCtx = fresh ? (int)g.context : CTX_NONE;   // o sensor segue o jogo, mesmo com o editor aberto
+    UIWindowScene *scene = self.window.windowScene;
+    if (scene) [GTMGyro.shared setOrientation:scene.interfaceOrientation];
+    [GTMGyro.shared setRunning:gGyro.on && gameCtx > CTX_NONE && gameCtx < CTX_CUTSCENE && gameCtx != CTX_MENU];
     BOOL live = (ctx != CTX_NONE);
     if (live != _live) {
         _live = live;
@@ -1000,7 +1302,7 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
     GTMHostBlock h = {0};
     h.magic = kHostMagic;
     h.seq = ++_hostSeq;
-    h.version = 4;
+    h.version = 5;
     h.cmdSeq = _cmdSeq; h.cmd = _hostCmd;
     if (!_editing) {
         uint32_t bits = 0;
@@ -1029,7 +1331,7 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
         if (abs(py) > abs(ly)) ly = py;
         h.lx = lx; h.ly = ly; h.rx = rx; h.ry = ry;
     }
-    pwrite(gFd, &h, sizeof h, kHostOffset);
+    pwrite(gFd, &h, 32, kHostOffset);                   // so os campos; [96..127] e do giroscopio
 }
 @end
 
@@ -1078,7 +1380,7 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
     self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(frame:)];
     self.link.preferredFrameRateRange = CAFrameRateRangeMake(30, 60, 60);
     [self.link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
-    NSLog(@"[GTMTouch] overlay 3.3 ligado; arquivo %@", GTMSharedPath());
+    NSLog(@"[GTMTouch] overlay 3.4 ligado; arquivo %@", GTMSharedPath());
 }
 - (void)frame:(CADisplayLink *)l { [self.pad tick]; }
 - (void)sceneEvent:(NSNotification *)n { [self attachIfNeeded]; }

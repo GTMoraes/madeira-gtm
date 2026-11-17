@@ -10,8 +10,9 @@ Overlay de toque contextual para o GTA San Andreas (PC 1.0 US) rodando no Madeir
   grupo, ícone do Atirar pela arma na mão, Entrar com o ícone do veículo perto. Editor de posição
   e tamanho por layout (lápis no canto). Ícones lidos de `Documents/gtmtouch/icons` no aparelho.
   Troca de arma deslizando sobre o ícone da arma do jogo (um toque sem deslizar recarrega a arma, quando dá);
-  botão TAB contextual (status, telefone, trocar pela arma do chão). Teclado do iPhone quando o jogo pede um
-  texto (placa dos carros da garagem).
+  botão TAB contextual (status, telefone, trocar pela arma do chão). "Olhar atrás" dirigindo e de passageiro. Teclado do iPhone quando o jogo pede um
+  texto (placa dos carros da garagem). Giroscópio: gira só a câmera do jogo, sempre na mira e, se quiser,
+  também a pé e dirigindo, com sensibilidade horizontal, vertical e na mira no painel do editor (lápis > Giroscópio).
 - `asi/GTMTouchSA.cpp`: plugin do jogo (vai em `GTA San Andreas/scripts`). Escreve contexto e
   estado e recebe os toques por `C:\gtmtouch.bin` (`Documents/wine/drive_c/gtmtouch.bin` no
   iPhone), entregando ao GInput como um controle. Inclui a direção pelas setas, salvar na hora,
@@ -23,7 +24,7 @@ Overlay de toque contextual para o GTA San Andreas (PC 1.0 US) rodando no Madeir
   para a garagem; venda no mercado negro; os amassados do LocalDent vao junto, com o LocalDent modificado que
   exporta o estado de cada carro; cada garagem guarda quantos carros couberem nela e o carro que nao cabe fica
   seu, "sem vaga"; troca de placa que acompanha o carro; os patios da policia ficam de fora).
-  Protocolo 4 (256 bytes: jogo 0-63, overlay 64-127, pedido de teclado 128-191, resposta 192-255).
+  Protocolo 5 (256 bytes: jogo 0-63, overlay 64-95, giroscópio 96-127, pedido de teclado 128-191, resposta 192-255).
 - `.github/workflows/build-ipa.yml`: baixa o Madeira, compila e injeta o dylib, publica o IPA numa Release.
   Fonte padrao: o fork GTMoraes/Madeira (FEX de GTMoraes/FEX, branch gtm-x87pc: o x87 respeita a precisao
   simples que o Direct3D 9 pede; `env.MADEIRA_X87_PC = 0` desliga). A fonte "oficial" usa willfaust/Madeira.
