@@ -12,7 +12,8 @@ Overlay de toque contextual para o GTA San Andreas (PC 1.0 US) rodando no Madeir
   Troca de arma deslizando sobre o ícone da arma do jogo (um toque sem deslizar recarrega a arma, quando dá);
   botão TAB contextual (status, telefone, trocar pela arma do chão). "Olhar atrás" dirigindo e de passageiro. Teclado do iPhone quando o jogo pede um
   texto (placa dos carros da garagem). Giroscópio: gira só a câmera do jogo, sempre na mira e, se quiser,
-  também a pé e dirigindo, com sensibilidade horizontal, vertical e na mira no painel do editor (lápis > Giroscópio).
+  também a pé e dirigindo (aí a câmera vira e fica, como o mouse; "Olhar atrás" no veículo e "Centralizar" a pé
+  voltam ela para trás), com sensibilidade horizontal, vertical e na mira no painel do editor (lápis > Giroscópio).
 - `asi/GTMTouchSA.cpp`: plugin do jogo (vai em `GTA San Andreas/scripts`). Escreve contexto e
   estado e recebe os toques por `C:\gtmtouch.bin` (`Documents/wine/drive_c/gtmtouch.bin` no
   iPhone), entregando ao GInput como um controle. Inclui a direção pelas setas, salvar na hora,

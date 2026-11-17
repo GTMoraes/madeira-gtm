@@ -1,4 +1,4 @@
-// GTMTouchSA.asi 3.17 - controles de toque contextuais para GTA San Andreas 1.0 US no Madeira
+// GTMTouchSA.asi 3.18 - controles de toque contextuais para GTA San Andreas 1.0 US no Madeira
 //
 // 1) Contexto: a cada quadro escreve em C:\gtmtouch.bin em que situacao o CJ esta (a pe,
 //    nadando, de jetpack, carro, moto, helicoptero, aviao, barco, passageiro, cutscene,
@@ -11,7 +11,7 @@
 // 3) Direcao: dentro de veiculo, D-pad esquerda/direita vira esterco total com rampa.
 // 4) Salvar: na hora (botao), autosave a cada N minutos e ao passar missao, sempre no
 //    mesmo slot. Se salvou dentro de um veiculo, recria o veiculo ao carregar.
-// 5) Comandos do overlay: 1 salvar, 2 detonar as satchels, 3 voltar para a satchel, 4 recarregar.
+// 5) Comandos do overlay: 1 salvar, 2 detonar as satchels, 3 voltar para a satchel, 4 recarregar, 5 centralizar.
 // 6) Skin Selector (3.10/3.12): Status + Atirar abre o menu; a skin escolhida anda e fala como o
 //    personagem do modelo; o save daqui grava a skin no slot do save.
 // 7) Garagem pelo telefone (3.13/3.14): Status + Pular lista os carros das garagens; um membro da Grove entrega,
@@ -20,7 +20,8 @@
 //    seu, "sem vaga"), lugar livre ao voltar, e "Trocar placa" (teclado do iPhone pelo overlay 3.3, ou do PC).
 // 8) Arquivo compartilhado, parte do teclado: [128..191] pedido do jogo, [192..255] resposta do overlay.
 // 9) Giroscopio (3.17, overlay 3.4): [96..127] escrito pelo overlay; gira so a camera, na mira e, se quiser,
-//    tambem a pe e dirigindo.
+//    tambem a pe e dirigindo. 3.18: fora da mira a camera vira e fica, como o mouse; Olhar atras e Centralizar
+//    voltam ela para tras.
 //
 // Interceptacoes: XInputGetState (instalada logo na carga, para valer no menu tambem),
 // CALL em 0x53C077 dentro de CGame::Process (por quadro: CCranes::UpdateCranes, depois dos
@@ -789,6 +790,7 @@ static const DWORD VEH_MAGIC = 0x564D5447;
 static bool  g_pendingRestore = false;
 static char* g_saveVeh = nullptr;                                          // veiculo do CJ durante o DoSave
 static void  GarOnLoad();
+static void  DoRecenter();
 static unsigned g_loadedTimeMs = 0;
 static DWORD g_lastAutosaveTick = 0, g_missionEndTick = 0, g_hostCmdSeen = 0;
 static int   g_lastMissionsPassed = -1;
@@ -1020,6 +1022,7 @@ static void SaveTick() {
                 case 2: DoDetonate(); break;
                 case 3: DoSelectSatchel(); break;
                 case 4: DoReload(); break;
+                case 5: DoRecenter(); break;
                 default: break;
             }
         }
@@ -3083,9 +3086,18 @@ static void InstallGarage() {
 // configuracao de controle. So gira a camera: o personagem e o carro nao recebem nada.
 //  - mira (sempre): mira livre (53), M4/AK (34), rifle (7), lanca-foguetes (8, 51), camera (46), canhao do
 //    helicoptero (45), mira de dentro do carro (55) e as variantes "runabout" (39-42, 52);
-//  - fora da mira (opcao do painel): a pe (4), carro e moto (18), barco (22). No carro, com o mouse na terceira
-//    pessoa ligado no jogo, segura a camera onde voce virou por 1 s, como o mouse (0xB70118).
+//  - fora da mira (opcao do painel): a pe (4), carro e moto (18), barco (22).
 // Com zoom, o giro diminui na mesma proporcao do zoom (tan(FOV/2)), para a mira andar o mesmo tanto na tela.
+//
+// Fora da mira, a camera do modo controle volta sozinha para tras (a pe, CCam::Process_FollowPed_SA 0x522D40, e no
+// carro, Process_FollowCar_SA 0x5245B0). No modo mouse ela "vira e fica": a pe o jogo usa outra camera,
+// Process_FollowPedWithMouse (0x50F970, o analogico continua valendo nela), e no carro um contador (0xB70118) segura
+// a camera onde o mouse deixou. Com o "fora da mira" ligado, as duas leituras de CCamera::m_bUseMouse3rdPerson
+// (0xB6EC2E) que escolhem isso (0x5279BB e 0x525615) passam a ler um byte nosso: o do jogo, ou 1 enquanto o
+// giroscopio estiver valendo fora da mira (com arma em uso a pe, fica o do jogo, que guarda a trava de alvo).
+// No carro, depois que o giroscopio mexe, o contador fica cheio e a camera acompanha o giro do carro (fica virada
+// em relacao a ele). Soltam: Olhar atras (os dois gatilhos), o analogico direito, ou sair do carro.
+// "Centralizar" (comando 5 do overlay), a pe: a camera volta para tras do CJ, na altura de antes, em ~0,2 s.
 #pragma pack(push, 1)
 struct GyroBlock { DWORD magic, seq, yaw, pitch; WORD sensH, sensV, aimPct; BYTE flags, pad0; BYTE pad[8]; };
 #pragma pack(pop)
@@ -3096,6 +3108,28 @@ static int   g_gyroOn = 1;
 static bool  g_gyHave = false;
 static DWORD g_gyPrevYaw = 0, g_gyPrevPitch = 0, g_gyCfgLogged = 0xFFFFFFFF;
 static unsigned long long g_gyModesLogged = 0;
+static BYTE  g_camMouse = 0;                                                  // lido no lugar de 0xB6EC2E (2 pontos)
+static bool  g_camPatched = false, g_carHold = false, g_restAlphaOk = false;
+static float g_carHeading = 0.f, g_restAlpha = 0.f;
+static DWORD g_recenterUntil = 0;
+static void ApplyGyroCam() {
+    g_camMouse = *(volatile BYTE*)0xB6EC2E;
+    static const BYTE orig[] = { 0xA0, 0x2E, 0xEC, 0xB6, 0x00 };             // mov al, [CCamera::m_bUseMouse3rdPerson]
+    BYTE r[5]; r[0] = 0xA0; *(DWORD*)(r + 1) = (DWORD)&g_camMouse;
+    bool a = PatchBytes(0x5279BB, orig, sizeof orig, r, sizeof r, "giroscopio: camera a pe que vira e fica (CCam::Process)");
+    bool b = PatchBytes(0x525615, orig, sizeof orig, r, sizeof r, "giroscopio: camera do carro que segura (Process_FollowCar_SA)");
+    g_camPatched = a && b;
+}
+static float WrapPi(float d) { while (d > 3.14159265f) d -= 6.2831853f; while (d < -3.14159265f) d += 6.2831853f; return d; }
+static float EntityHeading(const char* e) {                                  // direcao da frente no chao (x, y)
+    const float* m = Rd<const float*>(e, 0x14);
+    if (m) return atan2f(m[5], m[4]);
+    return Rd<float>(e, 0x10) + 1.5707963f;
+}
+static void DoRecenter() {
+    if (g_carHold) { g_carHold = false; *(float*)0xB70118 = 0.f; Log("giroscopio: camera do carro solta (centralizar)"); }
+    g_recenterUntil = GetTickCount() + 600;
+}
 static bool ReadGyro(GyroBlock* b) {
     if (g_file == INVALID_HANDLE_VALUE) return false;
     EnterCriticalSection(&g_io);
@@ -3109,10 +3143,51 @@ static bool IsAimCam(int m) {
     return false;
 }
 static bool IsFreeCam(int m) { return m == 4 || m == 18 || m == 22; }
+static void CamTick(const GyroBlock* b) {                                     // a cada quadro, mesmo sem giro
+    HostBlock hb;                                                             // sensor parado um instante (pausa): vale o overlay vivo
+    bool gyroFree = b && (b->flags & GY_ON) && (b->flags & GY_ALWAYS) && ((b->flags & GY_RUN) || ReadHost(&hb));
+    char* me = PlayerPed();
+    int active = *(volatile BYTE*)0xB6F081;
+    char* cam = active <= 2 ? (char*)0xB6F19C + active * 0x238 : nullptr;
+    int mode = cam ? Rd<short>(cam, 0xC) : -1;
+    bool gun = false;
+    if (me) { char* intel = Rd<char*>(me, 0x47C); gun = intel && GetTaskUseGun(intel); }
+    g_camMouse = (*(volatile BYTE*)0xB6EC2E || (gyroFree && g_camPatched && !gun)) ? 1 : 0;
+    // carro: segura enquanto valer; acompanha o giro do carro
+    char* veh = PlayerVehicle();
+    if (g_carHold) {
+        const short* pad = (const short*)0xB73458;                           // CPad 0, NewState
+        bool lookBack = pad[0x0A / 2] > 100 && pad[0x0E / 2] > 100;           // LeftShoulder2 + RightShoulder2
+        bool stick = abs(pad[4 / 2]) > 16 || abs(pad[6 / 2]) > 16;          // analogico direito
+        if (!gyroFree || !veh || !cam || (mode != 18 && mode != 22) || lookBack || stick) {
+            g_carHold = false;
+            *(float*)0xB70118 = 0.f;                                          // sem o resto do segurar: volta ja
+            Log("giroscopio: camera do carro solta (%s)", lookBack ? "olhar atras" : stick ? "analogico" : !veh ? "saiu do veiculo" : "fim do modo");
+        } else {
+            float h = EntityHeading(veh);
+            *(float*)(cam + 0xBC) += WrapPi(h - g_carHeading);
+            g_carHeading = h;
+            *(float*)0xB70118 = 50.f;
+        }
+    }
+    // centralizar a pe: volta para tras do CJ (frente da camera = -cos/sin do Beta) e para a altura de antes
+    if (g_recenterUntil) {
+        if (GetTickCount() > g_recenterUntil || !me || !cam || mode != 4 || veh) { g_recenterUntil = 0; g_restAlphaOk = false; }
+        else {
+            float target = EntityHeading(me) + 3.14159265f;                    // Beta tal que (-cos B, -sin B) = frente do CJ
+            float d = WrapPi(target - Rd<float>(cam, 0xBC));
+            *(float*)(cam + 0xBC) += d * 0.35f;
+            if (g_restAlphaOk) *(float*)(cam + 0xAC) += (g_restAlpha - Rd<float>(cam, 0xAC)) * 0.35f;
+            if (fabsf(d) < 0.01f) { g_recenterUntil = 0; g_restAlphaOk = false; }
+        }
+    }
+}
 static void GyroTick() {
-    if (!g_gyroOn || !g_touchOn) return;
+    if (!g_gyroOn || !g_touchOn) { CamTick(nullptr); return; }
     GyroBlock b;
-    if (!ReadGyro(&b) || !(b.flags & GY_ON) || !(b.flags & GY_RUN)) { g_gyHave = false; return; }
+    bool okb = ReadGyro(&b);
+    CamTick(okb ? &b : nullptr);
+    if (!okb || !(b.flags & GY_ON) || !(b.flags & GY_RUN)) { g_gyHave = false; return; }
     DWORD cfg = (DWORD)b.sensH | ((DWORD)b.sensV << 10) | ((DWORD)b.aimPct << 20) | ((DWORD)(b.flags & 0xF) << 28);
     if (cfg != g_gyCfgLogged) {
         g_gyCfgLogged = cfg;
@@ -3146,9 +3221,13 @@ static void GyroTick() {
     }
     float yaw = dy * 1e-6f * sh * k, pitch = dp * 1e-6f * sv * k;
     if (b.flags & GY_INVERT) pitch = -pitch;
+    if (free && mode == 4 && !g_restAlphaOk && !g_recenterUntil) { g_restAlpha = Rd<float>(cam, 0xAC); g_restAlphaOk = true; }
+    if (free && (mode == 18 || mode == 22) && !g_carHold && PlayerVehicle()) {
+        g_carHold = true; g_carHeading = EntityHeading(PlayerVehicle());
+        Log("giroscopio: camera do carro segura onde voce virou (Olhar atras solta)");
+    }
     *(float*)(cam + 0xBC) -= yaw;                                             // Beta: frente = (-cos B, -sin B): para a direita diminui
     *(float*)(cam + 0xAC) += pitch;                                           // Alpha: frente.z = sin A (0x524206): para cima aumenta
-    if (mode == 18 || mode == 22) *(float*)0xB70118 = 50.f;
     if (mode < 64 && !(g_gyModesLogged & (1ull << mode))) {
         g_gyModesLogged |= 1ull << mode;
         Log("giroscopio: girando a camera no modo %d (%s)", mode, aim ? "mira" : "fora da mira");
@@ -3445,7 +3524,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     InitializeCriticalSection(&g_hookCs);
     LoadConfig(inst);
     QueryPerformanceFrequency(&g_qpf);
-    Log("GTMTouchSA 3.17 carregado (direcao=%d rampa=%d retorno=%d toque=%d sim/nao por script=%d diag toque=%d ragdoll=%d contagem=%d audio=%d x87=%d pular abertura=%d radar no alto=%d protecao da arma=%d menu de skins=%d andar da skin=%d voz da skin=%d skin nas roupas de missao=%d garagem=%d giroscopio=%d)",
+    Log("GTMTouchSA 3.18 carregado (direcao=%d rampa=%d retorno=%d toque=%d sim/nao por script=%d diag toque=%d ragdoll=%d contagem=%d audio=%d x87=%d pular abertura=%d radar no alto=%d protecao da arma=%d menu de skins=%d andar da skin=%d voz da skin=%d skin nas roupas de missao=%d garagem=%d giroscopio=%d)",
         g_steerOn, g_rampMs, g_releaseMs, g_touchOn, g_ynScripts, g_traceTouch, g_traceRagdoll, g_countRagdoll, g_audioHash, g_fixX87, g_skipIntro, g_radarTop, g_weaponGuard, g_skinOn, g_skinAnims, g_skinVoice, g_skinClothes, g_garOn, g_gyroOn);
     if (GetModuleHandleA("GTMSteerSA.asi")) Log("AVISO: GTMSteerSA.asi tambem esta carregado; apague ele da pasta scripts");
     if (!IsSupportedExe()) { Log("executavel nao e o 1.0 US: nada foi alterado"); return TRUE; }
@@ -3457,6 +3536,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     if (g_weaponGuard) ApplyWeaponGuard();
     if (g_skinAnims) ApplySkinAnims();
     if (g_skinClothes) ApplySkinClothes();
+    if (g_gyroOn) ApplyGyroCam();
     g_mhReady = (MH_Initialize() == MH_OK);
     if (!g_mhReady) { Log("MinHook nao iniciou"); return TRUE; }
     HANDLE t = CreateThread(nullptr, 0, StartupThread, nullptr, 0, nullptr);

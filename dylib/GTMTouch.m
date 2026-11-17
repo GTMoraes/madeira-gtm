@@ -1,4 +1,4 @@
-// GTMTouch.dylib 3.4 - overlay de toque contextual para o GTA San Andreas no Madeira.
+// GTMTouch.dylib 3.5 - overlay de toque contextual para o GTA San Andreas no Madeira.
 //
 // Injetado no IPA oficial do Madeira. Desenha os controles por cima do jogo e troca o
 // conjunto de botoes sozinho conforme o contexto que o GTMTouchSA.asi escreve em
@@ -34,6 +34,8 @@
 // e escreve em [96..127] (GTMY) o giro acumulado e os ajustes. O jogo gira so a camera, como um mouse. Painel no
 // editor (lapis > Giroscopio). Protocolo 5: o bloco do overlay passa a gravar so os 32 bytes dele em [64..95].
 //      Botao "Olhar atrás" dirigindo (carro, moto, barco) e de passageiro: aperta os dois gatilhos juntos.
+// 3.5 (GTMTouchSA 3.18): com o giroscopio "fora da mira", a camera vira e fica, como o mouse. "Olhar atrás" no
+// veiculo tambem solta a camera, que volta para tras; a pe, "Centralizar" (comando 5) poe a camera atras do CJ.
 //
 // Sem jogo rodando o overlay some e todo toque passa direto para o Madeira. No menu e na
 // cutscene so os botoes recebem toque; o resto da tela continua sendo do Madeira.
@@ -102,6 +104,7 @@ enum {
     S_ACTPHONE = 1u << 17, S_ACTWEAPON = 1u << 18, S_ACTOTHER = 1u << 19, S_RELOAD = 1u << 20,
 };
 #define S_CANSAVE 0x80000000u
+#define S_GYROFREE 0x40000000u                          // local: giroscopio ligado tambem fora da mira
 // .asi 2.0 nao manda estado: mostra o que a 2.0 mostrava
 static const uint32_t kCompatState = S_YESNO | S_WEAPONS | S_AIM | S_ARMED | S_FIRE | S_SUBMISSION | S_VEHNEAR;
 
@@ -112,7 +115,7 @@ enum {
     B_X = 0x4000, B_Y = 0x8000, B_LT = 0x10000, B_RT = 0x20000, B_RAWL = 0x40000, B_RAWR = 0x80000,
     B_STKUP = 0x100000, B_STKDN = 0x200000      // analogico esquerdo para cima/baixo, com rampa (cruz das aeronaves)
 };
-enum { CMD_NONE = 0, CMD_SAVE = 1, CMD_DETONATE = 2, CMD_SATCHEL = 3, CMD_RELOAD = 4 };
+enum { CMD_NONE = 0, CMD_SAVE = 1, CMD_DETONATE = 2, CMD_SATCHEL = 3, CMD_RELOAD = 4, CMD_RECENTER = 5 };
 enum { DYN_NONE = 0, DYN_WEAPON, DYN_VEHICLE, DYN_GROUP, DYN_ACTION };
 
 // ------------------------------------------------------------------ layouts padrao
@@ -176,6 +179,7 @@ static const GTMBtnDef kFoot[] = {
     {.key = "satchel",  .label = "Jogar mais", .icon = "hud_bomb",      .cmd = CMD_SATCHEL,  .need = S_MORESATCHEL, .x = 590, .y = 225, .d = 54},
     {.key = "action", .label = "Status",  .bits = B_LB, .dyn = DYN_ACTION, .x = 110, .y = 180, .d = 51},
     {.key = "crouch", .label = "Agachar", .icon = "crouch",        .bits = B_L3, .x = 110, .y = 240, .d = 51},
+    {.key = "recenter", .label = "Centralizar", .cmd = CMD_RECENTER, .need = S_GYROFREE, .x = 600, .y = 150, .d = 50},
     {.key = "follow", .label = "Recrutar", .icon = "LetsGoHand", .bits = B_UP,   .dyn = DYN_GROUP, .need = S_GROUP,     .x = 205, .y = 165, .d = 44},
     {.key = "stay",   .label = "Ficar",    .icon = "StopHand",   .bits = B_DOWN, .need = S_GROUPMEMBERS,                 .x = 265, .y = 165, .d = 44},
     YESNO_AT(100), CAM_BTN, PAUSE_BTN, SAVE_BTN,
@@ -1275,6 +1279,7 @@ enum { GYT_ON = 101, GYT_ALWAYS, GYT_H, GYT_V, GYT_AIM, GYT_INVERT, GYT_ZOOM, GY
     if (fresh && (int)g.context == ctx) {               // estado so vale para o contexto em que veio
         uint32_t state = g.version >= 3 ? g.state : kCompatState;
         if (g.canSave) state |= S_CANSAVE;
+        if (gGyro.on && gGyro.always) state |= S_GYROFREE;
         uint8_t weapon = g.version >= 3 ? g.weapon : 0xFF, nearVeh = g.version >= 3 ? g.nearVeh : 0;
         if (state != _state || weapon != _weapon || nearVeh != _nearVeh) {
             _state = state; _weapon = weapon; _nearVeh = nearVeh;
@@ -1380,7 +1385,7 @@ enum { GYT_ON = 101, GYT_ALWAYS, GYT_H, GYT_V, GYT_AIM, GYT_INVERT, GYT_ZOOM, GY
     self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(frame:)];
     self.link.preferredFrameRateRange = CAFrameRateRangeMake(30, 60, 60);
     [self.link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
-    NSLog(@"[GTMTouch] overlay 3.4 ligado; arquivo %@", GTMSharedPath());
+    NSLog(@"[GTMTouch] overlay 3.5 ligado; arquivo %@", GTMSharedPath());
 }
 - (void)frame:(CADisplayLink *)l { [self.pad tick]; }
 - (void)sceneEvent:(NSNotification *)n { [self attachIfNeeded]; }
