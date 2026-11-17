@@ -28,7 +28,11 @@ Overlay de toque contextual para o GTA San Andreas (PC 1.0 US) rodando no Madeir
   seu, "sem vaga"; troca de placa que acompanha o carro; os patios da policia ficam de fora) e o traficante de
   armas pelo mesmo telefone (van preta com as portas de tras abertas; arma uma vez e depois so a municao, em
   caixas; precos pela fase da AmmuNation, com o mesmo calculo do script da loja, e as pesadas liberadas com Las
-  Venturas; a policia reage a van aberta).
+  Venturas; a policia reage a van aberta; parado atras da van, ele pergunta se voce quer comprar, e da para
+  dispensar ele), dar a arma que voce segura para o pedestre na sua frente (Status + Correr, com um cumprimento de
+  gangue) e as armas de fogo protegidas em missao (a missao nao troca nem tira pistola, escopeta, submetralhadora
+  e fuzil de assalto seus: a arma dela vira municao da sua; municao infinita volta ao que era no fim, mais uma
+  caixa se vencer; o que a missao tira de uma vez volta quando ela termina).
   Protocolo 5 (256 bytes: jogo 0-63, overlay 64-95, giroscópio 96-127, pedido de teclado 128-191, resposta 192-255).
 - `.github/workflows/build-ipa.yml`: baixa o Madeira, compila e injeta o dylib, publica o IPA numa Release.
   Fonte padrao: o fork GTMoraes/Madeira (FEX de GTMoraes/FEX, branch gtm-x87pc: o x87 respeita a precisao

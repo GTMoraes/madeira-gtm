@@ -1,4 +1,4 @@
-// GTMTouchSA.asi 3.20 - controles de toque contextuais para GTA San Andreas 1.0 US no Madeira
+// GTMTouchSA.asi 3.23 - controles de toque contextuais para GTA San Andreas 1.0 US no Madeira
 //
 // 1) Contexto: a cada quadro escreve em C:\gtmtouch.bin em que situacao o CJ esta (a pe,
 //    nadando, de jetpack, carro, moto, helicoptero, aviao, barco, passageiro, cutscene,
@@ -25,6 +25,11 @@
 // 10) Traficante de armas (3.20): Status + Pular abre o telefone com "Carro da garagem" e "Traficante de armas";
 //    ele vem numa van preta, abre as portas de tras e vende armas, municao avulsa e equipamento. Precos pela fase
 //    da AmmuNation (o mesmo calculo do ammu.scm), Las Venturas libera as pesadas, a policia reage a van aberta.
+//    3.21: atras da van, parado 1 s, ele pergunta "Quer comprar?" (Sim abre o menu, Nao dispensa); "Dispensar o
+//    traficante" no menu; dispensado, sai com calma; as portas de tras fecham de verdade ao sair.
+// 11) Dar a arma (3.21): Status + Correr, a pe, da ao pedestre na sua frente a arma que voce esta segurando
+//    (municao de sobra), depois de um cumprimento de gangue.
+// 3.22/3.23: Atirar aparece no drive-by de missao (o script poe o CJ atirando da garupa ou da janela; ex.: Just Business).
 //
 // Interceptacoes: XInputGetState (instalada logo na carga, para valer no menu tambem),
 // CALL em 0x53C077 dentro de CGame::Process (por quadro: CCranes::UpdateCranes, depois dos
@@ -255,6 +260,7 @@ static bool ReadHost(HostBlock* out) {
 
 // ---------------------------------------------------------------- Sim/Nao pendente
 static volatile bool  g_helpYN = false, g_helpYNPerm = false;
+static volatile bool  g_dealerYN = false;                                    // o traficante pergunta "Quer comprar?"
 static volatile DWORD g_helpYNTick = 0, g_scriptYNTick = 0;
 static char g_scriptYNName[9] = "";
 static const char* g_ynWhy = "";
@@ -349,6 +355,7 @@ static int __fastcall GetPadStateDetour(void* self, void* /*edx*/, int pad, int 
 }
 
 static bool YesNoPending() {
+    if (g_dealerYN) { g_ynWhy = "traficante"; return true; }
     if (*(volatile DWORD*)0x969A20 == 1) { g_ynWhy = "pedestre puxou conversa"; return true; }   // CPedToPlayerConversations: PEDHASOPENED
     for (int i = 0; i < 14; i++)                                                                  // CConversations: WAITINGFORINPUT
         if (*(volatile DWORD*)(0x9691D8 + i * 0x1C + 0x14) == 3) { g_ynWhy = "conversa de missao"; return true; }
@@ -464,6 +471,19 @@ static bool CanReload(char* ped, int* reloadMs) {
     return true;
 }
 
+// drive-by de missao (TASK_DRIVE_BY no CJ, ex.: Just Business na garupa do Big Smoke): o script poe um
+// CTaskSimpleGangDriveBy (tipo 0x3FE) como tarefa PRIMARIA do CJ (o handler do 0713 olha CPedIntelligence+0x10,
+// isto e, CTaskManager::m_aPrimaryTasks[3], e entrega pelo 0x465C20). Enquanto ela roda, o m_bCanDoDriveBy fica zerado
+// (0x621AEF), entao o teste normal de drive-by falha. Atirar vale. Olho tambem a secundaria de ataque, por garantia.
+static bool GangDriveBy(char* ped) {
+    char* intel = Rd<char*>(ped, 0x47C);                                     // CPedIntelligence*
+    if (!intel) return false;
+    typedef int (__thiscall* GetTaskType_t)(void*);
+    void* tasks[2] = { Rd<void*>(intel, 0x10), Rd<void*>(intel, 0x18) };   // primaria (tm+0xC) e secundaria de ataque (tm+0x14)
+    for (void* t : tasks)
+        if (t && ((GetTaskType_t)(*(void***)t)[0x10 / 4])(t) == 0x3FE) return true;   // TASK_SIMPLE_GANG_DRIVEBY
+    return false;
+}
 static void ComputeInfo(Info& in) {
     in = {};
     if (MenuActive()) { in.ctx = CTX_MENU; return; }
@@ -498,7 +518,13 @@ static void ComputeInfo(Info& in) {
         int cls = Rd<int>(veh, 0x590);
         bool driver = remote || Rd<char*>(veh, 0x460) == ped;                 // m_pDriver
         if (remote) in.state |= S_REMOTE;
-        if (!driver) { in.ctx = CTX_PASSENGER; if (driveByWeapon) in.state |= S_FIRE | S_DRIVEBY; return; }
+        bool gangDriveBy = GangDriveBy(ped);
+        {
+            static bool noted = false;
+            if (gangDriveBy && !noted) Log("drive-by de missao: botao Atirar ligado (%s)", driver ? "dirigindo" : "passageiro");
+            noted = gangDriveBy;
+        }
+        if (!driver) { in.ctx = CTX_PASSENGER; if (driveByWeapon) in.state |= S_FIRE | S_DRIVEBY; if (gangDriveBy) in.state |= S_FIRE; return; }
         in.ctx = ClassToCtx(cls);
         int model = Rd<short>(veh, 0x22);
         DWORD hf = Rd<DWORD>(veh, 0x38C);                                     // handlingFlags
@@ -509,6 +535,7 @@ static void ComputeInfo(Info& in) {
         bool air = cls == 3 || cls == 4 || cls == 7 || cls == 8;
         int bomb = Rd<BYTE>(veh, 0x4A8) & 7;                                  // m_nBombOnBoard: 1 timer, 2 ignicao (armar com B)
         if (!air && driveByWeapon) in.state |= S_FIRE | S_DRIVEBY;
+        if (gangDriveBy) in.state |= S_FIRE;
         if (InList(g_fireModels, g_nFire, model) || bomb == 1 || bomb == 2) in.state |= S_FIRE;
         if (InList(g_fire2Models, g_nFire2, model)) in.state |= S_FIRE2;
         return;
@@ -598,6 +625,7 @@ static void SkinCombo(WORD buttons, PadState& p, DWORD now) {
 }
 
 static void GarageCombo(WORD buttons, PadState& p);
+static void GiveCombo(WORD buttons, PadState& p);
 static DWORD Filter(DWORD ret, DWORD idx, XState* st) {
     if (idx != 0 || !st) return ret;
     InterlockedIncrement(&g_xinputCalls);
@@ -628,6 +656,7 @@ static DWORD Filter(DWORD ret, DWORD idx, XState* st) {
         p.sThumbRX = Stronger(p.sThumbRX, h.rx); p.sThumbRY = Stronger(p.sThumbRY, h.ry);
         SkinCombo(h.buttons, p, now);
         GarageCombo(h.buttons, p);
+        GiveCombo(h.buttons, p);
     }
     if (ret != ERROR_SUCCESS) return ret;
 
@@ -793,6 +822,7 @@ static const DWORD VEH_MAGIC = 0x564D5447;
 static bool  g_pendingRestore = false;
 static char* g_saveVeh = nullptr;                                          // veiculo do CJ durante o DoSave
 static void  GarOnLoad();
+static void  ProtOnLoad();
 static void  DoRecenter();
 static unsigned g_loadedTimeMs = 0;
 static DWORD g_lastAutosaveTick = 0, g_missionEndTick = 0, g_hostCmdSeen = 0;
@@ -1003,6 +1033,7 @@ static void __cdecl AfterLoadDetour() {
     g_loadedTimeMs = *TimeMs;
     g_pendingRestore = g_keepVehicle != 0;
     GarOnLoad();
+    ProtOnLoad();
     g_lastAutosaveTick = GetTickCount();
     g_lastMissionsPassed = -1;
     g_missionEndTick = 0;
@@ -1364,7 +1395,9 @@ static void WeaponGuardTick();
 static void SkinVoiceTick();
 static void SkinClothesTick();
 static void GarageTick();
+static void GiveTick();
 static void GyroTick();
+static void ProtTick();
 static void __cdecl FrameTick() {
     if (g_origFrameCall) g_origFrameCall();
     if (g_firstFrame) {                                 // reserva, se a thread de inicio nao conseguiu
@@ -1379,6 +1412,8 @@ static void __cdecl FrameTick() {
     if (g_skinVoice) SkinVoiceTick();
     if (g_skinClothes) SkinClothesTick();
     GarageTick();
+    GiveTick();
+    ProtTick();
     GyroTick();
     if (g_info.ctx != g_lastCtx) { Log("contexto: %s", g_info.ctx >= 0 && g_info.ctx <= CTX_CUTSCENE ? kCtxName[g_info.ctx] : "?"); g_lastCtx = g_info.ctx; }
     bool yn = (g_info.state & S_YESNO) != 0;
@@ -1776,12 +1811,15 @@ struct Cmd {
     Cmd& Str(const char* s) { int l = (int)strlen(s); if (l > 100) l = 100; code[n++] = 0x0E; code[n++] = (BYTE)l; memcpy(code + n, s, l); n += l; return *this; }
 };
 static BYTE g_scr[0x100];
+static volatile int g_runDepth = 0;                                          // RunCmd nosso: os ganchos de armas nao mexem
 static bool RunCmd(Cmd& c, int* out = nullptr, int nOut = 0) {
     memset(g_scr, 0, sizeof g_scr);
     strcpy((char*)g_scr + 8, "gtmgar");
     *(BYTE**)(g_scr + 0x10) = c.code;                                          // m_pBaseIP
     *(BYTE**)(g_scr + 0x14) = c.code;                                          // m_pCurrentIP
+    g_runDepth++;
     ProcessOneCommand(g_scr);
+    g_runDepth--;
     for (int i = 0; i < nOut; i++) out[i] = ((int*)(g_scr + 0x3C))[i];          // m_aLocalVars
     return g_scr[0xC5] != 0;                                                   // m_bCondResult
 }
@@ -3281,7 +3319,8 @@ struct Dealer {
     int state, van, ped, blip, doorA, doorB;
     DWORD t0, tPhase, tTarget, tLast, tFleeTarget, tStill;
     V3 lastTarget, fleeTarget, threat;
-    bool armed, paid;
+    bool armed, paid, calm, asking;
+    DWORD tStillMe; int ynWas;           // CJ parado atras da van desde; setas da ultima leitura (Sim/Nao)
     DealerCop cops[4]; int nCops;
 };
 static Dealer g_dl = { DL_NONE, -1, -1, -1, -1, -1 };
@@ -3341,10 +3380,14 @@ static void ShowPanel(const char* title, const char* h0, const char* const* r0, 
     if (active > 0 && active < n) { Cmd c(0x090E); c.I(id).I(active); RunCmd(c); }
 }
 static void ShopCategories(int active) {
-    g_shopLevel = 0; g_shopN = CT_COUNT;
+    g_shopLevel = 0; g_shopN = CT_COUNT + 1;
+    const char* rows[CT_COUNT + 1];
+    for (int i = 0; i < CT_COUNT; i++) rows[i] = kArmCat[i];
+    rows[CT_COUNT] = "Dispensar o traficante";
     char head[40]; snprintf(head, sizeof head, "Dinheiro: $%d", Money());
-    ShowPanel("Traficante", head, kArmCat, nullptr, nullptr, CT_COUNT, 200.f, 0.f, 0, active);
+    ShowPanel("Traficante", head, rows, nullptr, nullptr, CT_COUNT + 1, 200.f, 0.f, 0, active);
 }
+static void DealerDismiss();
 static void ShopItems(int active) {
     g_shopLevel = 1; g_shopN = 0;
     char* me = PlayerPed(); if (!me) return;
@@ -3487,7 +3530,11 @@ static void ShopTick() {
         int row = 0;
         { Cmd c(0x08D7); c.I(g_menu).Out(0); RunCmd(c, &row, 1); }
         g_dl.tLast = GameMs();
-        if (g_shopLevel == 0) { if (row >= 0 && row < CT_COUNT) { g_shopCat = row; ShopItems(0); } return; }
+        if (g_shopLevel == 0) {
+            if (row >= 0 && row < CT_COUNT) { g_shopCat = row; ShopItems(0); }
+            else if (row == CT_COUNT) DealerDismiss();
+            return;
+        }
         if (g_shopLevel == 2) {
             int pick = g_shopPick;
             g_shopPick = -1;
@@ -3502,11 +3549,29 @@ static void ShopTick() {
 }
 
 // ---- van e motorista
+// CAutomobile::OpenDoor (vtable +0x6C): (ped, no, porta, abertura 0..1, som). Mesma chamada do OPEN_CAR_DOOR (0x494
+// 6DA) e do CloseAllDoors (0x6A4520), que so fecha quantas portas o modelo declara (+0x4C; a Burrito diz 2).
+typedef void (__thiscall* OpenDoorV_t)(void* veh, void* ped, int node, int door, float ratio, bool sound);
+typedef bool (__thiscall* DoorMissingV_t)(void* veh, int door);
+static void SetVanDoor(char* v, int door, float ratio) {
+    static const int kNode[6] = { 0x10, 0x11, 0x0A, 0x08, 0x0B, 0x09 };       // capo, porta-malas, frente E/D, tras E/D
+    if (!v || door < 0 || door > 5) return;
+    void** vt = *(void***)v;
+    if (((DoorMissingV_t)vt[0x98 / 4])(v, door)) return;
+    if (!((void* const*)(v + 0x648))[kNode[door]]) return;
+    ((OpenDoorV_t)vt[0x6C / 4])(v, nullptr, kNode[door], door, ratio, true);
+}
 static void DealerDoors(bool open) {
-    if (!VehByRef(g_dl.van)) return;
-    if (!open) { Cmd c(0x0508); c.I(g_dl.van); RunCmd(c); return; }
-    if (g_dl.doorA >= 0) { Cmd c(0x0657); c.I(g_dl.van).I(g_dl.doorA); RunCmd(c); }
-    if (g_dl.doorB >= 0) { Cmd c(0x0657); c.I(g_dl.van).I(g_dl.doorB); RunCmd(c); }
+    char* v = VehByRef(g_dl.van);
+    if (!v) return;
+    if (open) {
+        if (g_dl.doorA >= 0) { Cmd c(0x0657); c.I(g_dl.van).I(g_dl.doorA); RunCmd(c); }
+        if (g_dl.doorB >= 0) { Cmd c(0x0657); c.I(g_dl.van).I(g_dl.doorB); RunCmd(c); }
+        return;
+    }
+    SetVanDoor(v, g_dl.doorA, 0.f);
+    SetVanDoor(v, g_dl.doorB, 0.f);
+    { Cmd c(0x0508); c.I(g_dl.van); RunCmd(c); }
 }
 static V3 VanRear(const char* v) {                                            // atras da traseira, no chao da van
     V3 p = EntityPos(v);
@@ -3563,7 +3628,13 @@ static void ReleaseCops() {
     }
     g_dl.nCops = 0;
 }
+static void DealerAskEnd() {
+    if (!g_dl.asking) return;
+    g_dl.asking = false; g_dealerYN = false;
+    Cmd c(0x03E6); RunCmd(c);                                                  // CLEAR_HELP
+}
 static void DealerEnd(const char* how) {
+    DealerAskEnd();
     CloseShop(false);
     DealerRemoveBlip();
     ReleaseCops();
@@ -3602,6 +3673,7 @@ static void DealerDrive(V3 to, float speed) {
     { Cmd c(0x00A7); c.I(g_dl.van).F(to.x).F(to.y).F(to.z); RunCmd(c); }
 }
 static void DealerGo(int state, V3 threat) {                                  // vai embora (LEAVE) ou foge (FLEE/CHASE)
+    DealerAskEnd();
     CloseShop(false);
     DealerRemoveBlip();
     DealerDoors(false);
@@ -3609,13 +3681,21 @@ static void DealerGo(int state, V3 threat) {                                  //
     g_dl.state = state; g_dl.tPhase = g_dl.tFleeTarget = GameMs(); g_dl.threat = threat; g_dl.tStill = 0;
     if (!v) return;
     if (state == DL_LEAVE) {
-        { Cmd c(0x00AD); c.I(g_dl.van).F(32.f); RunCmd(c); }
-        { Cmd c(0x00AE); c.I(g_dl.van).I(2); RunCmd(c); }
+        { Cmd c(0x00AD); c.I(g_dl.van).F(g_dl.calm ? 14.f : 32.f); RunCmd(c); }
+        { Cmd c(0x00AE); c.I(g_dl.van).I(g_dl.calm ? 0 : 2); RunCmd(c); }   // calmo: para nos carros e no sinal
         { Cmd c(0x00A8); c.I(g_dl.van); RunCmd(c); }
     } else {
         g_dl.fleeTarget = FleePoint(EntityPos(v), threat);
         DealerDrive(g_dl.fleeTarget, 45.f);
     }
+}
+static void DealerDismiss() {
+    char* me = PlayerPed();
+    V3 pp = me ? EntityPos(me) : V3{ 0.f, 0.f, 0.f };
+    g_dl.calm = true;
+    GarHelp("Valeu. O traficante foi embora.");
+    Log("traficante: dispensado; foi embora com calma");
+    DealerGo(DL_LEAVE, pp);
 }
 static void SpawnChaseCop(const char* van) {
     V3 vp = EntityPos(van);
@@ -3862,9 +3942,27 @@ static void DealerTick() {
         }
         if (!g_shopOpen) {
             float dr = Dist2(rear, pp), dz = fabsf(rear.z - pp.z);
-            if (dr > 3.f) g_dl.armed = true;
-            if (g_dl.armed && dr < 1.6f && dz < 2.f && !PlayerVehicle() && !MenuActive() && !g_menuOpen && !g_kbMode && g_ctxCache == CTX_FOOT)
-                OpenShop();
+            bool here = dr < 1.6f && dz < 2.f && !PlayerVehicle() && !MenuActive() && !g_menuOpen && !g_kbMode && g_ctxCache == CTX_FOOT;
+            const float* mv = (const float*)(me + 0x44);                      // CPhysical::m_vecMoveSpeed
+            bool still = mv[0] * mv[0] + mv[1] * mv[1] < 0.004f * 0.004f;         // menos de ~0,2 m/s
+            if (g_dl.asking) {
+                if (!here || dr > 2.2f) { DealerAskEnd(); g_dl.tStillMe = 0; break; }
+                int yn = 0;                                                    // setas de conversa: 11 Sim, 10 Nao
+                { Cmd c(0x00E1); c.I(0).I(11); if (RunCmd(c)) yn |= 1; }
+                { Cmd c(0x00E1); c.I(0).I(10); if (RunCmd(c)) yn |= 2; }
+                int pressed = yn & ~g_dl.ynWas;
+                g_dl.ynWas = yn;
+                if (pressed & 1) { DealerAskEnd(); g_dl.tStillMe = 0; OpenShop(); }
+                else if (pressed & 2) { DealerAskEnd(); DealerDismiss(); return; }
+                break;
+            }
+            if (!here || !still) { g_dl.tStillMe = 0; break; }
+            if (!g_dl.tStillMe) g_dl.tStillMe = now;
+            if (now - g_dl.tStillMe >= 1000) {
+                g_dl.asking = true; g_dealerYN = true; g_dl.ynWas = 3;          // so vale apertar de novo
+                if (g_origSetHelp) g_origSetHelp("Quer comprar? Sim abre o menu. Nao dispensa o traficante.", true, true, false);
+                Log("traficante: perguntou se quer comprar");
+            }
         }
         break;
     }
@@ -3905,6 +4003,392 @@ static void DealerTick() {
         break;
     }
     }
+}
+
+// ---------------------------------------------------------------- dar a arma para um pedestre ([ArmaPedestre])
+// Status + Correr, a pe, com uma arma na mao: o pedestre mais perto na sua frente (ate 2,5 m, a pe) ganha a mesma
+// arma, com Ammo de municao, ja na mao; a sua fica com voce. Antes, os dois se cumprimentam (GANGS.ifp, Anim: o
+// abraco de gangue por padrao, com ele a Distance de voce). NPC de missao que nao e do seu grupo faz so o aperto de
+// mao parcial (AnimPartial, parte de cima do corpo): a animacao inteira apagaria a tarefa que o script deu a ele.
+// Ficam de fora: soco, detonador, camera, oculos, paraquedas e presentes.
+static int   g_giveOn = 1, g_giveAmmo = 9999;
+static float g_giveDist = 1.0f;
+static char  g_giveAnim[32] = "hndshkfa", g_giveAnimPart[32] = "prtial_hndshk_01";
+static volatile bool g_giveReq = false;
+static bool  g_giveCombo = false;
+enum { GV_NONE = 0, GV_LOAD, GV_PLAY };
+struct GiveState { int phase, ped, weapon; bool full, anim; DWORD t0; };
+static GiveState g_give = {};
+static void GiveCombo(WORD buttons, PadState& p) {                            // thread do XInput
+    if (!g_giveOn) return;
+    const WORD LB = 0x0100, RUN = 0x1000;                                     // Status (TAB) e Correr (A)
+    if (!(buttons & LB) || !(buttons & RUN)) { g_giveCombo = false; return; }
+    if (!g_giveCombo) {
+        if (g_ctxCache != CTX_FOOT || g_menuOpen || g_shopOpen) return;
+        g_giveCombo = true; g_giveReq = true;
+        Log("dar arma: Status + Correr");
+    }
+    p.wButtons &= (WORD)~RUN;                                                 // esse Correr nao chega ao jogo
+}
+static bool GiveAllowed(int type) {
+    if (type == 43 || type == 44 || type == 45 || type == 46) return false;   // camera, oculos, paraquedas
+    const ArmItem* it = ArmByType(type);
+    return it && it->type != ARM_ARMOUR;                                      // soco, detonador e presentes nao estao na lista
+}
+static char* FindGiveTarget(char* me) {
+    V3 mp = EntityPos(me);
+    const float* m = Rd<const float*>(me, 0x14);
+    float fx = m ? m[4] : 0.f, fy = m ? m[5] : 1.f;
+    char* pool = *(char**)0xB74490;
+    if (!pool) return nullptr;
+    char* best = nullptr; float bestD = 2.5f;
+    int size = Rd<int>(pool, 8);
+    for (int i = 0; i < size; i++) {
+        if (Rd<BYTE*>(pool, 4)[i] & 0x80) continue;
+        char* p = Rd<char*>(pool, 0) + i * 0x7C4;
+        if (p == me || Rd<float>(p, 0x540) <= 0.f || (Rd<BYTE>(p, 0x46D) & 1)) continue;
+        V3 pp = EntityPos(p);
+        float dx = pp.x - mp.x, dy = pp.y - mp.y, d = sqrtf(dx * dx + dy * dy);
+        if (d >= bestD || fabsf(pp.z - mp.z) > 1.5f) continue;
+        if (d > 0.2f && (dx * fx + dy * fy) / d < 0.25f) continue;           // na frente (uns 75 graus para cada lado)
+        best = p; bestD = d;
+    }
+    return best;
+}
+static void GivePose() {                                                     // um de frente para o outro
+    char* me = PlayerPed(); char* t = PedByRef(g_give.ped); int pr = PlayerRef();
+    if (!me || !t || pr < 0) return;
+    V3 a = EntityPos(me), b = EntityPos(t);
+    float dx = b.x - a.x, dy = b.y - a.y, l = sqrtf(dx * dx + dy * dy);
+    if (l < 0.05f) { const float* m = Rd<const float*>(me, 0x14); dx = m ? m[4] : 0.f; dy = m ? m[5] : 1.f; l = 1.f; }
+    dx /= l; dy /= l;
+    float h = atan2f(-dx, dy) * 57.2957795f;                                   // direcao do jogo: 0 = norte, anti-horario
+    { Cmd c(0x0173); c.I(pr).F(h); RunCmd(c); }
+    { Cmd c(0x0173); c.I(g_give.ped).F(h + 180.f); RunCmd(c); }
+    if (g_give.full && g_give.anim) {                                         // a distancia certa para o abraco encaixar
+        Cmd c(0x0972); c.I(g_give.ped).F(a.x + dx * g_giveDist).F(a.y + dy * g_giveDist).F(b.z); RunCmd(c);
+    }
+}
+static void GiveAnim(int ped, const char* anim, bool secondary) {
+    Cmd c(secondary ? 0x0A1A : 0x0605);
+    c.I(ped).Str(anim).Str("GANGS").F(4.f).I(0).I(0).I(0).I(0).I(-1);
+    RunCmd(c);
+}
+static void GiveEnd(bool gave, const char* why) {
+    char* me = PlayerPed(); int pr = PlayerRef();
+    char* p = PedByRef(g_give.ped);
+    if (gave && p && Rd<float>(p, 0x540) > 0.f) {
+        const ArmItem* it = ArmByType(g_give.weapon);
+        if (it && it->model > 0) { RequestModel(it->model, 2); if (it->model2 > 0) RequestModel(it->model2, 2); LoadAllRequestedModels(false); }
+        { Cmd c(0x01B2); c.I(g_give.ped).I(g_give.weapon).I(g_giveAmmo); RunCmd(c); }
+        { Cmd c(0x01B9); c.I(g_give.ped).I(g_give.weapon); RunCmd(c); }
+        if (it && it->model > 0) { Cmd c(0x0249); c.I(it->model); RunCmd(c); }
+        if (it && it->model2 > 0) { Cmd c(0x0249); c.I(it->model2); RunCmd(c); }
+        Log("dar arma: %s para o pedestre %d (%s, %d de municao)", it ? it->name : "?", Rd<short>(p, 0x22),
+            !g_give.anim ? "sem animacao" : g_give.full ? "abraco" : "aperto de mao", g_giveAmmo);
+    } else Log("dar arma: cancelado (%s)", why);
+    if (me && pr >= 0) {
+        if (Rd<float>(me, 0x540) > 0.f) { Cmd c(0x01B9); c.I(pr).I(g_give.weapon); RunCmd(c); }   // a sua volta para a mao
+        PlayerControl(true);
+    }
+    if (g_give.anim) { Cmd c(0x04EF); c.Str("GANGS"); RunCmd(c); }
+    memset(&g_give, 0, sizeof g_give); g_give.ped = -1;
+}
+static void GiveStart() {
+    char* me = PlayerPed(); int pr = PlayerRef();
+    if (!me || pr < 0 || PlayerVehicle() || MenuActive() || g_menuOpen || g_shopOpen || g_kbMode || Rd<float>(me, 0x540) <= 0.f) return;
+    int type = WeaponType(me, Rd<signed char>(me, 0x718) & 0x0F);               // CPed::m_nActiveWeaponSlot
+    if (!GiveAllowed(type)) { GarHelp("Pegue uma arma na mao para dar a alguem."); return; }
+    char* t = FindGiveTarget(me);
+    if (!t) { GarHelp("Chegue perto de alguem, de frente, para dar a arma."); return; }
+    int ph = PedRef(t);
+    if (ph < 0) return;
+    bool mission = Rd<BYTE>(t, 0x484) == 2;                                   // CPed::m_nCreatedBy: 2 = script
+    bool group = false;
+    { int g = -1; Cmd c(0x07AF); c.I(0).Out(0); RunCmd(c, &g, 1); if (g >= 0) { Cmd c2(0x06EE); c2.I(ph).I(g); group = RunCmd(c2); } }
+    memset(&g_give, 0, sizeof g_give);
+    g_give.ped = ph; g_give.weapon = type; g_give.full = !mission || group; g_give.t0 = GameMs();
+    g_give.anim = (g_give.full ? g_giveAnim[0] : g_giveAnimPart[0]) != 0;
+    PlayerControl(false);
+    { Cmd c(0x01B9); c.I(pr).I(0); RunCmd(c); }                              // guarda a arma durante o cumprimento
+    if (g_give.full) { Cmd c(0x05BA); c.I(ph).I(5000); RunCmd(c); }          // para de andar ate o cumprimento
+    GivePose();
+    Log("dar arma: %s para o pedestre %d (%s%s)", ArmByType(type)->name, Rd<short>(t, 0x22), mission ? "de missao" : "da rua", group ? ", do seu grupo" : "");
+    if (!g_give.anim) { GiveEnd(true, ""); return; }
+    { Cmd c(0x04ED); c.Str("GANGS"); RunCmd(c); }
+    g_give.phase = GV_LOAD;
+}
+static void GiveTick() {
+    if (!g_giveOn) return;
+    if (g_giveReq) { g_giveReq = false; if (g_give.phase == GV_NONE) GiveStart(); }
+    if (g_give.phase == GV_NONE) return;
+    char* me = PlayerPed(); char* p = PedByRef(g_give.ped);
+    DWORD now = GameMs();
+    if (!me || Rd<float>(me, 0x540) <= 0.f || PlayerVehicle()) { GiveEnd(false, "o CJ saiu ou caiu"); return; }
+    if (!p || Rd<float>(p, 0x540) <= 0.f || (Rd<BYTE>(p, 0x46D) & 1)) { GiveEnd(false, "o pedestre sumiu, caiu ou entrou num veiculo"); return; }
+    const char* anim = g_give.full ? g_giveAnim : g_giveAnimPart;
+    if (g_give.phase == GV_LOAD) {
+        bool loaded = false;
+        { Cmd c(0x04EE); c.Str("GANGS"); loaded = RunCmd(c); }
+        if (!loaded) { if (now - g_give.t0 > 3000) { Log("dar arma: a animacao nao carregou; vai sem ela"); GiveEnd(true, ""); } return; }
+        int pr = PlayerRef();
+        GivePose();
+        GiveAnim(pr, anim, !g_give.full);
+        GiveAnim(g_give.ped, anim, !g_give.full);
+        g_give.phase = GV_PLAY; g_give.t0 = now;
+        return;
+    }
+    bool playing = false;
+    { Cmd c(0x0611); c.I(PlayerRef()).Str(anim); playing = RunCmd(c); }
+    if (!playing) { Cmd c(0x0611); c.I(g_give.ped).Str(anim); playing = RunCmd(c); }
+    if ((now - g_give.t0 > 600 && !playing) || now - g_give.t0 > 7000) GiveEnd(true, "");
+}
+
+// ---------------------------------------------------------------- armas protegidas em missao ([ProtegerArmas])
+// Durante uma missao, a missao nao troca nem tira as suas armas de fogo dos espacos protegidos (padrao: pistolas,
+// escopetas, submetralhadoras e fuzis de assalto). Rifles e armas pesadas ficam com a missao (o lanca-chamas de
+// Are You Going to San Fierro? e o rifle de precisao sao necessarios), e tambem corpo a corpo, arremesso e itens.
+// - no comeco da missao, anota as armas de fogo do CJ (espacos 2 a 7) e a municao de cada uma;
+// - a missao da outra arma num espaco protegido onde esta a sua: a arma continua a sua e a municao vai para ela;
+// - a missao tira a sua (REMOVE_WEAPON_FROM_CHAR): nao tira;
+// - a missao da municao infinita (9999 ou mais) ou mexe na municao da sua: no fim volta ao que voce tinha ao
+//   comecar; se teve infinita e voce venceu, mais 1 caixa (a do traficante: 9mm 50, calibre 12 25, fuzil 50...);
+// - a missao tira todas as armas (REMOVE_ALL_CHAR_WEAPONS): tira, e as suas de fogo voltam quando ela termina;
+// - a missao pergunta pela arma dela (tem, esta na mao, quanta municao, poe na mao): responde pela sua;
+// - morreu ou foi preso: vale a regra do jogo. Missoes da lista Exclude ficam de fora.
+// Os ganchos ficam nas chamadas de dentro dos comandos de script (so script passa por eles):
+//   01B2 0x47D335 CPed::GiveWeapon, 0555 0x48D696 CPed::ClearWeapon, 048F 0x48AE86 CPed::ClearWeapons,
+//   017B 0x47CDF1 CPed::SetAmmo; 0491 0x48AEAF, 02D8 0x480233, 01B9 0x47D4BD, 041A 0x489B0B: CPool<CPed>::GetAt,
+//   logo antes de o comando ler o tipo da arma (ScriptParams[1]).
+static int  g_pmOn = 1, g_pmInf = 9999, g_pmBoxOnFail = 0;
+static bool g_pmProt[13];
+static char g_pmExclude[256];
+
+struct PmSlot { int type, ammo, ammoRemoved; bool infinite, touched, removed; };
+static struct {
+    bool active, excluded, named;
+    char name[9];
+    char* ped;
+    unsigned t0;
+    int passed0;
+    PmSlot s[13];
+    BYTE alias[64];                                                          // tipo da missao -> o seu
+} g_pm;
+
+typedef int   (__thiscall* GiveWeapon_t)(void* ped, int type, int ammo, int likeUnderwater);
+typedef void  (__thiscall* ClearWeapon_t)(void* ped, int type);
+typedef void  (__thiscall* ClearWeapons_t)(void* ped);
+typedef void  (__thiscall* SetAmmo_t)(void* ped, int type, int ammo);
+typedef char* (__thiscall* PedPoolAt_t)(void* pool, int handle);
+static const GiveWeapon_t   PedGiveWeapon   = (GiveWeapon_t)0x5E6080;
+static const ClearWeapon_t  PedClearWeapon  = (ClearWeapon_t)0x5E62B0;
+static const ClearWeapons_t PedClearWeapons = (ClearWeapons_t)0x5E6320;
+static const SetAmmo_t      PedSetAmmo      = (SetAmmo_t)0x5DF290;
+static const PedPoolAt_t    PedPoolAt       = (PedPoolAt_t)0x404910;
+
+static int WSlot(int type) {                                                  // aWeaponInfo[type].m_nSlot
+    if (type <= 0 || type > 46) return -1;
+    int s = *(const int*)(0xC8AAB8 + type * 0x70 + 0x14);
+    return s >= 0 && s < 13 ? s : -1;
+}
+static int WType(const char* ped, int s) { return Rd<int>(ped, 0x5A0 + s * 0x1C); }
+static int WAmmo(const char* ped, int s) { return Rd<int>(ped, 0x5A0 + s * 0x1C + 0xC); }
+static const char* WName(int type) {
+    const ArmItem* it = ArmByType(type);
+    static char buf[4][16]; static int k = 0;
+    if (it) return it->name;
+    k = (k + 1) & 3; snprintf(buf[k], sizeof buf[k], "arma %d", type);
+    return buf[k];
+}
+static int WBox(int type) { const ArmItem* it = ArmByType(type); return it && it->box > 0 ? it->box : 0; }
+
+static char* MissionScript() {                                                // CTheScripts::pActiveScripts
+    char* s = *(char**)0xA8B42C;
+    for (int n = 0; s && n < 256; n++, s = *(char**)s)
+        if (Rd<BYTE>(s, 0xDC)) return s;                                       // m_bIsMission
+    return nullptr;
+}
+static bool PmExcluded(const char* name) {
+    const char* p = g_pmExclude;
+    while (*p) {
+        while (*p == ',' || *p == ' ' || *p == ';') p++;
+        char tok[16]; int n = 0;
+        while (*p && *p != ',' && *p != ' ' && *p != ';') { if (n < 15) tok[n++] = *p; p++; }
+        tok[n] = 0;
+        if (n && !_strnicmp(tok, name, 8) && (n >= 8 || !name[n])) return true;
+    }
+    return false;
+}
+static void PmName() {
+    char* ms = MissionScript();
+    if (!ms) return;
+    memcpy(g_pm.name, ms + 8, 8); g_pm.name[8] = 0;
+    g_pm.named = true;
+    g_pm.excluded = PmExcluded(g_pm.name);
+}
+static void PmBegin() {
+    memset(&g_pm, 0, sizeof g_pm);
+    char* ped = PlayerPed();
+    g_pm.active = true; g_pm.ped = ped; g_pm.t0 = *TimeMs; g_pm.passed0 = *StatMissionsPassed;
+    strcpy(g_pm.name, "?");
+    PmName();
+    if (g_pm.excluded) { Log("armas: missao %s comecou; esta na lista Exclude, fica como no jogo", g_pm.name); return; }
+    char list[256]; int o = 0; list[0] = 0;
+    for (int s = 2; s <= 7 && ped; s++) {
+        int t = WType(ped, s), a = WAmmo(ped, s);
+        if (t <= 0 || t > 46) continue;
+        g_pm.s[s].type = t; g_pm.s[s].ammo = a;
+        o += snprintf(list + o, sizeof list - o, "%s%s %d%s", o ? ", " : "", WName(t), a, g_pmProt[s] ? "" : " (fica com a missao)");
+    }
+    Log("armas: missao %s comecou; suas armas de fogo: %s", g_pm.name, o ? list : "nenhuma");
+}
+static bool PmFor(const char* ped) {                                          // o gancho vale para este ped agora?
+    if (!g_pmOn || g_runDepth || !ped || ped != PlayerPed()) return false;
+    if (!IsPlayerOnAMission()) return false;
+    if (!g_pm.active) PmBegin();
+    else if (!g_pm.named) PmName();
+    return !g_pm.excluded;
+}
+static PmSlot* PmProtSlot(int s) { return s >= 2 && s <= 7 && g_pmProt[s] && g_pm.s[s].type ? &g_pm.s[s] : nullptr; }
+
+static int __thiscall PmGive(char* ped, int type, int ammo, int uw) {
+    if (PmFor(ped)) {
+        int s = WSlot(type);
+        PmSlot* p = PmProtSlot(s);
+        if (p) {
+            if (WType(ped, s) == p->type && type != p->type) {
+                g_pm.alias[type] = (BYTE)p->type;
+                Log("armas: a missao daria %s no lugar da sua %s; fica a sua, com os %d tiros", WName(type), WName(p->type), ammo);
+                type = p->type;
+            }
+            if (type == p->type && ammo >= g_pmInf && !p->infinite) {
+                p->infinite = p->touched = true;
+                Log("armas: municao infinita na sua %s; no fim volta a %d%s", WName(p->type), p->ammo, WBox(p->type) ? " (mais 1 caixa se vencer)" : "");
+            }
+        }
+    }
+    return PedGiveWeapon(ped, type, ammo, uw);
+}
+static void __thiscall PmClear(char* ped, int type) {
+    if (PmFor(ped)) {
+        int s = WSlot(type);
+        PmSlot* p = PmProtSlot(s);
+        if (p && WType(ped, s) == p->type && (type == p->type || g_pm.alias[type] == p->type)) {
+            Log("armas: a missao tiraria a sua %s; ficou com voce", WName(p->type));
+            return;
+        }
+    }
+    PedClearWeapon(ped, type);
+}
+static void __thiscall PmClearAll(char* ped) {
+    if (PmFor(ped)) {
+        int n = 0;
+        for (int s = 2; s <= 7; s++) {
+            PmSlot& p = g_pm.s[s];
+            if (!p.type || WType(ped, s) != p.type) continue;
+            if (!p.removed) p.ammoRemoved = WAmmo(ped, s);
+            p.removed = true; n++;
+        }
+        Log("armas: a missao tirou todas as armas; %s", n ? "as suas de fogo voltam quando ela terminar" : "nenhuma arma de fogo sua estava com o CJ");
+    }
+    PedClearWeapons(ped);
+}
+static void __thiscall PmSetAmmo(char* ped, int type, int ammo) {
+    if (PmFor(ped)) {
+        int s = WSlot(type);
+        PmSlot* p = PmProtSlot(s);
+        if (p && WType(ped, s) == p->type) {
+            if (type != p->type) g_pm.alias[type] = (BYTE)p->type;
+            type = p->type;
+            if (!p->touched) Log("armas: a missao poe %d tiros na sua %s; no fim volta a %d", ammo, WName(p->type), p->ammo);
+            p->touched = true;
+            if (ammo >= g_pmInf && !p->infinite) { p->infinite = true; Log("armas: e municao infinita (mais 1 caixa no fim se vencer)"); }
+        }
+    }
+    PedSetAmmo(ped, type, ammo);
+}
+static char* __thiscall PmPedAt(void* pool, int handle) {                    // comandos que perguntam pela arma
+    char* ped = PedPoolAt(pool, handle);
+    if (ped && g_pm.active && PmFor(ped)) {
+        int t = *(volatile int*)0xA43C7C;                                     // ScriptParams[1]: tipo da arma
+        if (t > 0 && t < 64 && g_pm.alias[t]) {
+            int y = g_pm.alias[t];
+            if (WType(ped, WSlot(y)) == y) *(volatile int*)0xA43C7C = y;
+        }
+    }
+    return ped;
+}
+
+static void PmGiveBack(char* ped, int type, int ammo) {
+    const ArmItem* it = ArmByType(type);
+    g_runDepth++;
+    bool ok = it ? ArmGive(*it, ammo) : (PedGiveWeapon(ped, type, ammo, 1), true);
+    g_runDepth--;
+    if (ok) PedSetAmmo(ped, type, ammo);
+    Log("armas: %s %s com %d tiros", ok ? "voltou a sua" : "NAO voltou (modelo nao carregou):", WName(type), ammo);
+}
+static void PmEnd(const char* why) {
+    g_pm.active = false;
+    if (g_pm.excluded) return;
+    char* ped = PlayerPed();
+    if (!ped || ped != g_pm.ped || *TimeMs < g_pm.t0) { Log("armas: missao %s terminou junto com um jogo carregado; nada mudou", g_pm.name); return; }
+    if (Rd<BYTE>(PlayerInfo(), 0xDC) != 0 || Rd<float>(ped, 0x540) <= 0.f) {  // m_nPlayerState: morreu / preso
+        Log("armas: missao %s terminou com o CJ morto ou preso; vale a regra do jogo", g_pm.name);
+        return;
+    }
+    bool passed = *StatMissionsPassed != g_pm.passed0;
+    Log("armas: missao %s terminou (%s%s)", g_pm.name, why, passed ? ", vencida" : "");
+    for (int s = 2; s <= 7; s++) {
+        PmSlot& p = g_pm.s[s];
+        if (!p.type) continue;
+        int ct = WType(ped, s), ca = WAmmo(ped, s);
+        if (!g_pmProt[s]) {                                                    // rifles e pesadas: so a devolucao
+            if (p.removed && ct <= 0) PmGiveBack(ped, p.type, p.ammoRemoved);
+            continue;
+        }
+        if (ct != p.type && !p.removed) {
+            if (ct > 0) Log("armas: no espaco da sua %s agora esta %s (voce pegou); fica", WName(p.type), WName(ct));
+            continue;
+        }
+        int want = -1;
+        if (p.infinite) want = p.ammo + ((passed || g_pmBoxOnFail) ? WBox(p.type) : 0);
+        else if (p.removed) want = ct == p.type && ca > p.ammoRemoved ? ca : p.ammoRemoved;
+        else if (p.touched) want = ca > p.ammo ? ca : p.ammo;
+        if (ct != p.type) { PmGiveBack(ped, p.type, want >= 0 ? want : p.ammoRemoved); continue; }
+        if (want >= 0 && want != ca) {
+            PedSetAmmo(ped, p.type, want);
+            Log("armas: sua %s volta a %d tiros (estava com %d%s)", WName(p.type), want, ca, p.infinite && want > p.ammo ? ", +1 caixa" : "");
+        }
+    }
+}
+static void ProtOnLoad() { if (g_pm.active) Log("armas: jogo carregado durante a missao %s; a protecao recomeca", g_pm.name); memset(&g_pm, 0, sizeof g_pm); }
+static void ProtTick() {
+    if (!g_pmOn) return;
+    bool on = IsPlayerOnAMission();
+    if (g_pm.active) {
+        if (!on) { PmEnd("acabou"); return; }
+        char* ms = MissionScript();
+        if (ms && g_pm.named && strncmp(ms + 8, g_pm.name, 8)) { PmEnd("outra missao comecou"); PmBegin(); return; }
+        if (ms && !g_pm.named) PmName();
+    } else if (on && PlayerPed()) PmBegin();
+}
+
+static bool PatchCallSite(DWORD site, DWORD target, void* fn, const char* what) {
+    BYTE exp[5]; exp[0] = 0xE8; *(int*)(exp + 1) = (int)(target - (site + 5));
+    BYTE rep[5]; rep[0] = 0xE8; *(int*)(rep + 1) = (int)((DWORD)fn - (site + 5));
+    return PatchBytes(site, exp, 5, rep, 5, what);
+}
+static void ApplyProtect() {
+    int ok = 0;
+    ok += PatchCallSite(0x47D335, 0x5E6080, (void*)&PmGive,     "armas: GIVE_WEAPON_TO_CHAR (01B2)");
+    ok += PatchCallSite(0x48D696, 0x5E62B0, (void*)&PmClear,    "armas: REMOVE_WEAPON_FROM_CHAR (0555)");
+    ok += PatchCallSite(0x48AE86, 0x5E6320, (void*)&PmClearAll, "armas: REMOVE_ALL_CHAR_WEAPONS (048F)");
+    ok += PatchCallSite(0x47CDF1, 0x5DF290, (void*)&PmSetAmmo,  "armas: SET_CHAR_AMMO (017B)");
+    ok += PatchCallSite(0x48AEAF, 0x404910, (void*)&PmPedAt,    "armas: HAS_CHAR_GOT_WEAPON (0491)");
+    ok += PatchCallSite(0x480233, 0x404910, (void*)&PmPedAt,    "armas: IS_CURRENT_CHAR_WEAPON (02D8)");
+    ok += PatchCallSite(0x47D4BD, 0x404910, (void*)&PmPedAt,    "armas: SET_CURRENT_CHAR_WEAPON (01B9)");
+    ok += PatchCallSite(0x489B0B, 0x404910, (void*)&PmPedAt,    "armas: GET_AMMO_IN_CHAR_WEAPON (041A)");
+    if (ok < 8) Log("armas: %d de 8 ganchos aplicados", ok);
 }
 
 // ---------------------------------------------------------------- giroscopio ([Gyro] Enabled=1; overlay 3.4)
@@ -4356,6 +4840,30 @@ static void LoadConfig(HMODULE self) {
     g_garPrice     = GetPrivateProfileIntA("Garage", "Price",    1250, ini);
     g_garSellPct   = GetPrivateProfileIntA("Garage", "SellPercent", 15, ini);
     g_gyroOn       = GetPrivateProfileIntA("Gyro", "Enabled",        1, ini);
+    g_giveOn       = GetPrivateProfileIntA("ArmaPedestre", "Enabled",        1, ini);
+    g_giveAmmo     = GetPrivateProfileIntA("ArmaPedestre", "Ammo",        9999, ini);
+    if (g_giveAmmo < 1) g_giveAmmo = 1;
+    if (g_giveAmmo > 99999) g_giveAmmo = 99999;
+    {
+        char v[32];
+        GetPrivateProfileStringA("ArmaPedestre", "Anim", "hndshkfa", g_giveAnim, sizeof g_giveAnim, ini);
+        GetPrivateProfileStringA("ArmaPedestre", "AnimPartial", "prtial_hndshk_01", g_giveAnimPart, sizeof g_giveAnimPart, ini);
+        GetPrivateProfileStringA("ArmaPedestre", "Distance", "1.0", v, sizeof v, ini);
+        float d = (float)atof(v);
+        g_giveDist = (d >= 0.4f && d <= 2.5f) ? d : 1.0f;
+    }
+    g_pmOn         = GetPrivateProfileIntA("ProtegerArmas", "Enabled",        1, ini);
+    g_pmInf        = GetPrivateProfileIntA("ProtegerArmas", "InfiniteFrom",  9999, ini);
+    g_pmBoxOnFail  = GetPrivateProfileIntA("ProtegerArmas", "BoxOnFail",        0, ini);
+    if (g_pmInf < 100) g_pmInf = 100;
+    {
+        char buf[128]; short sl[13];
+        GetPrivateProfileStringA("ProtegerArmas", "Slots", "2,3,4,5", buf, sizeof buf, ini);
+        int n = ParseList(buf, sl, 13);
+        memset(g_pmProt, 0, sizeof g_pmProt);
+        for (int i = 0; i < n; i++) if (sl[i] >= 2 && sl[i] <= 7) g_pmProt[sl[i]] = true;
+        GetPrivateProfileStringA("ProtegerArmas", "Exclude", "SHRANGE", g_pmExclude, sizeof g_pmExclude, ini);
+    }
     g_armOn        = GetPrivateProfileIntA("Traficante", "Enabled",           1, ini);
     g_armCall      = GetPrivateProfileIntA("Traficante", "CallPrice",       250, ini);
     g_armDiscount  = GetPrivateProfileIntA("Traficante", "Discount",         15, ini);
@@ -4416,8 +4924,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     InitializeCriticalSection(&g_hookCs);
     LoadConfig(inst);
     QueryPerformanceFrequency(&g_qpf);
-    Log("GTMTouchSA 3.20 carregado (direcao=%d rampa=%d retorno=%d toque=%d sim/nao por script=%d diag toque=%d ragdoll=%d contagem=%d audio=%d x87=%d pular abertura=%d radar no alto=%d protecao da arma=%d menu de skins=%d andar da skin=%d voz da skin=%d skin nas roupas de missao=%d garagem=%d giroscopio=%d traficante=%d)",
-        g_steerOn, g_rampMs, g_releaseMs, g_touchOn, g_ynScripts, g_traceTouch, g_traceRagdoll, g_countRagdoll, g_audioHash, g_fixX87, g_skipIntro, g_radarTop, g_weaponGuard, g_skinOn, g_skinAnims, g_skinVoice, g_skinClothes, g_garOn, g_gyroOn, g_armOn);
+    Log("GTMTouchSA 3.24 carregado (direcao=%d rampa=%d retorno=%d toque=%d sim/nao por script=%d diag toque=%d ragdoll=%d contagem=%d audio=%d x87=%d pular abertura=%d radar no alto=%d protecao da arma=%d menu de skins=%d andar da skin=%d voz da skin=%d skin nas roupas de missao=%d garagem=%d giroscopio=%d traficante=%d dar arma=%d armas em missao=%d)",
+        g_steerOn, g_rampMs, g_releaseMs, g_touchOn, g_ynScripts, g_traceTouch, g_traceRagdoll, g_countRagdoll, g_audioHash, g_fixX87, g_skipIntro, g_radarTop, g_weaponGuard, g_skinOn, g_skinAnims, g_skinVoice, g_skinClothes, g_garOn, g_gyroOn, g_armOn, g_giveOn, g_pmOn);
     if (g_armOn) Log("traficante: ligacao $%d, %d%% abaixo da AmmuNation, fora de epoca %dx e %d caixas por arma por dia, sem atender %d min do jogo, vai embora a %d m",
         g_armCall, g_armDiscount, g_armLockMult, g_armLockBoxes, g_armCooldown, g_armLeave);
     if (GetModuleHandleA("GTMSteerSA.asi")) Log("AVISO: GTMSteerSA.asi tambem esta carregado; apague ele da pasta scripts");
@@ -4431,6 +4939,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     if (g_skinAnims) ApplySkinAnims();
     if (g_skinClothes) ApplySkinClothes();
     if (g_gyroOn) ApplyGyroCam();
+    if (g_pmOn) ApplyProtect();
     g_mhReady = (MH_Initialize() == MH_OK);
     if (!g_mhReady) { Log("MinHook nao iniciou"); return TRUE; }
     HANDLE t = CreateThread(nullptr, 0, StartupThread, nullptr, 0, nullptr);
