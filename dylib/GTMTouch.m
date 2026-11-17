@@ -1,4 +1,4 @@
-// GTMTouch.dylib 3.5 - overlay de toque contextual para o GTA San Andreas no Madeira.
+// GTMTouch.dylib 3.6 - overlay de toque contextual para o GTA San Andreas no Madeira.
 //
 // Injetado no IPA oficial do Madeira. Desenha os controles por cima do jogo e troca o
 // conjunto de botoes sozinho conforme o contexto que o GTMTouchSA.asi escreve em
@@ -36,6 +36,8 @@
 //      Botao "Olhar atrás" dirigindo (carro, moto, barco) e de passageiro: aperta os dois gatilhos juntos.
 // 3.5 (GTMTouchSA 3.18): com o giroscopio "fora da mira", a camera vira e fica, como o mouse. "Olhar atrás" no
 // veiculo tambem solta a camera, que volta para tras; a pe, "Centralizar" (comando 5) poe a camera atras do CJ.
+// 3.6: depois do teclado da placa, o foco do teclado volta para o Madeira (antes a janela voltava a ser a
+// principal, mas o "first responder" ficava vazio ate o proximo toque no editor).
 //
 // Sem jogo rodando o overlay some e todo toque passa direto para o Madeira. No menu e na
 // cutscene so os botoes recebem toque; o resto da tela continua sendo do Madeira.
@@ -567,6 +569,22 @@ typedef struct { double x, y, d; } GTMPlace;
 typedef enum { T_NONE = 0, T_BUTTON, T_LSTICK, T_RSTICK, T_EDIT, T_SWIPE } GTMTouchKind;
 typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int button; CGPoint start, cur, grab; } GTMSlot;
 
+// quem tem o foco do teclado agora (o UIKit entrega a acao ao first responder)
+static __weak UIResponder *gFoundResponder;
+@interface UIResponder (GTMFirstResponder)
+- (void)gtm_noteFirstResponder:(id)sender;
+@end
+@implementation UIResponder (GTMFirstResponder)
+- (void)gtm_noteFirstResponder:(id)sender { gFoundResponder = self; }
+@end
+static UIResponder *GTMCurrentFirstResponder(void) {
+    gFoundResponder = nil;
+    [[UIApplication sharedApplication] sendAction:@selector(gtm_noteFirstResponder:) to:nil from:nil forEvent:nil];
+    UIResponder *r = gFoundResponder;
+    gFoundResponder = nil;
+    return r;
+}
+
 @interface GTMPadView : UIView
 @property (nonatomic) int context;
 @property (nonatomic) BOOL live, editing;
@@ -587,6 +605,7 @@ typedef struct { __unsafe_unretained UITouch *touch; GTMTouchKind kind; int butt
     uint32_t _kbDone;                                   // ultimo pedido respondido
     UIAlertController *_kbAlert;
     __weak UIWindow *_kbPrevKey;
+    __weak UIResponder *_kbPrevResponder;
     int _kbMax;
     UIView *_gyroPanel;
     CFTimeInterval _lastGameChange;
@@ -1201,6 +1220,7 @@ enum { GYT_ON = 101, GYT_ALWAYS, GYT_H, GYT_V, GYT_AIM, GYT_INVERT, GYT_ZOOM, GY
     _kbAlert = a;
     _kbPrevKey = nil;                                   // o teclado so aparece na janela principal (key)
     for (UIWindow *w in self.window.windowScene.windows) if (w.isKeyWindow) { _kbPrevKey = w; break; }
+    _kbPrevResponder = GTMCurrentFirstResponder();      // a view do Madeira que recebe o teclado do jogo
     [self.window makeKeyWindow];
     [self.host presentViewController:a animated:YES completion:nil];
 }
@@ -1238,8 +1258,17 @@ enum { GYT_ON = 101, GYT_ALWAYS, GYT_H, GYT_V, GYT_AIM, GYT_INVERT, GYT_ZOOM, GY
 
 - (void)restoreKeyWindow {
     UIWindow *prev = _kbPrevKey;
-    _kbPrevKey = nil;
+    UIResponder *resp = _kbPrevResponder;
+    _kbPrevKey = nil; _kbPrevResponder = nil;
     if (prev && prev != self.window) [prev makeKeyWindow];
+    // o alerta ainda esta saindo da tela: devolve o foco quando ele terminar
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (prev && prev != self.window && !prev.isKeyWindow) [prev makeKeyWindow];
+        if (resp && !resp.isFirstResponder && resp.canBecomeFirstResponder) {
+            BOOL ok = [resp becomeFirstResponder];
+            NSLog(@"[GTMTouch] foco do teclado devolvido ao Madeira (%@): %@", NSStringFromClass([resp class]), ok ? @"ok" : @"recusado");
+        }
+    });
 }
 
 // ---- ponte com o jogo (60 Hz)
@@ -1385,7 +1414,7 @@ enum { GYT_ON = 101, GYT_ALWAYS, GYT_H, GYT_V, GYT_AIM, GYT_INVERT, GYT_ZOOM, GY
     self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(frame:)];
     self.link.preferredFrameRateRange = CAFrameRateRangeMake(30, 60, 60);
     [self.link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
-    NSLog(@"[GTMTouch] overlay 3.5 ligado; arquivo %@", GTMSharedPath());
+    NSLog(@"[GTMTouch] overlay 3.6 ligado; arquivo %@", GTMSharedPath());
 }
 - (void)frame:(CADisplayLink *)l { [self.pad tick]; }
 - (void)sceneEvent:(NSNotification *)n { [self attachIfNeeded]; }

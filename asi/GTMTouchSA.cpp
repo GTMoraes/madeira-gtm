@@ -1,4 +1,4 @@
-// GTMTouchSA.asi 3.18 - controles de toque contextuais para GTA San Andreas 1.0 US no Madeira
+// GTMTouchSA.asi 3.20 - controles de toque contextuais para GTA San Andreas 1.0 US no Madeira
 //
 // 1) Contexto: a cada quadro escreve em C:\gtmtouch.bin em que situacao o CJ esta (a pe,
 //    nadando, de jetpack, carro, moto, helicoptero, aviao, barco, passageiro, cutscene,
@@ -20,8 +20,11 @@
 //    seu, "sem vaga"), lugar livre ao voltar, e "Trocar placa" (teclado do iPhone pelo overlay 3.3, ou do PC).
 // 8) Arquivo compartilhado, parte do teclado: [128..191] pedido do jogo, [192..255] resposta do overlay.
 // 9) Giroscopio (3.17, overlay 3.4): [96..127] escrito pelo overlay; gira so a camera, na mira e, se quiser,
-//    tambem a pe e dirigindo. 3.18: fora da mira a camera vira e fica, como o mouse; Olhar atras e Centralizar
-//    voltam ela para tras.
+//    tambem a pe e dirigindo. 3.18/3.19: fora da mira a camera vira e fica, como o mouse (o plugin segura o
+//    angulo); Olhar atras e Centralizar voltam ela para tras.
+// 10) Traficante de armas (3.20): Status + Pular abre o telefone com "Carro da garagem" e "Traficante de armas";
+//    ele vem numa van preta, abre as portas de tras e vende armas, municao avulsa e equipamento. Precos pela fase
+//    da AmmuNation (o mesmo calculo do ammu.scm), Las Venturas libera as pesadas, a policia reage a van aberta.
 //
 // Interceptacoes: XInputGetState (instalada logo na carga, para valer no menu tambem),
 // CALL em 0x53C077 dentro de CGame::Process (por quadro: CCranes::UpdateCranes, depois dos
@@ -2164,12 +2167,21 @@ static int SellPrice(int model, float health) {
 
 // ---------------------------------------------------------------- lista (menu do jogo)
 struct GarItem { int kind; int house, slot, gi, model; };                    // kind 0 vaga da garagem, 1 registro
-enum { AC_CALL = 1, AC_TOGARAGE, AC_SELL, AC_REPOR, AC_YES, AC_NO, AC_PLATE };
+enum { AC_CALL = 1, AC_TOGARAGE, AC_SELL, AC_REPOR, AC_YES, AC_NO, AC_PLATE, AC_ROOT_GAR, AC_ROOT_ARM };
 static GarItem g_items[90], g_sel;
 static int g_nItems = 0, g_page = 0, g_menu = -1, g_level = 0, g_acts[12], g_nActs = 0, g_price = 0;
 static bool g_menuOpen = false;
 static volatile bool g_garReq = false, g_garSel = false, g_garCancel = false;
 static DWORD g_phoneOffAt = 0, g_menuOpenAt = 0;
+// traficante de armas (mais abaixo, depois da garagem)
+static int  g_armOn = 1, g_armCall = 250, g_armDiscount = 15, g_armLockMult = 10, g_armLockBoxes = 2;
+static int  g_armCooldown = 1440, g_armLeave = 40;
+static bool g_shopOpen = false;
+static void DealerRootLabel(char* out, int n);
+static void DealerCall();
+static void DealerTick();
+static void ArmSave();
+static void ArmOnLoad();
 
 static int PlayerRef() { char* p = PlayerPed(); return p ? PedRef(p) : -1; }
 static void Phone(bool on) { int pr = PlayerRef(); if (pr >= 0) { Cmd c(0x0729); c.I(pr).I(on ? 1 : 0); RunCmd(c); } }
@@ -2352,14 +2364,29 @@ static void ShowConfirm() {
     ShowRows("Tem certeza?", CarName(g_sel.model), rows, 2);
 }
 static bool g_garHooked = false;
+// telefone (nivel 3): garagem e traficante
+static void ShowRoot() {
+    g_level = 3; g_nActs = 0;
+    static char arm[64];
+    const char* rows[2]; int n = 0;
+    if (g_garOn) { g_acts[g_nActs++] = AC_ROOT_GAR; rows[n++] = "Carro da garagem"; }
+    if (g_armOn) { g_acts[g_nActs++] = AC_ROOT_ARM; DealerRootLabel(arm, sizeof arm); rows[n++] = arm; }
+    ShowRows("Telefone", "Ligar para", rows, n);
+}
 static void OpenMenu() {
-    if (!g_garHooked) { GarHelp("Garagem desligada: os ganchos nao entraram (veja o GTMTouchSA.log)."); return; }
-    BuildItems();
-    if (!g_nItems) { GarHelp("Voce ainda nao tem carros guardados nas suas garagens."); return; }
+    if (!g_garOn && !g_armOn) return;
     g_page = 0; g_menuOpen = true; g_menuOpenAt = GetTickCount(); g_garSel = g_garCancel = false;
     if (!ModelLoaded(330)) { RequestModel(330, 2); LoadAllRequestedModels(false); }   // celular
     PlayerControl(false);
     Phone(true);
+    ShowRoot();
+    Log("telefone: menu aberto");
+}
+static void OpenGarageList() {
+    if (!g_garHooked) { CloseMenu(false); GarHelp("Garagem desligada: os ganchos nao entraram (veja o GTMTouchSA.log)."); return; }
+    BuildItems();
+    if (!g_nItems) { CloseMenu(false); GarHelp("Voce ainda nao tem carros guardados nas suas garagens."); return; }
+    g_page = 0;
     ShowList();
     Log("garagem: lista aberta (%d carros)", g_nItems);
 }
@@ -2758,6 +2785,12 @@ static void PlateTick() {
     }
 }
 static void PickRow(int row) {
+    if (g_level == 3) {
+        if (row < 0 || row >= g_nActs) return;
+        if (g_acts[row] == AC_ROOT_GAR) OpenGarageList();
+        else if (g_acts[row] == AC_ROOT_ARM) { CloseMenu(true); DealerCall(); }
+        return;
+    }
     if (g_level == 0) {
         int first = g_page * 11, n = g_nItems - first; if (n > 11) n = 11;
         if (row >= n) {                                                       // "Mais..." / "Voltar ao inicio"
@@ -2789,7 +2822,8 @@ static void MenuTick() {
         g_garCancel = false;
         if (g_level == 2) ShowActions();
         else if (g_level == 1) { BuildItems(); if (!g_nItems) CloseMenu(false); else { if (g_page * 11 >= g_nItems) g_page = 0; ShowList(); } }
-        else { CloseMenu(false); Log("garagem: lista fechada"); }
+        else if (g_level == 0) ShowRoot();
+        else { CloseMenu(false); Log("telefone: menu fechado"); }
         return;
     }
     if (g_garSel) {
@@ -2894,6 +2928,7 @@ static const DWORD GAR_MAGIC = 0x52414747;                                    //
 static GenericSave_t g_origGenericSave = (GenericSave_t)0x5D13E0;
 static bool __cdecl GenericSaveDetour(int a) {
     bool ok = g_origGenericSave(a);
+    if (ok) ArmSave();
     if (!ok || !g_garOn) return ok;
     char path[MAX_PATH]; snprintf(path, MAX_PATH, "%s.gtmgar", SaveFileName);
     char* pv = PlayerVehicle() ? PlayerVehicle() : g_saveVeh;                  // o DoSave tira o CJ do carro so para gravar
@@ -2943,6 +2978,7 @@ static BYTE* g_garFile = nullptr;
 static long  g_garFileLen = 0;
 static int   g_garFileSlot = 0;
 static void GarOnLoad() {                                                    // logo depois de carregar: o mundo e outro
+    ArmOnLoad();
     for (int i = 0; i < g_nGar; i++) free(g_gar[i].dent);
     g_nGar = 0; g_errand = -1; g_errandKind = ER_NONE; g_menuOpen = false; g_menu = -1; g_phoneOffAt = 0; g_level = 0;
     g_kbMode = 0;
@@ -3022,7 +3058,7 @@ static void GarLoadTick() {
 // Status + Pular abre a lista; com a lista aberta, Atirar escolhe e Pular volta
 static bool g_garCombo = false, g_garFireWas = false, g_garJumpWas = true;
 static void GarageCombo(WORD buttons, PadState& p) {
-    if (!g_garOn) return;
+    if (!g_garOn && !g_armOn) return;
     const WORD LB = 0x0100, FIRE = 0x2000, JUMP = 0x4000;
     if (g_kbMode) {                                                           // digitando a placa: Pular cancela
         bool jump = (buttons & JUMP) != 0;
@@ -3031,7 +3067,7 @@ static void GarageCombo(WORD buttons, PadState& p) {
         p.wButtons &= (WORD)~(FIRE | JUMP);
         return;
     }
-    if (g_menuOpen) {
+    if (g_menuOpen || g_shopOpen) {
         bool fire = (buttons & FIRE) != 0, jump = (buttons & JUMP) != 0;
         if (fire && !g_garFireWas) g_garSel = true;
         if (jump && !g_garJumpWas && GetTickCount() - g_menuOpenAt > 400) g_garCancel = true;
@@ -3052,29 +3088,823 @@ static void GarageCombo(WORD buttons, PadState& p) {
 }
 
 static void GarageTick() {
-    if (!g_garOn) return;
-    LdResolve();
-    GarLoadTick();
+    if (!g_garOn && !g_armOn) return;
+    if (g_garOn) { LdResolve(); GarLoadTick(); }
     if (g_phoneOffAt && !g_kbMode && GetTickCount() > g_phoneOffAt) { g_phoneOffAt = 0; Phone(false); }
     if (g_garReq) {
         g_garReq = false;
         char* me = PlayerPed();
-        if (me && !g_menuOpen && !g_kbMode && !PlayerVehicle() && !MenuActive()) OpenMenu();
+        if (me && !g_menuOpen && !g_shopOpen && !g_kbMode && !PlayerVehicle() && !MenuActive()) OpenMenu();
     }
-    PlateTick();
+    if (g_garOn) PlateTick();
     MenuTick();
-    if (g_errand >= 0 && g_errand < g_nGar) {
-        GarCar& g = g_gar[g_errand];
-        if (g_errandKind == ER_DELIVER) DeliveryTick(g); else PickupTick(g);
+    if (g_garOn) {
+        if (g_errand >= 0 && g_errand < g_nGar) {
+            GarCar& g = g_gar[g_errand];
+            if (g_errandKind == ER_DELIVER) DeliveryTick(g); else PickupTick(g);
+        }
+        CarsTick();
     }
-    CarsTick();
+    DealerTick();
 }
 static void InstallGarage() {
-    bool a = MH_CreateHook((void*)0x447E40, (void*)&RestoreCarDetour, (void**)&g_origRestoreCar) == MH_OK && MH_EnableHook((void*)0x447E40) == MH_OK;
-    bool b = MH_CreateHook((void*)0x449760, (void*)&StoreCarDetour, (void**)&g_origStoreCar) == MH_OK && MH_EnableHook((void*)0x449760) == MH_OK;
+    bool a = g_garOn && MH_CreateHook((void*)0x447E40, (void*)&RestoreCarDetour, (void**)&g_origRestoreCar) == MH_OK && MH_EnableHook((void*)0x447E40) == MH_OK;
+    bool b = g_garOn && MH_CreateHook((void*)0x449760, (void*)&StoreCarDetour, (void**)&g_origStoreCar) == MH_OK && MH_EnableHook((void*)0x449760) == MH_OK;
     bool c = MH_CreateHook((void*)0x5D13E0, (void*)&GenericSaveDetour, (void**)&g_origGenericSave) == MH_OK && MH_EnableHook((void*)0x5D13E0) == MH_OK;
     g_garHooked = a && b;
     Log("garagem: ganchos RestoreCar=%s StoreCar=%s save=%s", a ? "ok" : "FALHOU", b ? "ok" : "FALHOU", c ? "ok" : "FALHOU");
+}
+
+// ---------------------------------------------------------------- traficante de armas ([Traficante] Enabled=1)
+// Status + Pular abre o telefone com "Carro da garagem" e "Traficante de armas". A ligacao custa CallPrice; ele
+// vem numa van preta (Burrito), para perto do CJ e abre as portas de tras. Na traseira da van abre o menu de
+// compra (analogico escolhe, Atirar compra, Pular volta). Se o CJ se afastar mais que LeaveDistance, ou se ninguem
+// comprar nada por 3 minutos, ele fecha as portas e vai embora acelerando.
+// Precos: o que a AmmuNation ja vende na fase atual sai Discount% mais barato; o que ela ainda nao vende ("fora
+// de epoca") custa LockedMultiplier vezes mais (arma, caixa e pacote), com no maximo LockedBoxesPerDay caixas por
+// arma por dia do jogo. A fase e a mesma conta do script da loja (ammu.scm, em script.img): a AmmuNation abre com
+// Doberman ($67 = 1) e mostra os N primeiros itens da secao ammun do shopping.dat conforme os contadores de
+// missao ($453 ... $597). Lanca-foguetes, teleguiado, lanca-chamas e minigun: preco da tabela do shopping.dat e sem
+// limite so com Las Venturas liberada (estatistica 181 >= 2, depois de Yay Ka-Boom-Boom); antes, valem as regras
+// de fora de epoca. Molotov, gas, corpo a corpo e equipamento: sempre liberados, com preco estimado.
+// Policia (portas abertas; fechadas, ela ignora): um policial a menos de 40 m (80 m de helicoptero) com linha de
+// visao ate a traseira da van ve. Com o menu aberto, o menu fecha, o CJ ganha 2 estrelas e o traficante foge
+// (continua atendendo). Sem o menu, as viaturas perseguem a van, ele foge e fica 1 dia do jogo sem atender. Se a
+// policia ja esta atras do CJ e chega perto, ele so foge e continua atendendo. Atacar o traficante ou a van:
+// ele foge e fica 1 dia sem atender.
+// O dia do jogo, o "volta a atender" e as caixas compradas no dia ficam num arquivo junto do save (.gtmarm).
+static DWORD GameMs() { return *TimeMs; }                                     // para no menu de pausa
+enum { AG_AMMU = 0, AG_HEAVY, AG_FREE };
+enum { CT_PIST = 0, CT_SHOT, CT_SMG, CT_ASSAULT, CT_RIFLE, CT_HEAVY, CT_THROWN, CT_MELEE, CT_EQUIP, CT_COUNT };
+static const char* const kArmCat[CT_COUNT] = { "Pistolas", "Escopetas", "Submetralhadoras", "Fuzis", "Rifles",
+                                               "Pesadas", "Arremesso", "Corpo a corpo", "Equipamento" };
+static const int ARM_ARMOUR = 200;                                            // "tipo" do colete (nao e arma)
+struct ArmItem {
+    int  type, cat, group, tier, slot;   // tier: posicao na lista da AmmuNation (1..16), so AG_AMMU
+    bool pack;                           // a compra e o proprio pacote (arremesso, spray, extintor)
+    const char* key; const char* name;
+    int  price, ammo;                    // preco base (AmmuNation / tabela / estimado) e o que vem junto
+    int  box, boxPrice;                  // caixa avulsa: tiros e preco (0 = sem caixa)
+    const char* boxName;
+    int  model, model2;
+};
+static ArmItem g_armItems[] = {
+    { 22, CT_PIST,    AG_AMMU,  1, 2, false, "Pistola",            "Pistola 9mm",            200,  30,  50,   30, "Caixa 9mm",        346, 0 },
+    { 23, CT_PIST,    AG_AMMU,  9, 2, false, "PistolaSilenciador", "Pistola silenciada",     600,  30,  50,   30, "Caixa 9mm",        347, 0 },
+    { 24, CT_PIST,    AG_AMMU, 15, 2, false, "DesertEagle",        "Desert Eagle",          1200,  15,  20,   80, "Caixa .50 AE",     348, 0 },
+    { 25, CT_SHOT,    AG_AMMU,  4, 3, false, "Escopeta",           "Escopeta",               600,  15,  25,   45, "Caixa calibre 12", 349, 0 },
+    { 26, CT_SHOT,    AG_AMMU,  8, 3, false, "CanoSerrado",        "Cano serrado",           800,  12,  25,   45, "Caixa calibre 12", 350, 0 },
+    { 27, CT_SHOT,    AG_AMMU, 16, 3, false, "EscopetaCombate",    "Escopeta de combate",   1000,  10,  25,   45, "Caixa calibre 12", 351, 0 },
+    { 32, CT_SMG,     AG_AMMU,  2, 4, false, "Tec9",               "Tec-9",                  300,  60,  50,   30, "Caixa 9mm",        372, 0 },
+    { 28, CT_SMG,     AG_AMMU,  3, 4, false, "MicroSMG",           "Micro SMG",              500,  60,  50,   30, "Caixa 9mm",        352, 0 },
+    { 29, CT_SMG,     AG_AMMU,  7, 4, false, "SMG",                "SMG",                   2000,  90,  50,   30, "Caixa 9mm",        353, 0 },
+    { 30, CT_ASSAULT, AG_AMMU, 13, 5, false, "AK47",               "AK-47",                 3500, 120,  50,   50, "Caixa 7.62x39",    355, 0 },
+    { 31, CT_ASSAULT, AG_AMMU, 14, 5, false, "M4",                 "M4",                    4500, 150,  50,   50, "Caixa 5.56",       356, 0 },
+    { 33, CT_RIFLE,   AG_AMMU, 11, 6, false, "RifleCaca",          "Rifle de caca",         1000,  20,  20,   55, "Caixa .308",       357, 0 },
+    { 34, CT_RIFLE,   AG_AMMU, 12, 6, false, "RiflePrecisao",      "Rifle de precisao",     5000,  10,  20,   55, "Caixa .308",       358, 0 },
+    { 35, CT_HEAVY,   AG_HEAVY, 0, 7, false, "LancaFoguetes",      "Lanca-foguetes",       10000,   5,   1, 1000, "Foguete",    359, 0 },
+    { 36, CT_HEAVY,   AG_HEAVY, 0, 7, false, "Teleguiado",         "Teleguiado",           12000,   5,   1, 1500, "Foguete",    360, 0 },
+    { 37, CT_HEAVY,   AG_HEAVY, 0, 7, false, "LancaChamas",        "Lanca-chamas",          6000, 500, 500,  300, "Tanque",     361, 0 },
+    { 38, CT_HEAVY,   AG_HEAVY, 0, 7, false, "Minigun",            "Minigun",              10000, 500, 500, 1200, "Lata 7.62",       362, 0 },
+    { 16, CT_THROWN,  AG_AMMU,  5, 8, true,  "Granadas",           "Granadas",               300,   5,   0,    0, "",           342, 0 },
+    { 17, CT_THROWN,  AG_FREE,  0, 8, true,  "GasLacrimogeneo",    "Gas lacrimogeneo",       250,   5,   0,    0, "",           343, 0 },
+    { 18, CT_THROWN,  AG_FREE,  0, 8, true,  "Molotov",            "Coquetel molotov",       150,   5,   0,    0, "",           344, 0 },
+    { 39, CT_THROWN,  AG_AMMU, 10, 8, true,  "ExplosivoRemoto",    "Explosivo remoto",      2000,   1,   0,    0, "",           363, 364 },
+    {  1, CT_MELEE,   AG_FREE,  0, 0, false, "SocoIngles",         "Soco ingles",             40,   1,   0,    0, "",           331, 0 },
+    {  2, CT_MELEE,   AG_FREE,  0, 1, false, "TacoGolfe",          "Taco de golfe",           60,   1,   0,    0, "",           333, 0 },
+    {  3, CT_MELEE,   AG_FREE,  0, 1, false, "Cassetete",          "Cassetete",               80,   1,   0,    0, "",           334, 0 },
+    {  4, CT_MELEE,   AG_FREE,  0, 1, false, "Faca",               "Faca",                    60,   1,   0,    0, "",           335, 0 },
+    {  5, CT_MELEE,   AG_FREE,  0, 1, false, "TacoBeisebol",       "Taco de beisebol",        40,   1,   0,    0, "",           336, 0 },
+    {  6, CT_MELEE,   AG_FREE,  0, 1, false, "Pa",                 "Pa",                      30,   1,   0,    0, "",           337, 0 },
+    {  7, CT_MELEE,   AG_FREE,  0, 1, false, "TacoSinuca",         "Taco de sinuca",          30,   1,   0,    0, "",           338, 0 },
+    {  8, CT_MELEE,   AG_FREE,  0, 1, false, "Katana",             "Katana",                 400,   1,   0,    0, "",           339, 0 },
+    {  9, CT_MELEE,   AG_FREE,  0, 1, false, "Motosserra",         "Motosserra",             800,   1,   0,    0, "",           341, 0 },
+    { ARM_ARMOUR, CT_EQUIP, AG_AMMU, 6, 0, false, "Colete",        "Colete",                 200,   0,   0,    0, "",             0, 0 },
+    { 46, CT_EQUIP,   AG_FREE,  0, 11, false, "Paraquedas",        "Paraquedas",             500,   1,   0,    0, "",           371, 0 },
+    { 44, CT_EQUIP,   AG_FREE,  0, 11, false, "VisaoNoturna",      "Visao noturna",         2500,   1,   0,    0, "",           368, 0 },
+    { 45, CT_EQUIP,   AG_FREE,  0, 11, false, "VisaoTermica",      "Visao termica",         4000,   1,   0,    0, "",           369, 0 },
+    { 43, CT_EQUIP,   AG_FREE,  0, 9, false, "Camera",             "Camera",                 150,  36,  36,   15, "Filme",      367, 0 },
+    { 41, CT_EQUIP,   AG_FREE,  0, 9, true,  "Spray",              "Spray",                   15, 500,   0,    0, "",           365, 0 },
+    { 42, CT_EQUIP,   AG_FREE,  0, 9, true,  "Extintor",           "Extintor",                80, 500,   0,    0, "",           366, 0 },
+};
+static const int kArmItems = (int)(sizeof g_armItems / sizeof g_armItems[0]);
+
+// a fase da AmmuNation: a mesma conta do ammu.scm (0 = loja ainda fechada)
+static int Gvar(int n) { return *(volatile int*)(0xA49960 + n * 4); }          // CTheScripts::ScriptSpace
+static int AmmuTier() {
+    if (Gvar(67) != 1) return 0;                                              // Doberman
+    if (Gvar(597) > 2) return 16;
+    if (Gvar(593) > 7) return 15;
+    if (Gvar(545) > 9) return 14;
+    if (Gvar(543) > 0) return 13;
+    if (Gvar(545) > 7) return 12;
+    if (Gvar(491) > 0) return 11;
+    if (Gvar(717) == 1) return 10;
+    if (Gvar(455) > 4) return 9;
+    if (Gvar(454) > 3) return 8;
+    if (Gvar(453) > 2) return 7;
+    return 6;
+}
+static bool LvOpen() { return *(volatile int*)(0xB78E20 + 181 * 4) >= 2; }    // CStats: cidades liberadas
+static bool ArmLocked(const ArmItem& it, int tier, bool lv) {
+    if (it.group == AG_AMMU) return tier == 0 || it.tier > tier;
+    if (it.group == AG_HEAVY) return !lv;
+    return false;
+}
+static int ArmPrice(const ArmItem& it, bool locked) {                         // arma (ou pacote)
+    if (locked) return it.price * g_armLockMult;
+    if (it.group == AG_AMMU) return (it.price * (100 - g_armDiscount) + 50) / 100;
+    return it.price;
+}
+static int ArmBoxPrice(const ArmItem& it, bool locked) { return locked ? it.boxPrice * g_armLockMult : it.boxPrice; }
+static int Money() { return Rd<int>(PlayerInfo(), 0xB8); }                    // CPlayerInfo::m_nMoney
+static int WantedLevel() { int o = 0; Cmd c(0x01C0); c.I(0).Out(0); RunCmd(c, &o, 1); return o; }
+static void ShopSound(bool ok) {
+    char* me = PlayerPed(); if (!me) return;
+    V3 p = EntityPos(me);
+    Cmd c(0x097A); c.F(p.x).F(p.y).F(p.z).I(ok ? 1052 : 1053); RunCmd(c);    // SOUND_AMMUNATION_BUY_WEAPON(_DENIED)
+}
+static const ArmItem* ArmByType(int type) {
+    for (int i = 0; i < kArmItems; i++) if (g_armItems[i].type == type) return &g_armItems[i];
+    return nullptr;
+}
+
+// ---- dia do jogo: conta as viradas do relogio (meia-noite, dormir, salvar). Um pulo para tras de ate 6 horas
+// (missao que acerta o relogio) nao conta como dia novo.
+static DWORD g_armDay = 0, g_armCooldownUntil = 0, g_armBoxDay = 0;
+static int   g_armLastMin = -1;
+static BYTE  g_armBoxes[48];
+static DWORD g_armClockTick = 0;
+static void ArmClock() {
+    int o[2] = { -1, -1 };
+    Cmd c(0x00BF); c.Out(0).Out(1); RunCmd(c, o, 2);
+    int cur = o[0] * 60 + o[1];
+    if (o[0] < 0 || o[0] > 23 || o[1] < 0 || o[1] > 59) return;
+    if (g_armLastMin >= 0 && cur < g_armLastMin && g_armLastMin - cur > 360) g_armDay++;
+    g_armLastMin = cur;
+}
+static DWORD ArmNow() { return g_armDay * 1440 + (DWORD)(g_armLastMin < 0 ? 0 : g_armLastMin); }
+static void ArmWhen(DWORD when, char* out, int n) {
+    DWORD now = ArmNow();
+    int m = (int)(when % 1440);
+    if (when / 1440 == now / 1440) snprintf(out, n, "hoje as %02dh%02d", m / 60, m % 60);
+    else if (when / 1440 == now / 1440 + 1) snprintf(out, n, "amanha as %02dh%02d", m / 60, m % 60);
+    else snprintf(out, n, "daqui a %u dias", (unsigned)(when / 1440 - now / 1440));
+}
+static int ArmBoxesLeft(const ArmItem& it) {
+    if (g_armBoxDay != g_armDay) { g_armBoxDay = g_armDay; memset(g_armBoxes, 0, sizeof g_armBoxes); }
+    int used = (it.type >= 0 && it.type < 48) ? g_armBoxes[it.type] : 0;
+    return g_armLockBoxes - used;
+}
+static void ArmCountBox(const ArmItem& it) {
+    ArmBoxesLeft(it);
+    if (it.type >= 0 && it.type < 48 && g_armBoxes[it.type] < 250) g_armBoxes[it.type]++;
+}
+
+// ---- junto do save: GTASAsfN.b.gtmarm
+#pragma pack(push, 1)
+struct ArmFile { DWORD magic, ver, timeMs, day; int lastMin; DWORD cooldownUntil, boxDay; BYTE boxes[48]; };
+#pragma pack(pop)
+static const DWORD ARM_MAGIC = 0x4D524147;                                    // 'GARM'
+static void ArmSave() {
+    if (!g_armOn) return;
+    char path[MAX_PATH]; snprintf(path, MAX_PATH, "%s.gtmarm", SaveFileName);
+    ArmFile a = {}; a.magic = ARM_MAGIC; a.ver = 1; a.timeMs = *TimeMs; a.day = g_armDay; a.lastMin = g_armLastMin;
+    a.cooldownUntil = g_armCooldownUntil; a.boxDay = g_armBoxDay; memcpy(a.boxes, g_armBoxes, sizeof a.boxes);
+    FILE* f = fopen(path, "wb");
+    if (!f) { Log("traficante: nao gravou %s", path); return; }
+    fwrite(&a, sizeof a, 1, f); fclose(f);
+}
+enum { DL_NONE = 0, DL_COMING, DL_STOPPING, DL_OPEN, DL_LEAVE, DL_FLEE, DL_CHASE };
+struct DealerCop { int car, ped; bool spawned; };
+struct Dealer {
+    int state, van, ped, blip, doorA, doorB;
+    DWORD t0, tPhase, tTarget, tLast, tFleeTarget, tStill;
+    V3 lastTarget, fleeTarget, threat;
+    bool armed, paid;
+    DealerCop cops[4]; int nCops;
+};
+static Dealer g_dl = { DL_NONE, -1, -1, -1, -1, -1 };
+static void ArmOnLoad() {                                                     // o mundo e outro: o traficante sumiu
+    memset(&g_dl, 0, sizeof g_dl); g_dl.van = g_dl.ped = g_dl.blip = -1;
+    g_shopOpen = false;
+    g_armDay = 0; g_armLastMin = -1; g_armCooldownUntil = 0; g_armBoxDay = 0; memset(g_armBoxes, 0, sizeof g_armBoxes);
+    if (!g_armOn) return;
+    char saved[MAX_PATH]; snprintf(saved, sizeof saved, "%s", SaveFileName);
+    bool found = false;
+    for (int s = 0; s < 8 && !found; s++) {
+        MakeValidSaveName(s);
+        char path[MAX_PATH]; snprintf(path, MAX_PATH, "%s.gtmarm", SaveFileName);
+        FILE* f = fopen(path, "rb");
+        if (!f) continue;
+        ArmFile a = {};
+        if (fread(&a, sizeof a, 1, f) == 1 && a.magic == ARM_MAGIC && a.ver == 1 && a.timeMs == g_loadedTimeMs) {
+            g_armDay = a.day; g_armCooldownUntil = a.cooldownUntil; g_armBoxDay = a.boxDay;
+            memcpy(g_armBoxes, a.boxes, sizeof g_armBoxes);
+            found = true;
+            Log("traficante: carregado do slot %d (dia %u do jogo%s)", s + 1, (unsigned)g_armDay, g_armCooldownUntil > g_armDay * 1440 ? ", ainda sem atender por um tempo" : "");
+        }
+        fclose(f);
+    }
+    strcpy(SaveFileName, saved);
+    g_armClockTick = 0;                                                       // o relogio do save vale de novo
+}
+
+// ---- menu de compra (mesmo painel da garagem, com duas colunas)
+static int  g_shopLevel = 0, g_shopCat = 0, g_shopPick = -1, g_shopPickRow = 0, g_shopItem[12], g_shopN = 0;
+static void ShowPanel(const char* title, const char* h0, const char* const* r0, const char* h1, const char* const* r1,
+                      int n, float w0, float w1, DWORD disabled, int active) {
+    if (g_menu >= 0) { Cmd c(0x08DA); c.I(g_menu); RunCmd(c); g_menu = -1; }
+    static char k0[12][8], k1[12][8];
+    const char* keys0[12]; const char* keys1[12];
+    SetText("GTMGT", title);
+    SetText("GTMGH", h0);
+    if (r1) SetText("GTMGI", h1 ? h1 : "");
+    for (int r = 0; r < 12; r++) {
+        snprintf(k0[r], 8, "GTMG%d", r); snprintf(k1[r], 8, "GTMP%d", r);
+        keys0[r] = keys1[r] = "DUMMY";
+        if (r < n) { SetText(k0[r], r0[r]); keys0[r] = k0[r]; if (r1) { SetText(k1[r], r1[r]); keys1[r] = k1[r]; } }
+    }
+    int id = -1;
+    { Cmd c(0x08D4); c.Key("GTMGT").F(29.f).F(140.f).F(w0).I(r1 ? 2 : 1).I(1).I(1).I(0).Out(0); RunCmd(c, &id, 1); }
+    g_menu = id;
+    if (id < 0) return;
+    { Cmd c(0x08DB); c.I(id).I(0).Key("GTMGH"); for (int r = 0; r < 12; r++) c.Key(keys0[r]); RunCmd(c); }
+    if (r1) {
+        { Cmd c(0x08DB); c.I(id).I(1).Key("GTMGI"); for (int r = 0; r < 12; r++) c.Key(keys1[r]); RunCmd(c); }
+        { Cmd c(0x09DB); c.I(id).I(0).I((int)w0); RunCmd(c); }
+        { Cmd c(0x09DB); c.I(id).I(1).I((int)w1); RunCmd(c); }
+        { Cmd c(0x08D6); c.I(id).I(0).I(1); RunCmd(c); }                      // nomes a esquerda
+        { Cmd c(0x08D6); c.I(id).I(1).I(2); RunCmd(c); }                      // precos a direita
+    }
+    for (int r = 0; r < n; r++) if (disabled & (1u << r)) { Cmd c(0x08D9); c.I(id).I(r).I(0); RunCmd(c); }
+    if (active > 0 && active < n) { Cmd c(0x090E); c.I(id).I(active); RunCmd(c); }
+}
+static void ShopCategories(int active) {
+    g_shopLevel = 0; g_shopN = CT_COUNT;
+    char head[40]; snprintf(head, sizeof head, "Dinheiro: $%d", Money());
+    ShowPanel("Traficante", head, kArmCat, nullptr, nullptr, CT_COUNT, 200.f, 0.f, 0, active);
+}
+static void ShopItems(int active) {
+    g_shopLevel = 1; g_shopN = 0;
+    char* me = PlayerPed(); if (!me) return;
+    int tier = AmmuTier(); bool lv = LvOpen();
+    static char t0[12][48], t1[12][24];
+    const char* r0[12]; const char* r1[12];
+    DWORD disabled = 0;
+    for (int i = 0; i < kArmItems && g_shopN < 12; i++) {
+        const ArmItem& it = g_armItems[i];
+        if (it.cat != g_shopCat) continue;
+        int r = g_shopN++;
+        g_shopItem[r] = i;
+        bool locked = ArmLocked(it, tier, lv);
+        const char* star = locked ? " *" : "";
+        bool own = it.type != ARM_ARMOUR && WeaponType(me, it.slot) == it.type;
+        if (it.type == ARM_ARMOUR) {
+            float a = Rd<float>(me, 0x548); int maxA = Rd<BYTE>(PlayerInfo(), 0x150);
+            snprintf(t0[r], 48, "%s", it.name);
+            if (a >= (float)maxA - 0.5f) { snprintf(t1[r], 24, "cheio"); disabled |= 1u << r; }
+            else snprintf(t1[r], 24, "$%d%s", ArmPrice(it, locked), star);
+        } else if (it.pack) {
+            if (locked) snprintf(t0[r], 48, "%s (%d) %d/%d", it.name, it.ammo, ArmBoxesLeft(it) > 0 ? ArmBoxesLeft(it) : 0, g_armLockBoxes);
+            else snprintf(t0[r], 48, "%s (%d)", it.name, it.ammo);
+            snprintf(t1[r], 24, "$%d%s", ArmPrice(it, locked), star);
+        } else if (own && it.box > 0) {
+            if (locked) snprintf(t0[r], 48, "%s (%d) %d/%d", it.boxName, it.box, ArmBoxesLeft(it) > 0 ? ArmBoxesLeft(it) : 0, g_armLockBoxes);
+            else snprintf(t0[r], 48, "%s (%d)", it.boxName, it.box);
+            snprintf(t1[r], 24, "$%d%s", ArmBoxPrice(it, locked), star);
+        } else if (own) {
+            snprintf(t0[r], 48, "%s", it.name); snprintf(t1[r], 24, "tem"); disabled |= 1u << r;
+        } else {
+            snprintf(t0[r], 48, "%s", it.name); snprintf(t1[r], 24, "$%d%s", ArmPrice(it, locked), star);
+        }
+        r0[r] = t0[r]; r1[r] = t1[r];
+    }
+    char head[40]; snprintf(head, sizeof head, "%s ($%d)", kArmCat[g_shopCat], Money());
+    ShowPanel("Traficante", head, r0, "Preco", r1, g_shopN, 215.f, 80.f, disabled, active);
+}
+static void ShopConfirm(int idx, int cur, int price) {
+    g_shopLevel = 2; g_shopPick = idx; g_shopN = 2;
+    const ArmItem& it = g_armItems[idx];
+    const ArmItem* old = ArmByType(cur);
+    static char title[64], yes[48], note[64];
+    snprintf(title, sizeof title, "Trocar %s?", old ? old->name : "a arma atual");
+    snprintf(yes, sizeof yes, "Sim, %s por $%d", it.name, price);
+    if (it.slot >= 3 && it.slot <= 5) snprintf(note, sizeof note, "A municao passa para a nova");
+    else if (it.slot <= 1 || it.slot == 11) snprintf(note, sizeof note, "Voce fica so com a nova");
+    else snprintf(note, sizeof note, "A municao da atual se perde");
+    const char* rows[2] = { yes, "Nao" };
+    ShowPanel(title, note, rows, nullptr, nullptr, 2, 220.f, 0.f, 0, 0);
+}
+static void CloseShop(bool rearm) {
+    if (!g_shopOpen) return;
+    if (g_menu >= 0) { Cmd c(0x08DA); c.I(g_menu); RunCmd(c); }
+    g_menu = -1; g_shopOpen = false; g_shopLevel = 0;
+    PlayerControl(true);
+    g_dl.armed = rearm;
+    g_dl.tLast = GameMs();
+}
+static void OpenShop() {
+    g_shopOpen = true; g_menuOpenAt = GetTickCount(); g_garSel = g_garCancel = false;
+    g_dl.armed = false; g_dl.tLast = GameMs();
+    PlayerControl(false);
+    int tier = AmmuTier();
+    Log("traficante: menu aberto (dinheiro $%d, AmmuNation %s, nivel %d de 16, Las Venturas %s)", Money(), tier ? "aberta" : "fechada", tier, LvOpen() ? "liberada" : "fechada");
+    GarHelp("* fora de epoca: %dx o preco e %d caixas por arma por dia (o numero mostra quantas restam hoje).", g_armLockMult, g_armLockBoxes);
+    ShopCategories(0);
+}
+static bool ArmGive(const ArmItem& it, int ammo) {
+    int pr = PlayerRef();
+    if (pr < 0) return false;
+    if (it.model > 0) {
+        RequestModel(it.model, 2);
+        if (it.model2 > 0) RequestModel(it.model2, 2);
+        LoadAllRequestedModels(false);
+        if (!ModelLoaded(it.model) || (it.model2 > 0 && !ModelLoaded(it.model2))) return false;
+    }
+    { Cmd c(0x01B2); c.I(pr).I(it.type).I(ammo); RunCmd(c); }
+    if (it.model > 0) { Cmd c(0x0249); c.I(it.model); RunCmd(c); }
+    if (it.model2 > 0) { Cmd c(0x0249); c.I(it.model2); RunCmd(c); }
+    return true;
+}
+static void ShopBuy(int idx, bool confirmed, int row) {
+    const ArmItem& it = g_armItems[idx];
+    char* me = PlayerPed(); int pr = PlayerRef();
+    if (!me || pr < 0) return;
+    bool locked = ArmLocked(it, AmmuTier(), LvOpen());
+    int money = Money();
+    if (it.type == ARM_ARMOUR) {
+        float a = Rd<float>(me, 0x548); int maxA = Rd<BYTE>(PlayerInfo(), 0x150);
+        int price = ArmPrice(it, locked);
+        if (a >= (float)maxA - 0.5f) { ShopSound(false); GarHelp("O colete ja esta cheio."); return; }
+        if (money < price) { ShopSound(false); GarHelp("Dinheiro insuficiente: o colete custa $%d.", price); return; }
+        { Cmd c(0x035F); c.I(pr).I(maxA > 0 ? maxA : 100); RunCmd(c); }
+        AddMoney(-price); ShopSound(true);
+        Log("traficante: colete por $%d%s", price, locked ? " (fora de epoca)" : "");
+        GarHelp("Colete comprado.");
+        ShopItems(row);
+        return;
+    }
+    int cur = WeaponType(me, it.slot);
+    bool own = cur == it.type;
+    bool isBox = it.pack || (own && it.box > 0);
+    if (own && !it.pack && it.box <= 0) { ShopSound(false); GarHelp("Voce ja tem %s.", it.name); return; }
+    int price = isBox && !it.pack ? ArmBoxPrice(it, locked) : ArmPrice(it, locked);
+    if (isBox && locked && ArmBoxesLeft(it) <= 0) {
+        ShopSound(false);
+        GarHelp("Hoje nao tem mais %s. Ele consegue mais amanha.", it.pack ? it.name : "municao dessa arma");
+        return;
+    }
+    if (!own && cur > 0 && !confirmed) { g_shopPickRow = row; ShopConfirm(idx, cur, price); return; }
+    if (money < price) { ShopSound(false); GarHelp("Dinheiro insuficiente: custa $%d.", price); return; }
+    bool ok;
+    int qty = it.pack ? it.ammo : (own ? it.box : it.ammo);
+    if (own) { Cmd c(0x0114); c.I(pr).I(it.type).I(qty); RunCmd(c); ok = true; }
+    else ok = ArmGive(it, qty);
+    if (!ok) { ShopSound(false); GarHelp("Nao deu para pegar %s agora. Tente de novo.", it.name); return; }
+    AddMoney(-price);
+    if (isBox && locked) ArmCountBox(it);
+    ShopSound(true);
+    if (own && !it.pack) GarHelp("%s (%d) para %s.", it.boxName, it.box, it.name);
+    else if (it.pack) GarHelp("%s: mais %d.", it.name, it.ammo);
+    else GarHelp("%s comprada.", it.name);
+    Log("traficante: %s %s por $%d%s", it.name, own && !it.pack ? "caixa" : it.pack ? "pacote" : "arma", price, locked ? " (fora de epoca)" : "");
+    ShopItems(row);
+}
+static void ShopTick() {
+    if (!g_shopOpen) return;
+    char* me = PlayerPed();
+    if (!me || MenuActive() || PlayerVehicle() || Rd<float>(me, 0x540) <= 0.f) { CloseShop(false); return; }
+    if (g_garCancel) {
+        g_garCancel = false;
+        if (g_shopLevel == 2) { g_shopPick = -1; ShopItems(g_shopPickRow); }
+        else if (g_shopLevel == 1) ShopCategories(g_shopCat);
+        else { CloseShop(false); Log("traficante: menu fechado"); }
+        return;
+    }
+    if (g_garSel) {
+        g_garSel = false;
+        int row = 0;
+        { Cmd c(0x08D7); c.I(g_menu).Out(0); RunCmd(c, &row, 1); }
+        g_dl.tLast = GameMs();
+        if (g_shopLevel == 0) { if (row >= 0 && row < CT_COUNT) { g_shopCat = row; ShopItems(0); } return; }
+        if (g_shopLevel == 2) {
+            int pick = g_shopPick;
+            g_shopPick = -1;
+            if (row == 0 && pick >= 0) {
+                ShopBuy(pick, true, g_shopPickRow);
+                if (g_shopLevel == 2) ShopItems(g_shopPickRow);                // nao comprou (dinheiro, limite...)
+            } else ShopItems(g_shopPickRow);
+            return;
+        }
+        if (row >= 0 && row < g_shopN) ShopBuy(g_shopItem[row], false, row);
+    }
+}
+
+// ---- van e motorista
+static void DealerDoors(bool open) {
+    if (!VehByRef(g_dl.van)) return;
+    if (!open) { Cmd c(0x0508); c.I(g_dl.van); RunCmd(c); return; }
+    if (g_dl.doorA >= 0) { Cmd c(0x0657); c.I(g_dl.van).I(g_dl.doorA); RunCmd(c); }
+    if (g_dl.doorB >= 0) { Cmd c(0x0657); c.I(g_dl.van).I(g_dl.doorB); RunCmd(c); }
+}
+static V3 VanRear(const char* v) {                                            // atras da traseira, no chao da van
+    V3 p = EntityPos(v);
+    const float* m = Rd<const float*>(v, 0x14);
+    float fx = m ? m[4] : 0.f, fy = m ? m[5] : 1.f, fz = m ? m[6] : 0.f;
+    float back = -2.8f;
+    char* mi = ModelInfo(Rd<short>(v, 0x22));
+    const float* c = mi ? Rd<const float*>(mi, 0x14) : nullptr;
+    if (c && c[1] < -0.5f && c[1] > -8.f) back = c[1];
+    back -= 0.9f;
+    return { p.x + fx * back, p.y + fy * back, p.z + fz * back };
+}
+static bool IsCopCarModel(int m) { return m == 596 || m == 597 || m == 598 || m == 599 || m == 523 || m == 427 || m == 490 || m == 528 || m == 601 || m == 497; }
+static bool IsCop(const char* p) { return p && Rd<int>(p, 0x598) == 6 && Rd<float>(p, 0x540) > 0.f; }
+static bool IsOurCop(const char* p) {
+    for (int k = 0; k < g_dl.nCops; k++) if (PedByRef(g_dl.cops[k].ped) == p) return true;
+    return false;
+}
+// algum policial perto (range) da traseira; com sight, so conta quem tem linha de visao ate ela
+static bool CopNear(V3 at, float range, bool sight, V3* where) {
+    char* pool = *(char**)0xB74490;
+    if (!pool) return false;
+    int size = Rd<int>(pool, 8);
+    for (int i = 0; i < size; i++) {
+        if (Rd<BYTE*>(pool, 4)[i] & 0x80) continue;
+        char* p = Rd<char*>(pool, 0) + i * 0x7C4;
+        if (!IsCop(p) || IsOurCop(p)) continue;
+        V3 cp = EntityPos(p);
+        char* cv = (Rd<BYTE>(p, 0x46D) & 1) ? Rd<char*>(p, 0x58C) : nullptr;
+        float r = range;
+        if (sight && cv && Rd<int>(cv, 0x590) == 3) r = range * 2.f;          // helicoptero
+        float dx = cp.x - at.x, dy = cp.y - at.y, dz = cp.z - at.z;
+        if (dx * dx + dy * dy + dz * dz > r * r) continue;
+        if (sight) {
+            Cmd c(0x06BD); c.F(cp.x).F(cp.y).F(cp.z + 0.6f).F(at.x).F(at.y).F(at.z + 0.8f).I(1).I(0).I(0).I(1).I(0);
+            if (!RunCmd(c)) continue;
+        }
+        if (where) *where = cp;
+        return true;
+    }
+    return false;
+}
+static void DealerRemoveBlip() { if (g_dl.blip >= 0) { Cmd c(0x0164); c.I(g_dl.blip); RunCmd(c); g_dl.blip = -1; } }
+static void ReleaseCops() {
+    for (int k = 0; k < g_dl.nCops; k++) {
+        DealerCop& c = g_dl.cops[k];
+        char* car = VehByRef(c.car); char* ped = PedByRef(c.ped);
+        if (car) { Cmd x(0x0397); x.I(c.car).I(0); RunCmd(x); }
+        if (car && ped && (Rd<BYTE>(ped, 0x46D) & 1) && Rd<char*>(ped, 0x58C) == car) { Cmd x(0x05D2); x.I(c.ped).I(c.car).F(12.f).I(0); RunCmd(x); }
+        if (c.spawned) {
+            if (ped) { Cmd x(0x01C2); x.I(c.ped); RunCmd(x); }
+            if (car) { Cmd x(0x01C3); x.I(c.car); RunCmd(x); }
+        }
+    }
+    g_dl.nCops = 0;
+}
+static void DealerEnd(const char* how) {
+    CloseShop(false);
+    DealerRemoveBlip();
+    ReleaseCops();
+    char* v = VehByRef(g_dl.van); char* d = PedByRef(g_dl.ped);
+    bool onScreen = false;
+    if (v) { Cmd c(0x02CA); c.I(g_dl.van); onScreen = RunCmd(c); }
+    if (d) { Cmd c(0x09B6); c.I(g_dl.ped).I(0); RunCmd(c); }
+    if (!onScreen) {                                                          // fora de vista: some de vez
+        if (d) { Cmd c(0x009B); c.I(g_dl.ped); RunCmd(c); }
+        if (v) { Cmd c(0x00A6); c.I(g_dl.van); RunCmd(c); }
+    } else {                                                                  // na tela: o jogo tira quando sair
+        if (d) { Cmd c(0x01C2); c.I(g_dl.ped); RunCmd(c); }
+        if (v) { Cmd c(0x01C3); c.I(g_dl.van); RunCmd(c); }
+    }
+    Log("traficante: fim (%s)", how);
+    memset(&g_dl, 0, sizeof g_dl); g_dl.van = g_dl.ped = g_dl.blip = -1;
+}
+static void DealerCooldown(const char* why) {
+    g_armCooldownUntil = ArmNow() + (DWORD)(g_armCooldown > 0 ? g_armCooldown : 0);
+    char t[40]; ArmWhen(g_armCooldownUntil, t, sizeof t);
+    Log("traficante: sem atender ate %s (%s)", t, why);
+}
+static V3 FleePoint(V3 from, V3 threat) {
+    float dx = from.x - threat.x, dy = from.y - threat.y, l = sqrtf(dx * dx + dy * dy);
+    if (l < 1.f) { dx = 0.f; dy = 1.f; l = 1.f; }
+    float tx = from.x + dx / l * 400.f, ty = from.y + dy / l * 400.f;
+    int o[3] = {};
+    Cmd c(0x02C1); c.F(tx).F(ty).F(from.z).Out(0).Out(1).Out(2); RunCmd(c, o, 3);
+    V3 n = { AsF(o[0]), AsF(o[1]), AsF(o[2]) };
+    if (Dist2(n, from) < 60.f) n = { tx, ty, from.z };
+    return n;
+}
+static void DealerDrive(V3 to, float speed) {
+    { Cmd c(0x00AD); c.I(g_dl.van).F(speed); RunCmd(c); }
+    { Cmd c(0x00AE); c.I(g_dl.van).I(2); RunCmd(c); }                          // desvia dos carros, fura sinal
+    { Cmd c(0x00A7); c.I(g_dl.van).F(to.x).F(to.y).F(to.z); RunCmd(c); }
+}
+static void DealerGo(int state, V3 threat) {                                  // vai embora (LEAVE) ou foge (FLEE/CHASE)
+    CloseShop(false);
+    DealerRemoveBlip();
+    DealerDoors(false);
+    char* v = VehByRef(g_dl.van);
+    g_dl.state = state; g_dl.tPhase = g_dl.tFleeTarget = GameMs(); g_dl.threat = threat; g_dl.tStill = 0;
+    if (!v) return;
+    if (state == DL_LEAVE) {
+        { Cmd c(0x00AD); c.I(g_dl.van).F(32.f); RunCmd(c); }
+        { Cmd c(0x00AE); c.I(g_dl.van).I(2); RunCmd(c); }
+        { Cmd c(0x00A8); c.I(g_dl.van); RunCmd(c); }
+    } else {
+        g_dl.fleeTarget = FleePoint(EntityPos(v), threat);
+        DealerDrive(g_dl.fleeTarget, 45.f);
+    }
+}
+static void SpawnChaseCop(const char* van) {
+    V3 vp = EntityPos(van);
+    int level = 1;
+    { Cmd c(0x07EF); c.F(vp.x).F(vp.y).F(vp.z).Out(0); RunCmd(c, &level, 1); }
+    static const int kCar[4] = { 599, 596, 597, 598 }, kPed[4] = { 283, 280, 281, 282 };
+    if (level < 0 || level > 3) level = 1;
+    int carM = kCar[level], pedM = kPed[level];
+    const float* m = Rd<const float*>(van, 0x14);
+    float fx = m ? m[4] : 0.f, fy = m ? m[5] : 1.f;
+    char* me = PlayerPed(); V3 pp = me ? EntityPos(me) : vp;
+    static const float dist[] = { 90.f, 120.f, 70.f, 150.f };
+    static const float ang[] = { 180.f, 150.f, 210.f, 120.f, 240.f };
+    for (float d : dist) for (float a : ang) {
+        float r = a * 3.14159265f / 180.f, cs = cosf(r), sn = sinf(r);
+        float x = vp.x + (fx * cs - fy * sn) * d, y = vp.y + (fx * sn + fy * cs) * d;
+        int o[4] = {};
+        { Cmd c(0x03D3); c.F(x).F(y).F(vp.z).Out(0).Out(1).Out(2).Out(3); RunCmd(c, o, 4); }
+        V3 n = { AsF(o[0]), AsF(o[1]), AsF(o[2]) };
+        if (Dist2(n, vp) < 50.f || Dist2(n, pp) < 50.f) continue;
+        { Cmd c(0x00C2); c.F(n.x).F(n.y).F(n.z).F(4.f); if (RunCmd(c)) continue; }   // nao nasce na frente da camera
+        RequestModel(carM, 2); RequestModel(pedM, 2); LoadAllRequestedModels(false);
+        if (!ModelLoaded(carM) || !ModelLoaded(pedM)) return;
+        int car = -1, ped = -1;
+        { Cmd c(0x00A5); c.I(carM).F(n.x).F(n.y).F(n.z).Out(0); RunCmd(c, &car, 1); }
+        if (!VehByRef(car)) return;
+        { Cmd c(0x0175); c.I(car).F(AsF(o[3])); RunCmd(c); }
+        { Cmd c(0x0129); c.I(car).I(6).I(pedM).Out(0); RunCmd(c, &ped, 1); }
+        { Cmd c(0x0249); c.I(carM); RunCmd(c); }
+        { Cmd c(0x0249); c.I(pedM); RunCmd(c); }
+        if (!PedByRef(ped)) { Cmd c(0x00A6); c.I(car); RunCmd(c); return; }
+        { Cmd c(0x0397); c.I(car).I(1); RunCmd(c); }
+        { Cmd c(0x06E1); c.I(ped).I(car).I(g_dl.van).I(15).F(40.f).I(2); RunCmd(c); }   // MISSION_RAMCAR_FARAWAY
+        g_dl.cops[g_dl.nCops++] = { car, ped, true };
+        Log("traficante: viatura %d veio de (%.0f, %.0f) atras da van", carM, n.x, n.y);
+        return;
+    }
+    Log("traficante: nao achei rua fora de vista para uma viatura");
+}
+static void StartChase(V3 copAt) {
+    char* v = VehByRef(g_dl.van);
+    DealerGo(DL_CHASE, copAt);
+    if (!v) return;
+    if (PedByRef(g_dl.ped)) { Cmd c(0x09B6); c.I(g_dl.ped).I(1); RunCmd(c); }   // a policia vai atras dele
+    V3 vp = EntityPos(v);
+    char* pool = *(char**)0xB74494;
+    if (pool) {
+        int size = Rd<int>(pool, 8);
+        for (int i = 0; i < size && g_dl.nCops < 3; i++) {
+            if (Rd<BYTE*>(pool, 4)[i] & 0x80) continue;
+            char* car = Rd<char*>(pool, 0) + i * 0xA18;
+            if (car == v || !IsCopCarModel(Rd<short>(car, 0x22)) || (Rd<BYTE>(car, 0x36) >> 3) == 5) continue;
+            char* drv = Rd<char*>(car, 0x460);
+            if (!IsCop(drv) || Dist2(EntityPos(car), vp) > 150.f) continue;
+            int ch = VehRef(car), ph = PedRef(drv);
+            if (ch < 0 || ph < 0) continue;
+            { Cmd c(0x0397); c.I(ch).I(1); RunCmd(c); }
+            { Cmd c(0x06E1); c.I(ph).I(ch).I(g_dl.van).I(15).F(40.f).I(2); RunCmd(c); }
+            g_dl.cops[g_dl.nCops++] = { ch, ph, false };
+        }
+    }
+    int nNear = g_dl.nCops;
+    if (!g_dl.nCops) SpawnChaseCop(v);
+    Log("traficante: a policia viu a van aberta; perseguicao (%d viaturas perto, %d chamadas)", nNear, g_dl.nCops - nNear);
+}
+
+// ---- ligacao
+static void DealerRootLabel(char* out, int n) {
+    if (g_dl.state == DL_COMING || g_dl.state == DL_STOPPING) snprintf(out, n, "Traficante de armas (a caminho)");
+    else if (g_dl.state == DL_OPEN) snprintf(out, n, "Traficante de armas (aqui)");
+    else if (ArmNow() < g_armCooldownUntil) snprintf(out, n, "Traficante de armas (nao atende)");
+    else snprintf(out, n, "Traficante de armas ($%d)", g_armCall);
+}
+static void DealerCall() {
+    char* me = PlayerPed();
+    if (!me) return;
+    if (g_dl.state == DL_COMING || g_dl.state == DL_STOPPING) { GarHelp("O traficante ja esta a caminho."); return; }
+    if (g_dl.state == DL_OPEN) { GarHelp("O traficante ja esta te esperando na van."); return; }
+    if (g_dl.state != DL_NONE) { GarHelp("O traficante esta ocupado. Ligue daqui a pouco."); return; }
+    if (ArmNow() < g_armCooldownUntil) {
+        char t[40]; ArmWhen(g_armCooldownUntil, t, sizeof t);
+        GarHelp("O traficante nao atende. Ele volta a atender %s.", t);
+        Log("traficante: nao atendeu (volta %s)", t);
+        return;
+    }
+    if (*(volatile int*)0xB72914 != 0) { GarHelp("Ligue ao ar livre."); return; }
+    if (Money() < g_armCall) { GarHelp("Ele so vem por $%d.", g_armCall); return; }
+    V3 p = EntityPos(me), node; float hd = 0.f;
+    if (!FindSpawnNode(p, Rd<const float*>(me, 0x14), &node, &hd)) { GarHelp("Nao achei uma rua para a van vir. Tente de outro lugar."); return; }
+    static const int kPed[3] = { 28, 29, 30 };
+    int pm = kPed[GetTickCount() % 3];
+    RequestModel(482, 2); RequestModel(pm, 2); LoadAllRequestedModels(false);
+    if (!ModelLoaded(482) || !ModelLoaded(pm)) { GarHelp("A van nao carregou. Tente de novo."); return; }
+    int van = -1, ped = -1;
+    { Cmd c(0x00A5); c.I(482).F(node.x).F(node.y).F(node.z).Out(0); RunCmd(c, &van, 1); }
+    char* v = VehByRef(van);
+    if (!v) { GarHelp("A van nao pode ser criada agora. Tente de novo."); return; }
+    { Cmd c(0x0175); c.I(van).F(hd); RunCmd(c); }
+    { Cmd c(0x0229); c.I(van).I(0).I(0); RunCmd(c); }                        // preta
+    { Cmd c(0x020A); c.I(van).I(2); RunCmd(c); }                             // trancada
+    { Cmd c(0x0129); c.I(van).I(4).I(pm).Out(0); RunCmd(c, &ped, 1); }
+    { Cmd c(0x0249); c.I(482); RunCmd(c); }
+    { Cmd c(0x0249); c.I(pm); RunCmd(c); }
+    if (!PedByRef(ped)) { Cmd c(0x00A6); c.I(van); RunCmd(c); GarHelp("O traficante nao pode vir agora. Tente de novo."); return; }
+    { Cmd c(0x039E); c.I(ped).I(1); RunCmd(c); }                             // ninguem tira ele da van
+    { Cmd c(0x0526); c.I(ped).I(1); RunCmd(c); }
+    memset(&g_dl, 0, sizeof g_dl);
+    g_dl.van = van; g_dl.ped = ped; g_dl.blip = -1;
+    { int b = -1; Cmd c(0x0186); c.I(van).Out(0); RunCmd(c, &b, 1); g_dl.blip = b; }
+    // portas de tras: door_lr / door_rr (CAutomobile::m_aCarNodes +0x648, nos 11 e 9); sem elas, o porta-malas
+    void* const* nodes = (void* const*)(v + 0x648);
+    if (nodes[11] && nodes[9]) { g_dl.doorA = 4; g_dl.doorB = 5; }
+    else if (nodes[17]) { g_dl.doorA = 1; g_dl.doorB = -1; }
+    else { g_dl.doorA = g_dl.doorB = -1; }
+    DealerDrive(p, 22.f);
+    g_dl.lastTarget = p;
+    AddMoney(-g_armCall); g_dl.paid = true;
+    g_dl.state = DL_COMING; g_dl.t0 = g_dl.tPhase = g_dl.tTarget = g_dl.tLast = GameMs();
+    Log("traficante: a caminho de (%.0f, %.0f), %.0f m, motorista %d, portas %s ($%d)", node.x, node.y, Dist2(node, p), pm,
+        g_dl.doorA == 4 ? "traseiras" : g_dl.doorA == 1 ? "do porta-malas" : "nenhuma", g_armCall);
+    GarHelp("O traficante esta a caminho ($%d). Fique por perto.", g_armCall);
+}
+
+// ---- a cada quadro
+static void DealerTick() {
+    if (!g_armOn) return;
+    DWORD now = GameMs();
+    char* me = PlayerPed();
+    if (me && !MenuActive() && now - g_armClockTick >= 1000) { g_armClockTick = now; ArmClock(); }
+    ShopTick();
+    if (g_dl.state == DL_NONE || !me) return;
+    static DWORD logic = 0;
+    if (now - logic < 200 && g_dl.state != DL_OPEN) return;
+    logic = now;
+    char* v = VehByRef(g_dl.van); char* d = PedByRef(g_dl.ped);
+    bool vanOk = v && (Rd<BYTE>(v, 0x36) >> 3) != 5;
+    bool drvOk = vanOk && d && Rd<float>(d, 0x540) > 0.f && (Rd<BYTE>(d, 0x46D) & 1) && Rd<char*>(d, 0x58C) == v;
+    int pr = PlayerRef();
+    bool attacked = false;
+    if (pr >= 0 && g_dl.state <= DL_OPEN) {
+        if (d) { Cmd c(0x051A); c.I(g_dl.ped).I(pr); attacked = RunCmd(c); }
+        if (!attacked && v) { Cmd c(0x051C); c.I(g_dl.van).I(pr); attacked = RunCmd(c); }
+    }
+    V3 pp = EntityPos(me);
+    if (g_dl.state <= DL_OPEN && !drvOk) {
+        bool arrived = g_dl.state == DL_OPEN;
+        if (attacked || arrived) DealerCooldown(attacked ? "atacado" : "a van ou o traficante nao resistiu");
+        else if (g_dl.paid) { AddMoney(g_armCall); GarHelp("O traficante nao conseguiu chegar. Os $%d voltaram.", g_armCall); }
+        if (attacked) GarHelp("Voce atacou o traficante. Ele nao vai te atender por um dia.");
+        DealerEnd(attacked ? "atacado" : arrived ? "van ou traficante fora de combate" : "nao chegou");
+        return;
+    }
+    if (attacked) {
+        DealerCooldown("atacado");
+        GarHelp("Voce atacou o traficante. Ele fugiu e nao vai te atender por um dia.");
+        DealerGo(DL_FLEE, pp);
+        Log("traficante: atacado pelo CJ; fugiu");
+        return;
+    }
+    float dist = vanOk ? Dist2(EntityPos(v), pp) : 9999.f;
+    bool dead = Rd<float>(me, 0x540) <= 0.f;
+    if (g_dl.state <= DL_OPEN && *(volatile int*)0xB72914 != 0) {              // o CJ entrou num interior
+        Log("traficante: o CJ entrou num interior; foi embora");
+        DealerGo(DL_LEAVE, pp);
+        return;
+    }
+    switch (g_dl.state) {
+    case DL_COMING: {
+        if (dead) { DealerGo(DL_LEAVE, pp); return; }
+        if (now - g_dl.tTarget > 3000 && Dist2(g_dl.lastTarget, pp) > 15.f) { DealerDrive(pp, 22.f); g_dl.lastTarget = pp; g_dl.tTarget = now; }
+        if (dist < 14.f) {
+            { Cmd c(0x00AD); c.I(g_dl.van).F(0.f); RunCmd(c); }
+            g_dl.state = DL_STOPPING; g_dl.tPhase = now;
+        } else if (now - g_dl.t0 > 100000) {                                  // preso no transito: aparece numa rua perto
+            int o[4] = {};
+            { Cmd c(0x03D3); c.F(pp.x).F(pp.y).F(pp.z).Out(0).Out(1).Out(2).Out(3); RunCmd(c, o, 4); }
+            { Cmd c(0x00AB); c.I(g_dl.van).F(AsF(o[0])).F(AsF(o[1])).F(AsF(o[2]) + 1.f); RunCmd(c); }
+            { Cmd c(0x0175); c.I(g_dl.van).F(AsF(o[3])); RunCmd(c); }
+            DealerDrive(pp, 22.f);
+            Log("traficante: demorou; apareceu na rua mais perto");
+            g_dl.t0 = now;
+        }
+        break;
+    }
+    case DL_STOPPING: {
+        const float* mv = (const float*)(v + 0x44);
+        float sp = sqrtf(mv[0] * mv[0] + mv[1] * mv[1] + mv[2] * mv[2]);
+        if (sp < 0.02f || now - g_dl.tPhase > 4000) {
+            if (WantedLevel() > 0 && CopNear(EntityPos(v), 60.f, false, nullptr)) {
+                GarHelp("A policia esta atras de voce. O traficante nao parou.");
+                Log("traficante: chegou com a policia atras do CJ; foi embora");
+                DealerGo(DL_FLEE, pp);
+                return;
+            }
+            { Cmd c(0x00AF); c.I(g_dl.van).I(11); RunCmd(c); }               // MISSION_STOP_FOREVER
+            DealerDoors(true);
+            g_dl.state = DL_OPEN; g_dl.tPhase = g_dl.tLast = now; g_dl.armed = true;
+            Log("traficante: chegou a %.0f m; portas abertas", dist);
+            GarHelp("O traficante chegou. Va ate a traseira da van.");
+        }
+        break;
+    }
+    case DL_OPEN: {
+        if (dead) { DealerGo(DL_LEAVE, pp); Log("traficante: o CJ caiu; foi embora"); return; }
+        V3 rear = VanRear(v);
+        static DWORD copTick = 0;
+        if (now - copTick >= 250) {
+            copTick = now;
+            V3 cop = rear;
+            if (WantedLevel() > 0 && CopNear(rear, 60.f, false, &cop)) {
+                bool shop = g_shopOpen;
+                if (shop) { Cmd c(0x010E); c.I(0).I(2); RunCmd(c); }
+                GarHelp("A policia esta atras de voce. O traficante fugiu.");
+                Log("traficante: policia atras do CJ chegou perto%s; fugiu", shop ? " com o menu aberto" : "");
+                DealerGo(DL_FLEE, cop);
+                return;
+            }
+            if (CopNear(rear, 40.f, true, &cop)) {
+                if (g_shopOpen) {
+                    CloseShop(false);
+                    { Cmd c(0x010E); c.I(0).I(2); RunCmd(c); }
+                    GarHelp("A policia viu voce comprando! O traficante fugiu.");
+                    Log("traficante: a policia viu a negociacao; 2 estrelas, ele fugiu");
+                    DealerGo(DL_FLEE, cop);
+                } else {
+                    DealerCooldown("a policia viu a van aberta");
+                    GarHelp("A policia viu a van do traficante. Ele fugiu e nao vai atender por um dia.");
+                    StartChase(cop);
+                }
+                return;
+            }
+        }
+        if (dist > (float)g_armLeave) {
+            GarHelp("Voce se afastou. O traficante foi embora.");
+            Log("traficante: o CJ se afastou %.0f m; foi embora", dist);
+            DealerGo(DL_LEAVE, pp);
+            return;
+        }
+        if (!g_shopOpen && now - g_dl.tLast > 180000) {
+            GarHelp("O traficante cansou de esperar e foi embora.");
+            Log("traficante: 3 minutos sem compra; foi embora");
+            DealerGo(DL_LEAVE, pp);
+            return;
+        }
+        if (!g_shopOpen) {
+            float dr = Dist2(rear, pp), dz = fabsf(rear.z - pp.z);
+            if (dr > 3.f) g_dl.armed = true;
+            if (g_dl.armed && dr < 1.6f && dz < 2.f && !PlayerVehicle() && !MenuActive() && !g_menuOpen && !g_kbMode && g_ctxCache == CTX_FOOT)
+                OpenShop();
+        }
+        break;
+    }
+    case DL_LEAVE: case DL_FLEE: case DL_CHASE: {
+        if (!vanOk || !drvOk) {
+            if (g_dl.state == DL_CHASE) Log("traficante: %s na perseguicao", vanOk ? "o traficante caiu" : "a van foi destruida");
+            DealerEnd(g_dl.state == DL_CHASE ? "fim da perseguicao" : "van parada");
+            return;
+        }
+        bool onScreen = false;
+        { Cmd c(0x02CA); c.I(g_dl.van); onScreen = RunCmd(c); }
+        V3 vp = EntityPos(v);
+        if (g_dl.state != DL_LEAVE && (now - g_dl.tFleeTarget > 6000 || Dist2(vp, g_dl.fleeTarget) < 60.f)) {
+            V3 threat = g_dl.threat;
+            if (g_dl.state == DL_CHASE) {                                     // foge da viatura mais perto
+                float best = 1e9f;
+                for (int k = 0; k < g_dl.nCops; k++) if (char* c = VehByRef(g_dl.cops[k].car)) { float dd = Dist2(EntityPos(c), vp); if (dd < best) { best = dd; threat = EntityPos(c); } }
+            } else threat = pp;
+            g_dl.fleeTarget = FleePoint(vp, threat); g_dl.tFleeTarget = now;
+            DealerDrive(g_dl.fleeTarget, 45.f);
+        }
+        if (g_dl.state == DL_CHASE) {
+            float nearest = 1e9f;
+            for (int k = 0; k < g_dl.nCops; k++) if (char* c = VehByRef(g_dl.cops[k].car)) { float dd = Dist2(EntityPos(c), vp); if (dd < nearest) nearest = dd; }
+            const float* mv = (const float*)(v + 0x44);
+            float sp = sqrtf(mv[0] * mv[0] + mv[1] * mv[1]);
+            if (sp < 0.05f && nearest < 12.f) { if (!g_dl.tStill) g_dl.tStill = now; } else g_dl.tStill = 0;
+            if (g_dl.tStill && now - g_dl.tStill > 10000) { Log("traficante: preso pela policia"); DealerEnd("preso"); return; }
+            if ((g_dl.nCops && nearest > 200.f) || (!onScreen && dist > 150.f) || dist > 300.f || now - g_dl.tPhase > 150000) {
+                Log("traficante: escapou da policia (%.0f m da viatura mais perto)", nearest < 1e8f ? nearest : -1.f);
+                DealerEnd("escapou");
+                return;
+            }
+        } else if ((!onScreen && dist > 80.f) || dist > 250.f || now - g_dl.tPhase > 90000) {
+            DealerEnd(g_dl.state == DL_FLEE ? "fugiu" : "foi embora");
+            return;
+        }
+        break;
+    }
+    }
 }
 
 // ---------------------------------------------------------------- giroscopio ([Gyro] Enabled=1; overlay 3.4)
@@ -3089,14 +3919,14 @@ static void InstallGarage() {
 //  - fora da mira (opcao do painel): a pe (4), carro e moto (18), barco (22).
 // Com zoom, o giro diminui na mesma proporcao do zoom (tan(FOV/2)), para a mira andar o mesmo tanto na tela.
 //
-// Fora da mira, a camera do modo controle volta sozinha para tras (a pe, CCam::Process_FollowPed_SA 0x522D40, e no
-// carro, Process_FollowCar_SA 0x5245B0). No modo mouse ela "vira e fica": a pe o jogo usa outra camera,
-// Process_FollowPedWithMouse (0x50F970, o analogico continua valendo nela), e no carro um contador (0xB70118) segura
-// a camera onde o mouse deixou. Com o "fora da mira" ligado, as duas leituras de CCamera::m_bUseMouse3rdPerson
-// (0xB6EC2E) que escolhem isso (0x5279BB e 0x525615) passam a ler um byte nosso: o do jogo, ou 1 enquanto o
-// giroscopio estiver valendo fora da mira (com arma em uso a pe, fica o do jogo, que guarda a trava de alvo).
-// No carro, depois que o giroscopio mexe, o contador fica cheio e a camera acompanha o giro do carro (fica virada
-// em relacao a ele). Soltam: Olhar atras (os dois gatilhos), o analogico direito, ou sair do carro.
+// Fora da mira, a camera do jogo volta sozinha para tras (a pe, CCam::Process_FollowPed_SA 0x522D40; no carro,
+// Process_FollowCar_SA 0x5245B0). A camera a pe "do mouse" (0x50F970) nem e usada na 1.0: CCam::Process so a escolhe
+// com 0x8CCF00 == 0, e ele vem 1 do executavel. Entao o plugin segura a camera ele mesmo: depois que o giroscopio
+// mexe, a cada quadro os angulos voltam para onde ele deixou (e as velocidades zeram). A pe, o angulo fica fixo;
+// no carro, fica fixo em relacao ao carro (acompanha as curvas). No carro, a leitura de m_bUseMouse3rdPerson
+// (0xB6EC2E) que liga o "segurar" do mouse (0x525615) le um byte nosso enquanto segura, para o jogo nao brigar.
+// Solta: o analogico direito (a pe e no carro), mirar, Olhar para os lados ou para tras (gatilhos, no carro),
+// Centralizar (a pe), sair ou entrar no veiculo, cutscene, controle desligado por script ou teletransporte.
 // "Centralizar" (comando 5 do overlay), a pe: a camera volta para tras do CJ, na altura de antes, em ~0,2 s.
 #pragma pack(push, 1)
 struct GyroBlock { DWORD magic, seq, yaw, pitch; WORD sensH, sensV, aimPct; BYTE flags, pad0; BYTE pad[8]; };
@@ -3108,19 +3938,26 @@ static int   g_gyroOn = 1;
 static bool  g_gyHave = false;
 static DWORD g_gyPrevYaw = 0, g_gyPrevPitch = 0, g_gyCfgLogged = 0xFFFFFFFF;
 static unsigned long long g_gyModesLogged = 0;
-static BYTE  g_camMouse = 0;                                                  // lido no lugar de 0xB6EC2E (2 pontos)
-static bool  g_camPatched = false, g_carHold = false, g_restAlphaOk = false;
-static float g_carHeading = 0.f, g_restAlpha = 0.f;
+static BYTE  g_camMouse = 0;                                                  // lido no lugar de 0xB6EC2E em 0x525615
+static bool  g_camPatched = false, g_carHold = false, g_footHold = false, g_restAlphaOk = false;
+static float g_carOffset = 0.f, g_carAlpha = 0.f, g_footBeta = 0.f, g_footAlpha = 0.f, g_restAlpha = 0.f;
+static V3    g_footPos = {};
+static float g_gyMoved = 0.f;                                                 // giro desde a ultima soltura (para nao segurar por ruido)
+static DWORD g_holdLogT = 0;
 static DWORD g_recenterUntil = 0;
 static void ApplyGyroCam() {
     g_camMouse = *(volatile BYTE*)0xB6EC2E;
     static const BYTE orig[] = { 0xA0, 0x2E, 0xEC, 0xB6, 0x00 };             // mov al, [CCamera::m_bUseMouse3rdPerson]
     BYTE r[5]; r[0] = 0xA0; *(DWORD*)(r + 1) = (DWORD)&g_camMouse;
-    bool a = PatchBytes(0x5279BB, orig, sizeof orig, r, sizeof r, "giroscopio: camera a pe que vira e fica (CCam::Process)");
-    bool b = PatchBytes(0x525615, orig, sizeof orig, r, sizeof r, "giroscopio: camera do carro que segura (Process_FollowCar_SA)");
-    g_camPatched = a && b;
+    g_camPatched = PatchBytes(0x525615, orig, sizeof orig, r, sizeof r, "giroscopio: camera do carro que segura (Process_FollowCar_SA)");
 }
-static float WrapPi(float d) { while (d > 3.14159265f) d -= 6.2831853f; while (d < -3.14159265f) d += 6.2831853f; return d; }
+static float WrapPi(float d) {                                               // -pi..pi; valor invalido vira 0
+    if (!isfinite(d)) return 0.f;
+    if (d >= -3.14159265f && d <= 3.14159265f) return d;
+    d = fmodf(d + 3.14159265f, 6.2831853f);
+    if (d < 0.f) d += 6.2831853f;
+    return d - 3.14159265f;
+}
 static float EntityHeading(const char* e) {                                  // direcao da frente no chao (x, y)
     const float* m = Rd<const float*>(e, 0x14);
     if (m) return atan2f(m[5], m[4]);
@@ -3128,6 +3965,8 @@ static float EntityHeading(const char* e) {                                  // 
 }
 static void DoRecenter() {
     if (g_carHold) { g_carHold = false; *(float*)0xB70118 = 0.f; Log("giroscopio: camera do carro solta (centralizar)"); }
+    if (g_footHold) { g_footHold = false; Log("giroscopio: camera a pe solta (centralizar)"); }
+    g_gyMoved = 0.f;
     g_recenterUntil = GetTickCount() + 600;
 }
 static bool ReadGyro(GyroBlock* b) {
@@ -3143,7 +3982,7 @@ static bool IsAimCam(int m) {
     return false;
 }
 static bool IsFreeCam(int m) { return m == 4 || m == 18 || m == 22; }
-static void CamTick(const GyroBlock* b) {                                     // a cada quadro, mesmo sem giro
+static void CamTick(const GyroBlock* b) {                                     // a cada quadro, antes do giro novo
     HostBlock hb;                                                             // sensor parado um instante (pausa): vale o overlay vivo
     bool gyroFree = b && (b->flags & GY_ON) && (b->flags & GY_ALWAYS) && ((b->flags & GY_RUN) || ReadHost(&hb));
     char* me = PlayerPed();
@@ -3152,24 +3991,40 @@ static void CamTick(const GyroBlock* b) {                                     //
     int mode = cam ? Rd<short>(cam, 0xC) : -1;
     bool gun = false;
     if (me) { char* intel = Rd<char*>(me, 0x47C); gun = intel && GetTaskUseGun(intel); }
-    g_camMouse = (*(volatile BYTE*)0xB6EC2E || (gyroFree && g_camPatched && !gun)) ? 1 : 0;
-    // carro: segura enquanto valer; acompanha o giro do carro
     char* veh = PlayerVehicle();
-    if (g_carHold) {
-        const short* pad = (const short*)0xB73458;                           // CPad 0, NewState
-        bool lookBack = pad[0x0A / 2] > 100 && pad[0x0E / 2] > 100;           // LeftShoulder2 + RightShoulder2
-        bool stick = abs(pad[4 / 2]) > 16 || abs(pad[6 / 2]) > 16;          // analogico direito
-        if (!gyroFree || !veh || !cam || (mode != 18 && mode != 22) || lookBack || stick) {
-            g_carHold = false;
-            *(float*)0xB70118 = 0.f;                                          // sem o resto do segurar: volta ja
-            Log("giroscopio: camera do carro solta (%s)", lookBack ? "olhar atras" : stick ? "analogico" : !veh ? "saiu do veiculo" : "fim do modo");
+    const short* pad = (const short*)0xB73458;                               // CPad 0, NewState
+    bool stick = abs(pad[2]) > 16 || abs(pad[3]) > 16;                       // analogico direito (o toque do lado direito)
+    bool scripted = Rd<WORD>((void*)0xB73458, 0x10E) != 0 || *(volatile signed char*)0xB5F851;
+    // a pe: volta para onde o giroscopio deixou
+    if (g_footHold) {
+        V3 p = me ? EntityPos(me) : V3{};
+        const char* why = !gyroFree ? "giroscopio fora da mira desligado" : !cam || mode != 4 ? "outra camera" : veh ? "entrou no veiculo" :
+                          gun ? "mirando" : stick ? nullptr : scripted ? "cena do jogo" : Dist2(p, g_footPos) > 15.f ? "teletransporte" : nullptr;
+        if (why || stick) {
+            g_footHold = false; g_gyMoved = 0.f;
+            if (why) Log("giroscopio: camera a pe solta (%s)", why);
         } else {
-            float h = EntityHeading(veh);
-            *(float*)(cam + 0xBC) += WrapPi(h - g_carHeading);
-            g_carHeading = h;
+            *(float*)(cam + 0xBC) = g_footBeta; *(float*)(cam + 0xAC) = g_footAlpha;
+            *(float*)(cam + 0xC0) = 0.f; *(float*)(cam + 0xB0) = 0.f;          // BetaSpeed, AlphaSpeed
+            g_footPos = p;
+        }
+    }
+    // carro: fica virada em relacao ao carro
+    if (g_carHold) {
+        bool trig = pad[5] > 100 || pad[7] > 100;                            // LeftShoulder2 / RightShoulder2: olhar
+        const char* why = !gyroFree ? "giroscopio fora da mira desligado" : !veh ? "saiu do veiculo" : !cam || (mode != 18 && mode != 22) ? "outra camera" :
+                          trig ? "olhar" : stick ? "analogico" : scripted ? "cena do jogo" : nullptr;
+        if (why) {
+            g_carHold = false; g_gyMoved = 0.f;
+            *(float*)0xB70118 = 0.f;                                          // sem o resto do segurar: volta ja
+            Log("giroscopio: camera do carro solta (%s)", why);
+        } else {
+            *(float*)(cam + 0xBC) = WrapPi(EntityHeading(veh) + g_carOffset); *(float*)(cam + 0xAC) = g_carAlpha;
+            *(float*)(cam + 0xC0) = 0.f; *(float*)(cam + 0xB0) = 0.f;
             *(float*)0xB70118 = 50.f;
         }
     }
+    g_camMouse = (*(volatile BYTE*)0xB6EC2E || (g_carHold && g_camPatched)) ? 1 : 0;
     // centralizar a pe: volta para tras do CJ (frente da camera = -cos/sin do Beta) e para a altura de antes
     if (g_recenterUntil) {
         if (GetTickCount() > g_recenterUntil || !me || !cam || mode != 4 || veh) { g_recenterUntil = 0; g_restAlphaOk = false; }
@@ -3222,12 +4077,22 @@ static void GyroTick() {
     float yaw = dy * 1e-6f * sh * k, pitch = dp * 1e-6f * sv * k;
     if (b.flags & GY_INVERT) pitch = -pitch;
     if (free && mode == 4 && !g_restAlphaOk && !g_recenterUntil) { g_restAlpha = Rd<float>(cam, 0xAC); g_restAlphaOk = true; }
-    if (free && (mode == 18 || mode == 22) && !g_carHold && PlayerVehicle()) {
-        g_carHold = true; g_carHeading = EntityHeading(PlayerVehicle());
-        Log("giroscopio: camera do carro segura onde voce virou (Olhar atras solta)");
-    }
     *(float*)(cam + 0xBC) -= yaw;                                             // Beta: frente = (-cos B, -sin B): para a direita diminui
     *(float*)(cam + 0xAC) += pitch;                                           // Alpha: frente.z = sin A (0x524206): para cima aumenta
+    // fora da mira: depois de um giro de verdade (mais de ~1,7 grau, nao o ruido do sensor), a camera fica onde ele deixou
+    if (free && !aim) {
+        g_gyMoved += fabsf(yaw) + fabsf(pitch);
+        bool engage = g_gyMoved > 0.03f;
+        DWORD now = GetTickCount();
+        if (mode == 4 && !PlayerVehicle() && !g_recenterUntil && (g_footHold || engage)) {
+            if (!g_footHold && now - g_holdLogT > 10000) { g_holdLogT = now; Log("giroscopio: camera a pe fica onde voce virou (analogico, mirar ou Centralizar soltam)"); }
+            g_footHold = true; g_footBeta = WrapPi(Rd<float>(cam, 0xBC)); g_footAlpha = Rd<float>(cam, 0xAC); g_footPos = EntityPos(PlayerPed());
+        }
+        if ((mode == 18 || mode == 22) && PlayerVehicle() && (g_carHold || engage)) {
+            if (!g_carHold && now - g_holdLogT > 10000) { g_holdLogT = now; Log("giroscopio: camera do carro fica virada em relacao a ele (gatilhos, analogico ou sair soltam)"); }
+            g_carHold = true; g_carOffset = WrapPi(Rd<float>(cam, 0xBC) - EntityHeading(PlayerVehicle())); g_carAlpha = Rd<float>(cam, 0xAC);
+        }
+    }
     if (mode < 64 && !(g_gyModesLogged & (1ull << mode))) {
         g_gyModesLogged |= 1ull << mode;
         Log("giroscopio: girando a camera no modo %d (%s)", mode, aim ? "mira" : "fora da mira");
@@ -3455,7 +4320,7 @@ static DWORD WINAPI StartupThread(LPVOID) {
     HookGame(0x485B10, (void*)&GetPadStateDetour, (void**)&g_origGetPadState, "das setas dos scripts");
     HookGame(0x588BE0, (void*)&SetHelpDetour, (void**)&g_origSetHelp, "do texto de ajuda");
     HookGame(0x588E30, (void*)&SetHelpNumDetour, (void**)&g_origSetHelpNum, "do texto de ajuda com numero");
-    if (g_garOn) InstallGarage();                                             // depois do MH_Initialize
+    if (g_garOn || g_armOn) InstallGarage();                                  // depois do MH_Initialize
     InstallXInputHooks();
     if (g_audioHash) { HANDLE t = CreateThread(nullptr, 0, AudioHashThread, nullptr, 0, nullptr); if (t) CloseHandle(t); }
     return 0;
@@ -3491,6 +4356,33 @@ static void LoadConfig(HMODULE self) {
     g_garPrice     = GetPrivateProfileIntA("Garage", "Price",    1250, ini);
     g_garSellPct   = GetPrivateProfileIntA("Garage", "SellPercent", 15, ini);
     g_gyroOn       = GetPrivateProfileIntA("Gyro", "Enabled",        1, ini);
+    g_armOn        = GetPrivateProfileIntA("Traficante", "Enabled",           1, ini);
+    g_armCall      = GetPrivateProfileIntA("Traficante", "CallPrice",       250, ini);
+    g_armDiscount  = GetPrivateProfileIntA("Traficante", "Discount",         15, ini);
+    g_armLockMult  = GetPrivateProfileIntA("Traficante", "LockedMultiplier", 10, ini);
+    g_armLockBoxes = GetPrivateProfileIntA("Traficante", "LockedBoxesPerDay", 2, ini);
+    g_armCooldown  = GetPrivateProfileIntA("Traficante", "CooldownMinutes", 1440, ini);
+    g_armLeave     = GetPrivateProfileIntA("Traficante", "LeaveDistance",    40, ini);
+    if (g_armDiscount < 0 || g_armDiscount > 90) g_armDiscount = 15;
+    if (g_armLockMult < 1) g_armLockMult = 1;
+    if (g_armLockBoxes < 0) g_armLockBoxes = 0;
+    if (g_armLeave < 15) g_armLeave = 15;
+    for (int i = 0; i < kArmItems; i++) {                                     // preco[,caixa,preco da caixa]
+        ArmItem& it = g_armItems[i];
+        char v[64];
+        GetPrivateProfileStringA("Traficante", it.key, "", v, sizeof v, ini);
+        if (!v[0]) continue;
+        int vals[3] = { -1, -1, -1 }, k = 0;                                  // ate 3 numeros separados por virgula
+        for (char* q = v; *q && k < 3; ) {
+            while (*q && !isdigit((unsigned char)*q) && *q != '-') q++;
+            if (!*q) break;
+            vals[k++] = (int)strtol(q, &q, 10);
+        }
+        int a = vals[0], b = vals[1], c = vals[2];
+        if (k >= 1 && a >= 0) it.price = a;
+        if (it.pack) { if (k >= 2 && b > 0) it.ammo = b; }
+        else if (it.box > 0) { if (k >= 2 && b > 0) it.box = b; if (k >= 3 && c >= 0) it.boxPrice = c; }
+    }
     g_saveSlot  = GetPrivateProfileIntA("Save",  "Slot",      8,   ini);
     g_autosaveMin  = GetPrivateProfileIntA("Save", "AutosaveMinutes", 5, ini);
     g_afterMission = GetPrivateProfileIntA("Save", "AfterMission",    1, ini);
@@ -3524,8 +4416,10 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     InitializeCriticalSection(&g_hookCs);
     LoadConfig(inst);
     QueryPerformanceFrequency(&g_qpf);
-    Log("GTMTouchSA 3.18 carregado (direcao=%d rampa=%d retorno=%d toque=%d sim/nao por script=%d diag toque=%d ragdoll=%d contagem=%d audio=%d x87=%d pular abertura=%d radar no alto=%d protecao da arma=%d menu de skins=%d andar da skin=%d voz da skin=%d skin nas roupas de missao=%d garagem=%d giroscopio=%d)",
-        g_steerOn, g_rampMs, g_releaseMs, g_touchOn, g_ynScripts, g_traceTouch, g_traceRagdoll, g_countRagdoll, g_audioHash, g_fixX87, g_skipIntro, g_radarTop, g_weaponGuard, g_skinOn, g_skinAnims, g_skinVoice, g_skinClothes, g_garOn, g_gyroOn);
+    Log("GTMTouchSA 3.20 carregado (direcao=%d rampa=%d retorno=%d toque=%d sim/nao por script=%d diag toque=%d ragdoll=%d contagem=%d audio=%d x87=%d pular abertura=%d radar no alto=%d protecao da arma=%d menu de skins=%d andar da skin=%d voz da skin=%d skin nas roupas de missao=%d garagem=%d giroscopio=%d traficante=%d)",
+        g_steerOn, g_rampMs, g_releaseMs, g_touchOn, g_ynScripts, g_traceTouch, g_traceRagdoll, g_countRagdoll, g_audioHash, g_fixX87, g_skipIntro, g_radarTop, g_weaponGuard, g_skinOn, g_skinAnims, g_skinVoice, g_skinClothes, g_garOn, g_gyroOn, g_armOn);
+    if (g_armOn) Log("traficante: ligacao $%d, %d%% abaixo da AmmuNation, fora de epoca %dx e %d caixas por arma por dia, sem atender %d min do jogo, vai embora a %d m",
+        g_armCall, g_armDiscount, g_armLockMult, g_armLockBoxes, g_armCooldown, g_armLeave);
     if (GetModuleHandleA("GTMSteerSA.asi")) Log("AVISO: GTMSteerSA.asi tambem esta carregado; apague ele da pasta scripts");
     if (!IsSupportedExe()) { Log("executavel nao e o 1.0 US: nada foi alterado"); return TRUE; }
     OpenShared();

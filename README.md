@@ -14,6 +14,7 @@ Overlay de toque contextual para o GTA San Andreas (PC 1.0 US) rodando no Madeir
   texto (placa dos carros da garagem). Giroscópio: gira só a câmera do jogo, sempre na mira e, se quiser,
   também a pé e dirigindo (aí a câmera vira e fica, como o mouse; "Olhar atrás" no veículo e "Centralizar" a pé
   voltam ela para trás), com sensibilidade horizontal, vertical e na mira no painel do editor (lápis > Giroscópio).
+  Depois do teclado, o foco do teclado volta para o Madeira.
 - `asi/GTMTouchSA.cpp`: plugin do jogo (vai em `GTA San Andreas/scripts`). Escreve contexto e
   estado e recebe os toques por `C:\gtmtouch.bin` (`Documents/wine/drive_c/gtmtouch.bin` no
   iPhone), entregando ao GInput como um controle. Inclui a direção pelas setas, salvar na hora,
@@ -24,7 +25,10 @@ Overlay de toque contextual para o GTA San Andreas (PC 1.0 US) rodando no Madeir
   (Status + Pular: os carros das garagens das casas viram seus; um membro da Grove entrega, busca e leva
   para a garagem; venda no mercado negro; os amassados do LocalDent vao junto, com o LocalDent modificado que
   exporta o estado de cada carro; cada garagem guarda quantos carros couberem nela e o carro que nao cabe fica
-  seu, "sem vaga"; troca de placa que acompanha o carro; os patios da policia ficam de fora).
+  seu, "sem vaga"; troca de placa que acompanha o carro; os patios da policia ficam de fora) e o traficante de
+  armas pelo mesmo telefone (van preta com as portas de tras abertas; arma uma vez e depois so a municao, em
+  caixas; precos pela fase da AmmuNation, com o mesmo calculo do script da loja, e as pesadas liberadas com Las
+  Venturas; a policia reage a van aberta).
   Protocolo 5 (256 bytes: jogo 0-63, overlay 64-95, giroscópio 96-127, pedido de teclado 128-191, resposta 192-255).
 - `.github/workflows/build-ipa.yml`: baixa o Madeira, compila e injeta o dylib, publica o IPA numa Release.
   Fonte padrao: o fork GTMoraes/Madeira (FEX de GTMoraes/FEX, branch gtm-x87pc: o x87 respeita a precisao
