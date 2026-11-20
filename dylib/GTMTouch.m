@@ -1,4 +1,4 @@
-// GTMTouch.dylib 3.6 - overlay de toque contextual para o GTA San Andreas no Madeira.
+// GTMTouch.dylib 3.8 - overlay de toque contextual para o GTA San Andreas no Madeira.
 //
 // Injetado no IPA oficial do Madeira. Desenha os controles por cima do jogo e troca o
 // conjunto de botoes sozinho conforme o contexto que o GTMTouchSA.asi escreve em
@@ -97,6 +97,9 @@ enum {
     CTX_MENU, CTX_SWIM, CTX_JETPACK, CTX_CUTSCENE
 };
 
+// 3.7 (protocolo 6): botoes do Vigilante no lugar do Sim/Nao: Reforco e Viatura (na missao, acesos quando
+// podem vir), Recrutar policial (policial perto ou na mira) e Vigilante (nivel 64: comecar/encerrar).
+// 3.8: Trocar arma tambem no veiculo (deslizar; o .asi troca pelos comandos 10 e 11, porque LT/RT ali e Olhar).
 // estado do jogo (igual ao .asi) + S_CANSAVE, que e local
 enum {
     S_YESNO = 1u << 0, S_WEAPONS = 1u << 1, S_AIM = 1u << 2, S_DETONATE = 1u << 3, S_MORESATCHEL = 1u << 4,
@@ -104,6 +107,8 @@ enum {
     S_SUBMISSION = 1u << 10, S_GROUP = 1u << 11, S_TARGETPED = 1u << 12, S_ARMED = 1u << 13,
     S_REMOTE = 1u << 14, S_GROUPMEMBERS = 1u << 15, S_DRIVEBY = 1u << 16,
     S_ACTPHONE = 1u << 17, S_ACTWEAPON = 1u << 18, S_ACTOTHER = 1u << 19, S_RELOAD = 1u << 20,
+    S_VIG = 1u << 21, S_VIGBACKUP = 1u << 22, S_VIGCAR = 1u << 23, S_RECRUITCOP = 1u << 24, S_VIG64 = 1u << 25,
+    S_CARWEAPONS = 1u << 26,
 };
 #define S_CANSAVE 0x80000000u
 #define S_GYROFREE 0x40000000u                          // local: giroscopio ligado tambem fora da mira
@@ -117,7 +122,8 @@ enum {
     B_X = 0x4000, B_Y = 0x8000, B_LT = 0x10000, B_RT = 0x20000, B_RAWL = 0x40000, B_RAWR = 0x80000,
     B_STKUP = 0x100000, B_STKDN = 0x200000      // analogico esquerdo para cima/baixo, com rampa (cruz das aeronaves)
 };
-enum { CMD_NONE = 0, CMD_SAVE = 1, CMD_DETONATE = 2, CMD_SATCHEL = 3, CMD_RELOAD = 4, CMD_RECENTER = 5 };
+enum { CMD_NONE = 0, CMD_SAVE = 1, CMD_DETONATE = 2, CMD_SATCHEL = 3, CMD_RELOAD = 4, CMD_RECENTER = 5,
+       CMD_BACKUP = 6, CMD_COPCAR = 7, CMD_RECRUITCOP = 8, CMD_VIGTOGGLE = 9, CMD_WEAPPREV = 10, CMD_WEAPNEXT = 11 };
 enum { DYN_NONE = 0, DYN_WEAPON, DYN_VEHICLE, DYN_GROUP, DYN_ACTION };
 
 // ------------------------------------------------------------------ layouts padrao
@@ -127,7 +133,8 @@ typedef struct {
     const char *key, *label, *icon, *badge;
     uint32_t bits;
     uint8_t cmd, dyn;
-    uint8_t swipe;                  // area de deslizar (invisivel no jogo): esquerda = LT, direita = RT, toque = recarregar
+    uint8_t swipe;                  // area de deslizar (invisivel no jogo): esquerda = LT, direita = RT, toque = recarregar;
+                                    // 2 = no veiculo: comandos 10 e 11 (troca de arma pelo .asi)
     uint32_t need, lit;
     double x, y, d;
 } GTMBtnDef;
@@ -139,6 +146,13 @@ static const double kRefW = 874.0, kRefH = 402.0;
 #define YESNO_AT(yy) \
     {.key = "no",  .label = "Não", .icon = "hud_x",     .bits = B_RAWL, .need = S_YESNO, .x = 220, .y = yy, .d = 44}, \
     {.key = "yes", .label = "Sim", .icon = "hud_check", .bits = B_RAWR, .need = S_YESNO, .x = 280, .y = yy, .d = 44}
+// Vigilante (protocolo 6): Reforco e Viatura so na missao, acesos quando podem vir; Vigilante no nivel 64
+#define VIG_BTNS \
+    {.key = "vigbackup", .label = "Reforço", .cmd = CMD_BACKUP, .need = S_VIG, .lit = S_VIGBACKUP, .x = 390, .y = 185, .d = 48}, \
+    {.key = "vigcar",    .label = "Viatura", .cmd = CMD_COPCAR, .need = S_VIG, .lit = S_VIGCAR,    .x = 484, .y = 185, .d = 48}, \
+    {.key = "vig64",     .label = "Vigilante", .cmd = CMD_VIGTOGGLE, .need = S_VIG64, .x = 560, .y = 58, .d = 44}
+#define CARWEAP_SWIPE \
+    {.key = "cwswipe", .label = "Trocar\narma", .swipe = 2, .need = S_CARWEAPONS, .x = 709, .y = 44, .d = 64}
 #define ENTER_BTN \
     {.key = "enter", .label = "Entrar", .icon = "enterandexit", .bits = B_Y, .dyn = DYN_VEHICLE, .lit = S_VEHNEAR, .x = 765, .y = 225, .d = 61}
 #define RADIO_BTNS \
@@ -168,7 +182,7 @@ static const double kRefW = 874.0, kRefH = 402.0;
     {.key = "fire",  .label = "Atirar", .icon = "shoot",        .bits = B_B, .need = S_FIRE, .x = 665, .y = 240, .d = 54}, \
     {.key = "exit",  .label = "Sair",   .icon = "enterandexit", .bits = B_Y,  .x = 770, .y = 140, .d = 54}, \
     {.key = "mission", .label = "Missão", .icon = "mission_start", .bits = B_R3, .need = S_SUBMISSION, .x = 110, .y = 165, .d = 46}, \
-    RADIO_BTNS, YESNO_AT(165), CAM_BTN, PAUSE_BTN, SAVE_BTN
+    RADIO_BTNS, YESNO_AT(165), CAM_BTN, PAUSE_BTN, SAVE_BTN, VIG_BTNS
 
 static const GTMBtnDef kFoot[] = {
     {.key = "fire",   .label = "Atirar",  .icon = "punch",  .bits = B_B, .dyn = DYN_WEAPON, .x = 765, .y = 315, .d = 74},
@@ -184,7 +198,8 @@ static const GTMBtnDef kFoot[] = {
     {.key = "recenter", .label = "Centralizar", .cmd = CMD_RECENTER, .need = S_GYROFREE, .x = 600, .y = 150, .d = 50},
     {.key = "follow", .label = "Recrutar", .icon = "LetsGoHand", .bits = B_UP,   .dyn = DYN_GROUP, .need = S_GROUP,     .x = 205, .y = 165, .d = 44},
     {.key = "stay",   .label = "Ficar",    .icon = "StopHand",   .bits = B_DOWN, .need = S_GROUPMEMBERS,                 .x = 265, .y = 165, .d = 44},
-    YESNO_AT(100), CAM_BTN, PAUSE_BTN, SAVE_BTN,
+    {.key = "recruitcop", .label = "Recrutar\npolicial", .cmd = CMD_RECRUITCOP, .need = S_RECRUITCOP, .x = 325, .y = 165, .d = 48},
+    YESNO_AT(100), CAM_BTN, PAUSE_BTN, SAVE_BTN, VIG_BTNS,
 };
 static const GTMBtnDef kSwim[] = {
     {.key = "dive",     .label = "Mergulhar",     .icon = "hud_dive", .bits = B_B, .x = 765, .y = 315, .d = 74},
@@ -210,6 +225,7 @@ static const GTMBtnDef kCar[] = {
     {.key = "hydraulics", .label = "Hidráulica", .icon = "hydraulicCar", .bits = B_R3, .need = S_HYDRAULICS, .x = 300, .y = 225, .d = 58},
     LOOK_BTNS,
     LOOKBACK_AT(580, 225),
+    CARWEAP_SWIPE,
     DRIVE_COMMON,
 };
 static const GTMBtnDef kHeli[] = {
@@ -233,7 +249,8 @@ static const GTMBtnDef kPassenger[] = {
     {.key = "exit", .label = "Sair",   .icon = "enterandexit", .bits = B_Y, .x = 770, .y = 140, .d = 54},
     LOOK_BTNS,
     LOOKBACK_AT(640, 235),
-    RADIO_BTNS, YESNO_AT(165), CAM_BTN, PAUSE_BTN,
+    CARWEAP_SWIPE,
+    RADIO_BTNS, YESNO_AT(165), CAM_BTN, PAUSE_BTN, VIG_BTNS,
 };
 static const GTMBtnDef kMenu[] = {
     {.key = "up",     .label = "▲",      .icon = "menu_up",   .bits = B_UP,    .x = 140, .y = 215, .d = 52},
@@ -920,11 +937,15 @@ static UIResponder *GTMCurrentFirstResponder(void) {
         if (!s) continue;
         if (s->kind == T_SWIPE) {                       // esquerda volta a arma, direita avanca, toque recarrega
             CGFloat dx = s->cur.x - s->start.x, minDx = 18 * [self sy];
+            BOOL inCar = s->button >= 0 && s->button < (int)_buttons.count && _buttons[s->button].def->swipe == 2;
             if (dx < -minDx || dx > minDx) {
-                _pulseBits = dx < 0 ? B_LT : B_RT;
-                _pulseUntil = CACurrentMediaTime() + 0.12;
+                if (inCar) { _cmdSeq++; _hostCmd = dx < 0 ? CMD_WEAPPREV : CMD_WEAPNEXT; }
+                else {
+                    _pulseBits = dx < 0 ? B_LT : B_RT;
+                    _pulseUntil = CACurrentMediaTime() + 0.12;
+                }
                 [_haptic impactOccurred];
-            } else if (_state & S_RELOAD) {             // so quando o jogo diz que da; senao nada (nem vibra)
+            } else if (!inCar && (_state & S_RELOAD)) {             // so quando o jogo diz que da; senao nada (nem vibra)
                 _cmdSeq++; _hostCmd = CMD_RELOAD;
                 [_haptic impactOccurred];
             }
@@ -1336,7 +1357,7 @@ enum { GYT_ON = 101, GYT_ALWAYS, GYT_H, GYT_V, GYT_AIM, GYT_INVERT, GYT_ZOOM, GY
     GTMHostBlock h = {0};
     h.magic = kHostMagic;
     h.seq = ++_hostSeq;
-    h.version = 5;
+    h.version = 6;
     h.cmdSeq = _cmdSeq; h.cmd = _hostCmd;
     if (!_editing) {
         uint32_t bits = 0;
@@ -1414,7 +1435,7 @@ enum { GYT_ON = 101, GYT_ALWAYS, GYT_H, GYT_V, GYT_AIM, GYT_INVERT, GYT_ZOOM, GY
     self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(frame:)];
     self.link.preferredFrameRateRange = CAFrameRateRangeMake(30, 60, 60);
     [self.link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
-    NSLog(@"[GTMTouch] overlay 3.6 ligado; arquivo %@", GTMSharedPath());
+    NSLog(@"[GTMTouch] overlay 3.8 ligado; arquivo %@", GTMSharedPath());
 }
 - (void)frame:(CADisplayLink *)l { [self.pad tick]; }
 - (void)sceneEvent:(NSNotification *)n { [self attachIfNeeded]; }

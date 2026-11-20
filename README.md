@@ -21,14 +21,26 @@ Overlay de toque contextual para o GTA San Andreas (PC 1.0 US) rodando no Madeir
   autosave e o veículo salvo junto, correções do x87 (sons de missão e clima), pular os vídeos de abertura,
   radar no canto de cima a esquerda, proteção da arma fora da memória (sem ícone, mãos vazias, travar ao mirar),
   recarregar pelo toque no ícone da arma, save dentro do carro e o Skin Selector: menu com Status + Atirar,
-  skin gravada junto com o save e o jeito de andar e a voz do personagem da skin, e a garagem pelo telefone
+  skin gravada junto com o save e o jeito de andar e a voz do personagem da skin (também nas respostas a pedestres,
+  nas ordens aos recrutados e nas respostas à namorada), o trânsito sem carro surgindo logo à frente quando você olha para trás, o Vigilante com reforço da polícia
+  pelo Sim/Não e recompensas por nível (12: mirar em policial não dá estrela, recrutar policial como parceiro de
+  gangue, armeiro da polícia no Vigilante e o procurado caindo mais rápido; 21: roubo de carro e batida em viatura
+  sem estrela e até 3 recrutas; 32: Vigilante sem timer; 64: Vigilante a qualquer hora, a pé ou em qualquer veículo,
+  a polícia ignorando seus crimes e indo atrás dos seus alvos), as policiais femininas do SA-MP 0.3.7 na rua e no
+  reforço (o limite de 278 modelos de pedestre do jogo sobe para 350), a mira do drive-by (de moto ou de carro, o
+  tiro vai no suspeito do Vigilante, no veículo dele ou em quem atacou você; sem alvo, só a altura do tiro é acertada
+  no pedestre ou veículo à frente), a mira a pé que prefere o suspeito (até dentro do carro) e, no nível hitman, passa
+  sozinha para o próximo agressor, a pistola silenciada .45 mais rápida, botões próprios do Vigilante no overlay
+  (Reforço, Viatura, Recrutar policial, Vigilante), trocar de arma no veículo e fazer drive-by com pistola, SMG,
+  fuzil ou escopeta, atirar para a frente no carro quebrando o para-brisa, e a garagem pelo telefone
   (Status + Pular: os carros das garagens das casas viram seus; um membro da Grove entrega, busca e leva
   para a garagem; venda no mercado negro; os amassados do LocalDent vao junto, com o LocalDent modificado que
   exporta o estado de cada carro; cada garagem guarda quantos carros couberem nela e o carro que nao cabe fica
   seu, "sem vaga"; troca de placa que acompanha o carro; os patios da policia ficam de fora) e o traficante de
-  armas pelo mesmo telefone (van preta com as portas de tras abertas; arma uma vez e depois so a municao, em
+  armas pelo mesmo telefone (van preta que para no seu nivel e e puxada para perto se se perder; as portas de tras
+  abrem quando voce chega na traseira; arma uma vez e depois so a municao, em
   caixas; precos pela fase da AmmuNation, com o mesmo calculo do script da loja, e as pesadas liberadas com Las
-  Venturas; a policia reage a van aberta; parado atras da van, ele pergunta se voce quer comprar, e da para
+  Venturas; a policia so reage se ver de perto, por tras, a van aberta; parado atras da van, ele pergunta se voce quer comprar, e da para
   dispensar ele), dar a arma que voce segura para o pedestre na sua frente (Status + Correr, com um cumprimento de
   gangue) e as armas de fogo protegidas em missao (a missao nao troca nem tira pistola, escopeta, submetralhadora
   e fuzil de assalto seus: a arma dela vira municao da sua; municao infinita volta ao que era no fim, mais uma

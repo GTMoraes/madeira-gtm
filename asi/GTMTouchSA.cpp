@@ -58,6 +58,8 @@
 
 // ---------------------------------------------------------------- configuracao e log
 static int  g_steerOn = 1, g_rampMs = 150, g_releaseMs = 60, g_touchOn = 1, g_log = 1;
+static int  g_noMouseSteer = 1, g_tsDeg = 10, g_tsStick = 1;                 // sem volante pelo mouse; trocar de alvo
+static volatile SHORT g_touchRX = 0;                                         // analogico direito do overlay (troca de alvo)
 static int  g_traceTouch = 0, g_traceRagdoll = 0, g_countRagdoll = 0, g_audioHash = 0, g_fixX87 = 1, g_skipIntro = 1, g_radarTop = 16, g_weaponGuard = 1;     // diagnosticos ([Debug] TouchTrace / RagdollTrace)
 static int  g_saveSlot = 8, g_autosaveMin = 5, g_afterMission = 1, g_keepVehicle = 1;
 static int  g_ynScripts = 1;
@@ -165,6 +167,12 @@ enum State : DWORD {
     S_ACTWEAPON    = 1u << 18,  // o TAB troca pela arma do chao
     S_ACTOTHER     = 1u << 19,  // o jogo pede o TAB para outra coisa (comprar, presente, foto...)
     S_RELOAD       = 1u << 20,  // a pe, a arma na mao pode ser recarregada agora (toque no icone da arma)
+    S_VIG          = 1u << 21,  // Vigilante rodando: botoes Reforco e Viatura (overlay 3.7, protocolo 6)
+    S_VIGBACKUP    = 1u << 22,  // o reforco pode vir agora (botao aceso)
+    S_VIGCAR       = 1u << 23,  // a viatura para voce pode vir agora (botao aceso)
+    S_RECRUITCOP   = 1u << 24,  // mira travada num policial que da para recrutar: botao Recrutar policial
+    S_VIG64        = 1u << 25,  // nivel 64: botao Vigilante (comecar/encerrar)
+    S_CARWEAPONS   = 1u << 26,  // no veiculo com arma para trocar (deslizar Trocar arma, comandos 10 e 11)
 };
 
 struct Info { int ctx; DWORD state; BYTE weapon, nearVeh; };
@@ -261,6 +269,10 @@ static bool ReadHost(HostBlock* out) {
 // ---------------------------------------------------------------- Sim/Nao pendente
 static volatile bool  g_helpYN = false, g_helpYNPerm = false;
 static volatile bool  g_dealerYN = false;                                    // o traficante pergunta "Quer comprar?"
+static volatile bool  g_vigYN = false, g_vigEatYN = false;                   // Vigilante: Sim/Nao chamam a policia (3.34)
+static volatile WORD  g_vigRaw = 0;                                          // setas do Sim/Nao do overlay, so para nos
+static volatile bool  g_rcYN = false;                                        // mira num policial: Sim recruta (3.41)
+static volatile DWORD g_tripSkipTick = 0;                                    // o jogo desenhou a caixa do Trip Skip
 static volatile DWORD g_helpYNTick = 0, g_scriptYNTick = 0;
 static char g_scriptYNName[9] = "";
 static const char* g_ynWhy = "";
@@ -354,8 +366,12 @@ static int __fastcall GetPadStateDetour(void* self, void* /*edx*/, int pad, int 
     return r;
 }
 
+static bool NewButtons() { return g_hostEverSeen && g_host.version >= 6; }   // overlay 3.7: Reforco, Viatura...
+static bool NewButtonsAlive() { return NewButtons() && GetTickCount() - g_hostSeqTick < 300; }
 static bool YesNoPending() {
+    g_vigEatYN = false;
     if (g_dealerYN) { g_ynWhy = "traficante"; return true; }
+    if (GetTickCount() - g_tripSkipTick < 500) { g_ynWhy = "trip skip"; return true; }
     if (*(volatile DWORD*)0x969A20 == 1) { g_ynWhy = "pedestre puxou conversa"; return true; }   // CPedToPlayerConversations: PEDHASOPENED
     for (int i = 0; i < 14; i++)                                                                  // CConversations: WAITINGFORINPUT
         if (*(volatile DWORD*)(0x9691D8 + i * 0x1C + 0x14) == 3) { g_ynWhy = "conversa de missao"; return true; }
@@ -365,6 +381,9 @@ static bool YesNoPending() {
         if (now - g_helpYNTick < 15000 || (g_helpYNPerm && shown)) { g_ynWhy = "texto de ajuda"; return true; }
     }
     if (g_ynScripts && g_scriptYNTick && now - g_scriptYNTick < 600) { g_ynWhy = kWhyScript; return true; }
+    if (NewButtons()) return false;                                           // overlay 3.7: botoes proprios
+    if (g_rcYN) { g_ynWhy = "recrutar policial"; g_vigEatYN = true; return true; }
+    if (g_vigYN) { g_ynWhy = "vigilante"; g_vigEatYN = true; return true; }
     return false;
 }
 
@@ -484,6 +503,14 @@ static bool GangDriveBy(char* ped) {
         if (t && ((GetTaskType_t)(*(void***)t)[0x10 / 4])(t) == 0x3FE) return true;   // TASK_SIMPLE_GANG_DRIVEBY
     return false;
 }
+static DWORD VigButtonState();
+static int  g_cwOn = 1, g_fwOn = 1, g_fwGlass = 1;
+static bool CwAllowed(int t) { return t >= 22 && t <= 33; }                    // pistolas, escopetas, SMGs, fuzis, rifle de caca
+static bool CwHasAny(const char* ped) {
+    if (!g_cwOn) return false;
+    for (int sl = 2; sl <= 6; sl++) if (CwAllowed(WeaponType(ped, sl)) && WeaponAmmo(ped, sl) > 0) return true;
+    return false;
+}
 static void ComputeInfo(Info& in) {
     in = {};
     if (MenuActive()) { in.ctx = CTX_MENU; return; }
@@ -504,16 +531,19 @@ static void ComputeInfo(Info& in) {
     if (active != 0) in.state |= S_ARMED;
     if (active != 40 && active != 44 && active != 45 && active != 46) in.state |= S_AIM;
     if (YesNoPending()) in.state |= S_YESNO;
+    in.state |= VigButtonState();
     {
         DWORD now = GetTickCount();
         bool shown = *(volatile char*)0xBAA480 != 0;                          // CHud::m_pHelpMessageToPrint
         if (g_helpAct && shown && now - g_helpActTick < 20000) in.state |= g_helpAct;
         else if (g_scriptTabTick && now - g_scriptTabTick < 600) in.state |= S_ACTPHONE;   // script esperando o TAB
     }
-    bool driveByWeapon = (active == 28 || active == 29 || active == 32) && activeAmmo > 0 && Rd<BYTE>(info, 0x153);   // m_bCanDoDriveBy
+    bool driveByWeapon = (CwAllowed(active) ? g_cwOn != 0 : (active == 28 || active == 29 || active == 32)) && activeAmmo > 0
+                         && Rd<BYTE>(info, 0x153);                            // m_bCanDoDriveBy
 
     char* remote = Rd<char*>(info, 0xB0);                                     // m_pRemoteVehicle
     char* veh = remote ? remote : PlayerVehicle();
+    if (veh && !remote && CwHasAny(ped)) in.state |= S_CARWEAPONS;
     if (veh) {
         int cls = Rd<int>(veh, 0x590);
         bool driver = remote || Rd<char*>(veh, 0x460) == ped;                 // m_pDriver
@@ -557,8 +587,10 @@ static void ComputeInfo(Info& in) {
     if (active == 40 && hasSatchel) in.state |= S_MORESATCHEL;
 
     const char* tgt = Rd<const char*>(ped, 0x71C);                            // m_pTargetedObject
-    if (tgt && (Rd<BYTE>(tgt, 0x36) & 7) == 3) in.state |= S_TARGETPED;
+    if (tgt && (Rd<BYTE>(tgt, 0x36) & 7) == 3 && Rd<int>(tgt, 0x598) == 8 && Rd<float>(tgt, 0x540) > 0.f)
+        in.state |= S_TARGETPED;                                              // so membro da Grove da para recrutar (3.43)
     if (GroupMembers(ped) > 0) in.state |= S_GROUPMEMBERS;
+    if (in.state & S_RECRUITCOP) in.state &= ~(DWORD)S_TARGETPED;            // policial: o botao e o Recrutar policial
     if (in.state & (S_TARGETPED | S_GROUPMEMBERS)) in.state |= S_GROUP;
 
     int nearCls = NearestVehicleClass(ped);
@@ -654,6 +686,7 @@ static DWORD Filter(DWORD ret, DWORD idx, XState* st) {
         if (h.rt > p.bRightTrigger) p.bRightTrigger = h.rt;
         p.sThumbLX = Stronger(p.sThumbLX, h.lx); p.sThumbLY = Stronger(p.sThumbLY, h.ly);
         p.sThumbRX = Stronger(p.sThumbRX, h.rx); p.sThumbRY = Stronger(p.sThumbRY, h.ry);
+        g_touchRX = h.rx;
         SkinCombo(h.buttons, p, now);
         GarageCombo(h.buttons, p);
         GiveCombo(h.buttons, p);
@@ -674,7 +707,10 @@ static DWORD Filter(DWORD ret, DWORD idx, XState* st) {
         }
     }
     // 3) Sim/Nao do overlay: setas de verdade, mesmo dentro do carro
-    if (host) st->Gamepad.wButtons |= h.rawButtons;
+    if (host) {
+        if (g_vigEatYN) g_vigRaw = h.rawButtons;                              // Vigilante: o Sim/Nao e nosso
+        else st->Gamepad.wButtons |= h.rawButtons;
+    }
 
     // diagnostico: o que o jogo recebeu, quadro a quadro (so quando muda)
     if (g_traceTouch) {
@@ -757,7 +793,8 @@ static void ApplyToNewState(short* ns) {
             if (dir != 0 || s != 0.0) { ns[0x14 / 2] = 0; ns[0x16 / 2] = 0; ns[0] = (short)(s * 128.0); }
         }
     }
-    if (host) for (auto& m : map) if (h.rawButtons & m.bit) ns[m.off / 2] = 255;
+    if (host && g_vigEatYN) g_vigRaw = h.rawButtons;
+    else if (host) for (auto& m : map) if (h.rawButtons & m.bit) ns[m.off / 2] = 255;
 }
 
 // ---------------------------------------------------------------- salvar / autosave / veiculo
@@ -823,6 +860,19 @@ static bool  g_pendingRestore = false;
 static char* g_saveVeh = nullptr;                                          // veiculo do CJ durante o DoSave
 static void  GarOnLoad();
 static void  ProtOnLoad();
+static void  RewardsOnLoad();
+static int   VigLevel();                                                      // recompensas do Vigilante (3.41)
+static bool  RcIsRecruit(const char* p);
+static int   RcCount();
+static void  RcReleaseAll(const char* why);
+static int   FemCopModel(int level);
+static bool  ArmLegalNow();
+static bool  Vig64CanStart(const char** why);
+static void  Vig64Start(const char* how);
+static void  Vig64Stop();
+static bool  VigActiveNow();
+static bool  g_dlLegal = false;                                               // o "traficante" desta vez e o armeiro da policia
+static int   GarageCopDriver(V3 at, int* pedType);
 static void  DoRecenter();
 static unsigned g_loadedTimeMs = 0;
 static DWORD g_lastAutosaveTick = 0, g_missionEndTick = 0, g_hostCmdSeen = 0;
@@ -1034,12 +1084,18 @@ static void __cdecl AfterLoadDetour() {
     g_pendingRestore = g_keepVehicle != 0;
     GarOnLoad();
     ProtOnLoad();
+    RewardsOnLoad();
     g_lastAutosaveTick = GetTickCount();
     g_lastMissionsPassed = -1;
     g_missionEndTick = 0;
     Log("jogo carregado (t=%u)", g_loadedTimeMs);
 }
 
+static void VgCmdBackup();
+static void VgCmdCar();
+static void RcCmdRecruit();
+static void Vig64Toggle(const char* how);
+static void CwCycle(int dir);
 static void SaveTick() {
     DWORD now = GetTickCount();
     if (g_lastAutosaveTick == 0) g_lastAutosaveTick = now;
@@ -1057,6 +1113,12 @@ static void SaveTick() {
                 case 3: DoSelectSatchel(); break;
                 case 4: DoReload(); break;
                 case 5: DoRecenter(); break;
+                case 6: VgCmdBackup(); break;                                // Reforco (overlay 3.7)
+                case 7: VgCmdCar(); break;                                   // Viatura
+                case 8: RcCmdRecruit(); break;                               // Recrutar policial
+                case 9: Vig64Toggle("pelo botao Vigilante"); break;          // nivel 64: comecar/encerrar
+                case 10: CwCycle(-1); break;                                 // trocar arma no veiculo (overlay 3.8)
+                case 11: CwCycle(1); break;
                 default: break;
             }
         }
@@ -1398,6 +1460,8 @@ static void GarageTick();
 static void GiveTick();
 static void GyroTick();
 static void ProtTick();
+static void TargetStickTick();
+static void ApplyNoMouseSteer();
 static void __cdecl FrameTick() {
     if (g_origFrameCall) g_origFrameCall();
     if (g_firstFrame) {                                 // reserva, se a thread de inicio nao conseguiu
@@ -1414,6 +1478,7 @@ static void __cdecl FrameTick() {
     GarageTick();
     GiveTick();
     ProtTick();
+    TargetStickTick();
     GyroTick();
     if (g_info.ctx != g_lastCtx) { Log("contexto: %s", g_info.ctx >= 0 && g_info.ctx <= CTX_CUTSCENE ? kCtxName[g_info.ctx] : "?"); g_lastCtx = g_info.ctx; }
     bool yn = (g_info.state & S_YESNO) != 0;
@@ -1807,6 +1872,7 @@ struct Cmd {
     Cmd& I(int v)   { code[n++] = 0x01; memcpy(code + n, &v, 4); n += 4; return *this; }
     Cmd& F(float v) { code[n++] = 0x06; memcpy(code + n, &v, 4); n += 4; return *this; }
     Cmd& Out(int lv){ code[n++] = 0x03; *(WORD*)(code + n) = (WORD)lv; n += 2; return *this; }
+    Cmd& G(int gv)  { code[n++] = 0x02; *(WORD*)(code + n) = (WORD)(gv * 4); n += 2; return *this; }
     Cmd& Key(const char* k) { code[n++] = 0x09; memset(code + n, 0, 8); strncpy((char*)code + n, k, 7); n += 8; return *this; }
     Cmd& Str(const char* s) { int l = (int)strlen(s); if (l > 100) l = 100; code[n++] = 0x0E; code[n++] = (BYTE)l; memcpy(code + n, s, l); n += l; return *this; }
 };
@@ -1862,7 +1928,7 @@ static int g_garOn = 1, g_garPrice = 1250, g_garSellPct = 15;
 static const DWORD kProofMask = (1u << 18) | (1u << 19) | (1u << 20) | (1u << 21) | (1u << 23);   // CPhysical +0x40
 enum { GS_NONE = 0, GS_LIVE, GS_AWAY, GS_DEAD, GS_DELIVER, GS_TOGARAGE, GS_PICKUP };
 static const char* kGarState[] = { "-", "na rua", "longe", "destruido", "a caminho", "indo p/ garagem", "sendo levado" };
-enum { ER_NONE = 0, ER_DELIVER, ER_TOGARAGE, ER_SOLD };                      // servico em andamento (um por vez)
+enum { ER_NONE = 0, ER_DELIVER, ER_TOGARAGE, ER_SOLD, ER_REPAIR, ER_REPAIRWAIT };   // ER_REPAIR: buscando para consertar                      // servico em andamento (um por vez)
 struct GarCar {
     BYTE  state, house, slot, inGarage, playerCar, hasDmg, pad[2];
     int   veh;                     // handle do veiculo vivo
@@ -1879,6 +1945,7 @@ struct GarCar {
 };
 static GarCar g_gar[80];
 static int    g_nGar = 0;
+static DWORD  g_repairAt = 0;                                                 // quando o carro consertado sai da oficina
 static int    g_errand = -1, g_errandKind = ER_NONE;                         // servico da Grove/comprador (indice em g_gar)
 static bool   g_garInternal = false;                                         // nossas chamadas a StoreCar/RestoreCar
 
@@ -1902,9 +1969,23 @@ static const char* CarName(int model) {
     const char* t = TextGet((void*)0xC1B340, mi + 0x32);                      // CVehicleModelInfo::m_szGameName
     return t && *t ? t : mi + 0x32;
 }
+static void ArmWords(char* buf, int size) {                                  // armeiro da policia: troca a palavra nas mensagens
+    if (!g_dlLegal) return;
+    static const char* from[2] = { "traficante", "Traficante" };
+    static const char* to[2]   = { "armeiro", "Armeiro" };
+    for (int k = 0; k < 2; k++) {
+        char* f;
+        while ((f = strstr(buf, from[k])) != nullptr) {
+            int lf = (int)strlen(from[k]), lt = (int)strlen(to[k]), rest = (int)strlen(f + lf);
+            if ((int)(f - buf) + lt + rest + 1 > size) return;
+            memmove(f + lt, f + lf, rest + 1); memcpy(f, to[k], lt);
+        }
+    }
+}
 static void GarHelp(const char* fmt, ...) {
     static char buf[200];
     va_list a; va_start(a, fmt); vsnprintf(buf, sizeof buf, fmt, a); va_end(a);
+    ArmWords(buf, sizeof buf);
     if (g_origSetHelp) g_origSetHelp(buf, true, false, false);
 }
 static void RequestBlobModels(const BYTE* b) {
@@ -2205,7 +2286,7 @@ static int SellPrice(int model, float health) {
 
 // ---------------------------------------------------------------- lista (menu do jogo)
 struct GarItem { int kind; int house, slot, gi, model; };                    // kind 0 vaga da garagem, 1 registro
-enum { AC_CALL = 1, AC_TOGARAGE, AC_SELL, AC_REPOR, AC_YES, AC_NO, AC_PLATE, AC_ROOT_GAR, AC_ROOT_ARM };
+enum { AC_CALL = 1, AC_TOGARAGE, AC_SELL, AC_REPOR, AC_YES, AC_NO, AC_PLATE, AC_ROOT_GAR, AC_ROOT_ARM, AC_REPAIR, AC_ROOT_VIG, AC_ROOT_RC };
 static GarItem g_items[90], g_sel;
 static int g_nItems = 0, g_page = 0, g_menu = -1, g_level = 0, g_acts[12], g_nActs = 0, g_price = 0;
 static bool g_menuOpen = false;
@@ -2213,11 +2294,13 @@ static volatile bool g_garReq = false, g_garSel = false, g_garCancel = false;
 static DWORD g_phoneOffAt = 0, g_menuOpenAt = 0;
 // traficante de armas (mais abaixo, depois da garagem)
 static int  g_armOn = 1, g_armCall = 250, g_armDiscount = 15, g_armLockMult = 10, g_armLockBoxes = 2;
-static int  g_armCooldown = 1440, g_armLeave = 40;
+static int  g_armCooldown = 1440, g_armLeave = 40, g_armCopSee = 25, g_armCopAngle = 60, g_armDoorDist = 7;
 static bool g_shopOpen = false;
 static void DealerRootLabel(char* out, int n);
 static void DealerCall();
 static void DealerTick();
+static void VigTick();
+static void WantedPerkTick();
 static void ArmSave();
 static void ArmOnLoad();
 
@@ -2318,6 +2401,8 @@ static bool ItemValid(const GarItem& it) {
 static const char* ItemStatus(const GarItem& it) {
     if (it.kind == 0) return "garagem";
     const GarCar& g = g_gar[it.gi];
+    if (g_errand == it.gi && g_errandKind == ER_REPAIRWAIT) return "no conserto";
+    if (g_errand == it.gi && g_errandKind == ER_REPAIR) return "indo p/ conserto";
     if (g.state == GS_DEAD) return "destruido";
     if (g.state == GS_LIVE && g.inGarage) return "garagem";
     if (g.state == GS_TOGARAGE) return g.noSpot ? "esperando vaga" : kGarState[g.state];
@@ -2384,6 +2469,7 @@ static void ShowActions() {
         add(AC_CALL, "Chamar");
         bool out = g_sel.kind == 1 && g_gar[g_sel.gi].state != GS_TOGARAGE && !(g_gar[g_sel.gi].state == GS_LIVE && g_gar[g_sel.gi].inGarage);
         if (out) add(AC_TOGARAGE, "Mandar para a garagem");
+        if (g_sel.kind == 1) add(AC_REPAIR, "Mandar consertar");
         if (PlateCapable(g_sel.model)) add(AC_PLATE, "Trocar placa");
         g_price = SellPrice(g_sel.model, ItemHealth(g_sel));
         char t[96]; snprintf(t, sizeof t, "Vender ($%d)", g_price); add(AC_SELL, t);
@@ -2405,14 +2491,16 @@ static bool g_garHooked = false;
 // telefone (nivel 3): garagem e traficante
 static void ShowRoot() {
     g_level = 3; g_nActs = 0;
-    static char arm[64];
-    const char* rows[2]; int n = 0;
+    static char arm[64], rc[48];
+    const char* rows[4]; int n = 0;
     if (g_garOn) { g_acts[g_nActs++] = AC_ROOT_GAR; rows[n++] = "Carro da garagem"; }
     if (g_armOn) { g_acts[g_nActs++] = AC_ROOT_ARM; DealerRootLabel(arm, sizeof arm); rows[n++] = arm; }
+    if (VigLevel() >= 64) { g_acts[g_nActs++] = AC_ROOT_VIG; rows[n++] = VigActiveNow() ? "Encerrar o Vigilante" : "Comecar o Vigilante"; }
+    if (RcCount() > 0) { g_acts[g_nActs++] = AC_ROOT_RC; snprintf(rc, sizeof rc, "Dispensar os policiais (%d)", RcCount()); rows[n++] = rc; }
     ShowRows("Telefone", "Ligar para", rows, n);
 }
 static void OpenMenu() {
-    if (!g_garOn && !g_armOn) return;
+    if (!g_garOn && !g_armOn && VigLevel() < 64 && !RcCount()) return;
     g_page = 0; g_menuOpen = true; g_menuOpenAt = GetTickCount(); g_garSel = g_garCancel = false;
     if (!ModelLoaded(330)) { RequestModel(330, 2); LoadAllRequestedModels(false); }   // celular
     PlayerControl(false);
@@ -2463,7 +2551,8 @@ static bool StartDelivery(int i) {
     V3 p = EntityPos(ped), node; float hd = 0.f;
     if (!FindSpawnNode(p, Rd<const float*>(ped, 0x14), &node, &hd)) { GarHelp("Nao achei uma rua para o carro vir. Tente de outro lugar."); return false; }
     static const int kFam[3] = { 105, 106, 107 };
-    int fam = kFam[GetTickCount() % 3];
+    int fam = kFam[GetTickCount() % 3], ptype = 8;
+    { int pt = 8, cop = GarageCopDriver(p, &pt); if (cop > 0) { fam = cop; ptype = pt; } }   // nivel 64: policial da regiao
     if (!LoadModelsNow(g.blob, fam)) { GarHelp("O carro nao carregou. Tente de novo."); return false; }
     BYTE b[0x40]; memcpy(b, g.blob, sizeof b);
     float* pos = (float*)b; pos[0] = node.x; pos[1] = node.y; pos[2] = node.z + 1.0f;
@@ -2471,12 +2560,13 @@ static bool StartDelivery(int i) {
     b[0x3C] = (BYTE)(signed char)(-sinf(r) * 100.f); b[0x3D] = (BYTE)(signed char)(cosf(r) * 100.f); b[0x3E] = 0;
     char* v = SpawnCar(g, b);
     if (!v) { GarHelp("O carro nao pode ser criado agora. Tente de novo."); return false; }
+    *(float*)(v + 0x4B0) = 0.f;                                               // CVehicle::m_fDirtLevel: vem lavado
     g.veh = VehRef(v);
     g.flags40 = Rd<DWORD>(v, 0x40); g.b42B = Rd<BYTE>(v, 0x42B);
     *(DWORD*)(v + 0x40) |= kProofMask;                                        // bala, fogo, colisao, golpe, explosao
     *(BYTE*)(v + 0x42B) |= 0x80;                                              // pneus nao furam
     int o = -1;
-    { Cmd c(0x0129); c.I(g.veh).I(8).I(fam).Out(0); RunCmd(c, &o, 1); }
+    { Cmd c(0x0129); c.I(g.veh).I(ptype).I(fam).Out(0); RunCmd(c, &o, 1); }
     g.ped = o;
     { Cmd c(0x0249); c.I(fam); RunCmd(c); }
     { Cmd c(0x00AD); c.I(g.veh).F(22.f); RunCmd(c); }
@@ -2539,6 +2629,19 @@ static void DeliveryTick(GarCar& g) {
 }
 
 // ---------------------------------------------------------------- busca a pe (Grove leva para a garagem, comprador leva o vendido)
+static void RepairGar(GarCar& g) {                                           // inteiro: vida cheia, sem danos nem amassados
+    g.health = 1000.f; g.hasDmg = 0; g.dentLen = 0;
+}
+static bool StartDelivery(int i);
+static void RepairWaitTick(GarCar& g) {
+    if (GetTickCount() < g_repairAt) return;
+    char* me = PlayerPed();
+    if (!me || Rd<float>(me, 0x540) <= 0.f || *(volatile int*)0xB72914 != 0) { g_repairAt = GetTickCount() + 3000; return; }
+    int i = (int)(&g - g_gar);
+    g_errand = -1; g_errandKind = ER_NONE;
+    if (StartDelivery(i)) { Log("garagem: %s consertado e lavado; voltando", CarName(BlobModel(g.blob))); GarHelp("%s consertado e lavado, a caminho.", CarName(BlobModel(g.blob))); return; }
+    g_errand = i; g_errandKind = ER_REPAIRWAIT; g_repairAt = GetTickCount() + 5000;   // tenta de novo
+}
 static bool StartPickup(int i, bool sold) {
     GarCar& g = g_gar[i];
     char* v = VehByRef(g.veh); char* me = PlayerPed();
@@ -2556,10 +2659,11 @@ static bool StartPickup(int i, bool sold) {
         if (Dist2(n, pp) > 25.f && Dist2(n, cp) < 80.f) { spot = n; break; }
     }
     static const int kFam[3] = { 105, 106, 107 }, kBuyer[3] = { 28, 29, 30 };   // Grove / traficantes
-    int model = sold ? kBuyer[GetTickCount() % 3] : kFam[GetTickCount() % 3];
+    int model = sold ? kBuyer[GetTickCount() % 3] : kFam[GetTickCount() % 3], ptype = sold ? 4 : 8;
+    if (!sold) { int pt = 8, cop = GarageCopDriver(spot, &pt); if (cop > 0) { model = cop; ptype = pt; } }   // nivel 64
     if (!LoadModelsNow(nullptr, model)) { GarHelp("Ninguem disponivel agora. Tente de novo."); return false; }
     int o = -1;
-    { Cmd c(0x009A); c.I(sold ? 4 : 8).I(model).F(spot.x).F(spot.y).F(spot.z + 1.f).Out(0); RunCmd(c, &o, 1); }
+    { Cmd c(0x009A); c.I(ptype).I(model).F(spot.x).F(spot.y).F(spot.z + 1.f).Out(0); RunCmd(c, &o, 1); }
     { Cmd c(0x0249); c.I(model); RunCmd(c); }
     if (!PedByRef(o)) { GarHelp("Ninguem disponivel agora. Tente de novo."); return false; }
     g.ped = o;
@@ -2567,13 +2671,23 @@ static bool StartPickup(int i, bool sold) {
     { Cmd c(0x05CB); c.I(g.ped).I(g.veh).I(30000); RunCmd(c); }               // entrar como motorista
     g.state = GS_PICKUP; g.phase = 0; g.t0 = g.tPhase = GetTickCount(); g.inGarage = 0;
     g_errand = i; g_errandKind = sold ? ER_SOLD : ER_TOGARAGE;
-    Log("garagem: %s vem buscar o %s", sold ? "o comprador" : "um membro da Grove", CarName(BlobModel(g.blob)));
+    Log("garagem: %s vem buscar o %s", sold ? "o comprador" : ptype == 8 ? "um membro da Grove" : "a policia", CarName(BlobModel(g.blob)));
     return true;
 }
 static void FinishPickup(GarCar& g, bool vanish, const char* how) {
     int i = (int)(&g - g_gar);
     bool sold = g_errandKind == ER_SOLD;
     char* v = VehByRef(g.veh);
+    if (vanish && g_errandKind == ER_REPAIR) {                                // levado para o conserto: volta em ~10 s
+        if (v) CaptureCar(g, v);
+        if (PedByRef(g.ped)) { Cmd c(0x009B); c.I(g.ped); RunCmd(c); }
+        if (v) { Cmd c(0x00A6); c.I(g.veh); RunCmd(c); }
+        g.ped = -1; g.veh = -1; g.state = GS_AWAY;
+        RepairGar(g);
+        g_errandKind = ER_REPAIRWAIT; g_repairAt = GetTickCount() + 10000;
+        Log("garagem: %s levado para o conserto (%s); volta em 10 s", CarName(BlobModel(g.blob)), how);
+        return;
+    }
     if (vanish) {
         if (v && !sold) CaptureCar(g, v);
         if (PedByRef(g.ped)) { Cmd c(0x009B); c.I(g.ped); RunCmd(c); }
@@ -2663,6 +2777,27 @@ static void DoToGarage() {
     Log("garagem: %s indo para a garagem (casa %d)%s", CarName(g_sel.model), g.house, g.noSpot ? "; sem vaga agora, espera abrir espaco" : "");
     if (g.noSpot) GarHelp("A garagem do %s esta cheia. Ele entra quando abrir espaco.", CarName(g_sel.model));
     else GarHelp("%s vai para a garagem.", CarName(g_sel.model));
+}
+static void DoRepair() {
+    if (g_errand >= 0) { GarHelp("A Grove ja esta ocupada com outro carro seu."); return; }
+    if (*(volatile int*)0xB72914 != 0) { GarHelp("Peca o conserto ao ar livre."); return; }
+    char* v; if (!CanUseNow(g_sel, &v)) return;
+    GarCar& g = g_gar[g_sel.gi];
+    const char* name = CarName(g_sel.model);
+    if (g.state == GS_LIVE && v && Dist2(EntityPos(v), EntityPos(PlayerPed())) < 70.f) {
+        if (StartPickup(g_sel.gi, false)) {
+            g_errandKind = ER_REPAIR;
+            Log("garagem: %s vai para o conserto; um membro da Grove vem buscar", name);
+            GarHelp("Um membro da Grove vem buscar o %s para consertar.", name);
+        }
+        return;
+    }
+    if (g.state == GS_LIVE && v) { CaptureCar(g, v); Cmd c(0x00A6); c.I(g.veh); RunCmd(c); }
+    g.veh = -1; g.state = GS_AWAY;
+    RepairGar(g);
+    g_errand = g_sel.gi; g_errandKind = ER_REPAIRWAIT; g_repairAt = GetTickCount() + 10000;
+    Log("garagem: %s no conserto (estava longe); volta ate voce em 10 s", name);
+    GarHelp("O %s vai para o conserto e volta ate voce, lavado.", name);
 }
 static void DoSell() {
     char* v; if (!CanUseNow(g_sel, &v)) return;
@@ -2827,6 +2962,15 @@ static void PickRow(int row) {
         if (row < 0 || row >= g_nActs) return;
         if (g_acts[row] == AC_ROOT_GAR) OpenGarageList();
         else if (g_acts[row] == AC_ROOT_ARM) { CloseMenu(true); DealerCall(); }
+        else if (g_acts[row] == AC_ROOT_VIG) {
+            CloseMenu(true);
+            if (VigActiveNow()) Vig64Stop();
+            else { const char* why = nullptr; if (Vig64CanStart(&why)) Vig64Start("pelo telefone"); else if (why) GarHelp("%s", why); }
+        } else if (g_acts[row] == AC_ROOT_RC) {
+            CloseMenu(true);
+            int n = RcCount(); RcReleaseAll("dispensados pelo telefone");
+            GarHelp(n > 1 ? "Os %d policiais foram dispensados." : "O policial foi dispensado.", n);
+        }
         return;
     }
     if (g_level == 0) {
@@ -2851,6 +2995,7 @@ static void PickRow(int row) {
     else if (act == AC_TOGARAGE) DoToGarage();
     else if (act == AC_YES) DoSell();
     else if (act == AC_REPOR) DoRepor();
+    else if (act == AC_REPAIR) DoRepair();
 }
 static void MenuTick() {
     if (!g_menuOpen) return;
@@ -3125,7 +3270,9 @@ static void GarageCombo(WORD buttons, PadState& p) {
     p.wButtons &= (WORD)~JUMP;
 }
 
+static void RewardsTick();
 static void GarageTick() {
+    RewardsTick();
     if (!g_garOn && !g_armOn) return;
     if (g_garOn) { LdResolve(); GarLoadTick(); }
     if (g_phoneOffAt && !g_kbMode && GetTickCount() > g_phoneOffAt) { g_phoneOffAt = 0; Phone(false); }
@@ -3139,11 +3286,15 @@ static void GarageTick() {
     if (g_garOn) {
         if (g_errand >= 0 && g_errand < g_nGar) {
             GarCar& g = g_gar[g_errand];
-            if (g_errandKind == ER_DELIVER) DeliveryTick(g); else PickupTick(g);
+            if (g_errandKind == ER_DELIVER) DeliveryTick(g);
+            else if (g_errandKind == ER_REPAIRWAIT) RepairWaitTick(g);
+            else PickupTick(g);
         }
         CarsTick();
     }
     DealerTick();
+    VigTick();
+    WantedPerkTick();
 }
 static void InstallGarage() {
     bool a = g_garOn && MH_CreateHook((void*)0x447E40, (void*)&RestoreCarDetour, (void**)&g_origRestoreCar) == MH_OK && MH_EnableHook((void*)0x447E40) == MH_OK;
@@ -3188,7 +3339,7 @@ struct ArmItem {
 };
 static ArmItem g_armItems[] = {
     { 22, CT_PIST,    AG_AMMU,  1, 2, false, "Pistola",            "Pistola 9mm",            200,  30,  50,   30, "Caixa 9mm",        346, 0 },
-    { 23, CT_PIST,    AG_AMMU,  9, 2, false, "PistolaSilenciador", "Pistola silenciada",     600,  30,  50,   30, "Caixa 9mm",        347, 0 },
+    { 23, CT_PIST,    AG_AMMU,  9, 2, false, "PistolaSilenciador", "Pistola silenciada",     600,  30,  50,   30, "Caixa .45 ACP subsonica", 347, 0 },
     { 24, CT_PIST,    AG_AMMU, 15, 2, false, "DesertEagle",        "Desert Eagle",          1200,  15,  20,   80, "Caixa .50 AE",     348, 0 },
     { 25, CT_SHOT,    AG_AMMU,  4, 3, false, "Escopeta",           "Escopeta",               600,  15,  25,   45, "Caixa calibre 12", 349, 0 },
     { 26, CT_SHOT,    AG_AMMU,  8, 3, false, "CanoSerrado",        "Cano serrado",           800,  12,  25,   45, "Caixa calibre 12", 350, 0 },
@@ -3226,6 +3377,7 @@ static ArmItem g_armItems[] = {
     { 42, CT_EQUIP,   AG_FREE,  0, 9, true,  "Extintor",           "Extintor",                80, 500,   0,    0, "",           366, 0 },
 };
 static const int kArmItems = (int)(sizeof g_armItems / sizeof g_armItems[0]);
+static int kArmItemsN() { return kArmItems; }
 
 // a fase da AmmuNation: a mesma conta do ammu.scm (0 = loja ainda fechada)
 static int Gvar(int n) { return *(volatile int*)(0xA49960 + n * 4); }          // CTheScripts::ScriptSpace
@@ -3253,6 +3405,17 @@ static int ArmPrice(const ArmItem& it, bool locked) {                         //
     if (locked) return it.price * g_armLockMult;
     if (it.group == AG_AMMU) return (it.price * (100 - g_armDiscount) + 50) / 100;
     return it.price;
+}
+// a caixa sai a preco normal se alguma arma do mesmo calibre (mesma caixa) ja esta liberada: a escopeta de combate
+// fora de epoca usa a caixa calibre 12 da escopeta comum; AK (7.62x39) e M4 (5.56) tem caixas diferentes
+static bool ArmBoxLocked(const ArmItem& it, int tier, bool lv) {
+    if (!ArmLocked(it, tier, lv)) return false;
+    if (it.box <= 0 || !it.boxName[0]) return true;
+    for (int i = 0; i < kArmItemsN(); i++) {
+        const ArmItem& o = g_armItems[i];
+        if (&o != &it && o.box > 0 && !strcmp(o.boxName, it.boxName) && !ArmLocked(o, tier, lv)) return false;
+    }
+    return true;
 }
 static int ArmBoxPrice(const ArmItem& it, bool locked) { return locked ? it.boxPrice * g_armLockMult : it.boxPrice; }
 static int Money() { return Rd<int>(PlayerInfo(), 0xB8); }                    // CPlayerInfo::m_nMoney
@@ -3322,6 +3485,11 @@ struct Dealer {
     bool armed, paid, calm, asking;
     DWORD tStillMe; int ynWas;           // CJ parado atras da van desde; setas da ultima leitura (Sim/Nao)
     DealerCop cops[4]; int nCops;
+    bool doorsOpen, meetLow;             // portas abertas agora; o ponto de encontro nao esta no nivel do CJ
+    DWORD tDoorFix, tFar, tProg, tMeet;  // reforco das portas; CJ longe desde; ultimo avanco; ultimo ponto de encontro
+    float bestDist, arriveDist; V3 meet, lastPull;
+    bool pulled, straight, los;
+    DWORD tLos;
 };
 static Dealer g_dl = { DL_NONE, -1, -1, -1, -1, -1 };
 static void ArmOnLoad() {                                                     // o mundo e outro: o traficante sumiu
@@ -3383,9 +3551,9 @@ static void ShopCategories(int active) {
     g_shopLevel = 0; g_shopN = CT_COUNT + 1;
     const char* rows[CT_COUNT + 1];
     for (int i = 0; i < CT_COUNT; i++) rows[i] = kArmCat[i];
-    rows[CT_COUNT] = "Dispensar o traficante";
+    rows[CT_COUNT] = g_dlLegal ? "Dispensar o armeiro" : "Dispensar o traficante";
     char head[40]; snprintf(head, sizeof head, "Dinheiro: $%d", Money());
-    ShowPanel("Traficante", head, rows, nullptr, nullptr, CT_COUNT + 1, 200.f, 0.f, 0, active);
+    ShowPanel(g_dlLegal ? "Armeiro" : "Traficante", head, rows, nullptr, nullptr, CT_COUNT + 1, 200.f, 0.f, 0, active);
 }
 static void DealerDismiss();
 static void ShopItems(int active) {
@@ -3413,9 +3581,10 @@ static void ShopItems(int active) {
             else snprintf(t0[r], 48, "%s (%d)", it.name, it.ammo);
             snprintf(t1[r], 24, "$%d%s", ArmPrice(it, locked), star);
         } else if (own && it.box > 0) {
-            if (locked) snprintf(t0[r], 48, "%s (%d) %d/%d", it.boxName, it.box, ArmBoxesLeft(it) > 0 ? ArmBoxesLeft(it) : 0, g_armLockBoxes);
+            bool bl = ArmBoxLocked(it, tier, lv);
+            if (bl) snprintf(t0[r], 48, "%s (%d) %d/%d", it.boxName, it.box, ArmBoxesLeft(it) > 0 ? ArmBoxesLeft(it) : 0, g_armLockBoxes);
             else snprintf(t0[r], 48, "%s (%d)", it.boxName, it.box);
-            snprintf(t1[r], 24, "$%d%s", ArmBoxPrice(it, locked), star);
+            snprintf(t1[r], 24, "$%d%s", ArmBoxPrice(it, bl), bl ? " *" : "");
         } else if (own) {
             snprintf(t0[r], 48, "%s", it.name); snprintf(t1[r], 24, "tem"); disabled |= 1u << r;
         } else {
@@ -3424,7 +3593,7 @@ static void ShopItems(int active) {
         r0[r] = t0[r]; r1[r] = t1[r];
     }
     char head[40]; snprintf(head, sizeof head, "%s ($%d)", kArmCat[g_shopCat], Money());
-    ShowPanel("Traficante", head, r0, "Preco", r1, g_shopN, 215.f, 80.f, disabled, active);
+    ShowPanel(g_dlLegal ? "Armeiro" : "Traficante", head, r0, "Preco", r1, g_shopN, 215.f, 80.f, disabled, active);
 }
 static void ShopConfirm(int idx, int cur, int price) {
     g_shopLevel = 2; g_shopPick = idx; g_shopN = 2;
@@ -3492,6 +3661,7 @@ static void ShopBuy(int idx, bool confirmed, int row) {
     bool own = cur == it.type;
     bool isBox = it.pack || (own && it.box > 0);
     if (own && !it.pack && it.box <= 0) { ShopSound(false); GarHelp("Voce ja tem %s.", it.name); return; }
+    if (isBox && !it.pack) locked = ArmBoxLocked(it, AmmuTier(), LvOpen());   // caixa: vale o calibre
     int price = isBox && !it.pack ? ArmBoxPrice(it, locked) : ArmPrice(it, locked);
     if (isBox && locked && ArmBoxesLeft(it) <= 0) {
         ShopSound(false);
@@ -3553,20 +3723,22 @@ static void ShopTick() {
 // 6DA) e do CloseAllDoors (0x6A4520), que so fecha quantas portas o modelo declara (+0x4C; a Burrito diz 2).
 typedef void (__thiscall* OpenDoorV_t)(void* veh, void* ped, int node, int door, float ratio, bool sound);
 typedef bool (__thiscall* DoorMissingV_t)(void* veh, int door);
-static void SetVanDoor(char* v, int door, float ratio) {
+static void SetVanDoor(char* v, int door, float ratio, bool sound = true) {
     static const int kNode[6] = { 0x10, 0x11, 0x0A, 0x08, 0x0B, 0x09 };       // capo, porta-malas, frente E/D, tras E/D
     if (!v || door < 0 || door > 5) return;
     void** vt = *(void***)v;
     if (((DoorMissingV_t)vt[0x98 / 4])(v, door)) return;
     if (!((void* const*)(v + 0x648))[kNode[door]]) return;
-    ((OpenDoorV_t)vt[0x6C / 4])(v, nullptr, kNode[door], door, ratio, true);
+    ((OpenDoorV_t)vt[0x6C / 4])(v, nullptr, kNode[door], door, ratio, sound);
 }
 static void DealerDoors(bool open) {
     char* v = VehByRef(g_dl.van);
     if (!v) return;
+    g_dl.doorsOpen = open;
     if (open) {
         if (g_dl.doorA >= 0) { Cmd c(0x0657); c.I(g_dl.van).I(g_dl.doorA); RunCmd(c); }
         if (g_dl.doorB >= 0) { Cmd c(0x0657); c.I(g_dl.van).I(g_dl.doorB); RunCmd(c); }
+        g_dl.tDoorFix = GameMs();
         return;
     }
     SetVanDoor(v, g_dl.doorA, 0.f);
@@ -3585,7 +3757,7 @@ static V3 VanRear(const char* v) {                                            //
     return { p.x + fx * back, p.y + fy * back, p.z + fz * back };
 }
 static bool IsCopCarModel(int m) { return m == 596 || m == 597 || m == 598 || m == 599 || m == 523 || m == 427 || m == 490 || m == 528 || m == 601 || m == 497; }
-static bool IsCop(const char* p) { return p && Rd<int>(p, 0x598) == 6 && Rd<float>(p, 0x540) > 0.f; }
+static bool IsCop(const char* p) { return p && Rd<int>(p, 0x598) == 6 && Rd<float>(p, 0x540) > 0.f && !RcIsRecruit(p); }
 static bool IsOurCop(const char* p) {
     for (int k = 0; k < g_dl.nCops; k++) if (PedByRef(g_dl.cops[k].ped) == p) return true;
     return false;
@@ -3613,6 +3785,83 @@ static bool CopNear(V3 at, float range, bool sight, V3* where) {
         return true;
     }
     return false;
+}
+// policial que ve a negociacao: perto da traseira (CopSeeDistance; helicoptero 1,6x), dentro do cone de tras da van
+// (CopSeeAngle para cada lado do eixo de tras) e com linha de visao ate a porta
+static bool CopSeesRear(const char* v, V3 rear, V3* where) {
+    char* pool = *(char**)0xB74490;
+    const float* m = Rd<const float*>(v, 0x14);
+    if (!pool || !m) return false;
+    float bx = -m[4], by = -m[5], bl = sqrtf(bx * bx + by * by);
+    if (bl < 0.01f) return false;
+    bx /= bl; by /= bl;
+    float cosMax = cosf((float)g_armCopAngle * 3.14159265f / 180.f);
+    int size = Rd<int>(pool, 8);
+    for (int i = 0; i < size; i++) {
+        if (Rd<BYTE*>(pool, 4)[i] & 0x80) continue;
+        char* p = Rd<char*>(pool, 0) + i * 0x7C4;
+        if (!IsCop(p) || IsOurCop(p)) continue;
+        V3 cp = EntityPos(p);
+        char* cv = (Rd<BYTE>(p, 0x46D) & 1) ? Rd<char*>(p, 0x58C) : nullptr;
+        bool heli = cv && Rd<int>(cv, 0x590) == 3;
+        float r = heli ? g_armCopSee * 1.6f : (float)g_armCopSee;
+        float dx = cp.x - rear.x, dy = cp.y - rear.y, dz = cp.z - rear.z;
+        float d = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (d > r) continue;
+        float h = sqrtf(dx * dx + dy * dy);
+        float cs = h < 2.f ? 1.f : (dx * bx + dy * by) / h;
+        if (cs < cosMax) continue;                                             // de lado ou pela frente: nao ve
+        Cmd c(0x06BD); c.F(cp.x).F(cp.y).F(cp.z + 0.6f).F(rear.x).F(rear.y).F(rear.z + 0.8f).I(1).I(0).I(0).I(1).I(0);
+        if (!RunCmd(c)) continue;
+        Log("traficante: policial%s a %.0f m da traseira, %.0f graus do eixo de tras", heli ? " de helicoptero" : cv ? " de viatura" : "",
+            d, acosf(cs > 1.f ? 1.f : cs) * 180.f / 3.14159265f);
+        if (where) *where = cp;
+        return true;
+    }
+    return false;
+}
+// ponto de encontro: a rua mais perto do CJ no mesmo nivel (ate 3 m de altura); sem nenhuma, a menos ruim
+static bool MeetNode(V3 pp, V3* out) {
+    bool found = false; float best = 1e9f, anyBest = 1e9f; V3 any = pp;
+    for (int n = 1; n <= 30; n++) {
+        int o[4] = {};
+        Cmd c(0x06F8); c.F(pp.x).F(pp.y).F(pp.z).I(n).Out(0).Out(1).Out(2).Out(3); RunCmd(c, o, 4);
+        V3 q = { AsF(o[0]), AsF(o[1]), AsF(o[2]) };
+        if (q.x == 0.f && q.y == 0.f) continue;
+        float d = Dist2(q, pp), dz = fabsf(q.z - pp.z);
+        if (d > 300.f) continue;
+        if (dz <= 3.f && d < best) { best = d; *out = q; found = true; }
+        float sc = d + dz * 10.f;
+        if (sc < anyBest) { anyBest = sc; any = q; }
+    }
+    if (!found) *out = any;
+    return found;
+}
+// delegacias (e os patios delas): a van nao e puxada para perto delas
+static bool NearPoliceStation(V3 q) {
+    static const float st[][2] = { { 1555.f, -1675.f }, { -1605.f, 715.f }, { 2290.f, 2430.f }, { 630.f, -570.f },
+                                   { -1390.f, 2640.f }, { -215.f, 980.f }, { -2160.f, -2385.f } };
+    for (auto& c : st) { float dx = q.x - c[0], dy = q.y - c[1]; if (dx * dx + dy * dy < 80.f * 80.f) return true; }
+    return false;
+}
+// para onde puxar a van perdida: rua no nivel do CJ, de 25 a 150 m, de preferencia fora da tela e longe de delegacia
+static bool PullNode(V3 pp, V3* out, float* hd) {
+    bool got = false, gotOn = false; V3 on = {}; float onHd = 0.f;
+    for (int n = 1; n <= 60 && !got; n++) {
+        int o[4] = {};
+        Cmd c(0x06F8); c.F(pp.x).F(pp.y).F(pp.z).I(n).Out(0).Out(1).Out(2).Out(3); RunCmd(c, o, 4);
+        V3 q = { AsF(o[0]), AsF(o[1]), AsF(o[2]) };
+        if (q.x == 0.f && q.y == 0.f) continue;
+        float d = Dist2(q, pp), dz = fabsf(q.z - pp.z);
+        if (dz > 3.f || d < 25.f || d > 150.f) continue;
+        if (NearPoliceStation(q) && !NearPoliceStation(pp)) continue;
+        bool seen = false;
+        { Cmd s(0x00C2); s.F(q.x).F(q.y).F(q.z + 1.f).F(4.f); seen = RunCmd(s); }
+        if (!seen) { *out = q; *hd = AsF(o[3]); got = true; }
+        else if (!gotOn) { on = q; onHd = AsF(o[3]); gotOn = true; }
+    }
+    if (!got && gotOn) { *out = on; *hd = onHd; got = true; }
+    return got;
 }
 static void DealerRemoveBlip() { if (g_dl.blip >= 0) { Cmd c(0x0164); c.I(g_dl.blip); RunCmd(c); g_dl.blip = -1; } }
 static void ReleaseCops() {
@@ -3652,9 +3901,11 @@ static void DealerEnd(const char* how) {
     Log("traficante: fim (%s)", how);
     memset(&g_dl, 0, sizeof g_dl); g_dl.van = g_dl.ped = g_dl.blip = -1;
 }
+static DWORD g_armLegalCool = 0;                                             // armeiro: sem atender (nao vai para o save)
 static void DealerCooldown(const char* why) {
-    g_armCooldownUntil = ArmNow() + (DWORD)(g_armCooldown > 0 ? g_armCooldown : 0);
-    char t[40]; ArmWhen(g_armCooldownUntil, t, sizeof t);
+    DWORD& until = g_dlLegal ? g_armLegalCool : g_armCooldownUntil;
+    until = ArmNow() + (DWORD)(g_armCooldown > 0 ? g_armCooldown : 0);
+    char t[40]; ArmWhen(until, t, sizeof t);
     Log("traficante: sem atender ate %s (%s)", t, why);
 }
 static V3 FleePoint(V3 from, V3 threat) {
@@ -3673,6 +3924,7 @@ static void DealerDrive(V3 to, float speed) {
     { Cmd c(0x00A7); c.I(g_dl.van).F(to.x).F(to.y).F(to.z); RunCmd(c); }
 }
 static void DealerGo(int state, V3 threat) {                                  // vai embora (LEAVE) ou foge (FLEE/CHASE)
+    if (g_dl.straight && VehByRef(g_dl.van)) { Cmd c(0x04E0); c.I(g_dl.van).I(20); RunCmd(c); g_dl.straight = false; }
     DealerAskEnd();
     CloseShop(false);
     DealerRemoveBlip();
@@ -3764,40 +4016,60 @@ static void StartChase(V3 copAt) {
 
 // ---- ligacao
 static void DealerRootLabel(char* out, int n) {
-    if (g_dl.state == DL_COMING || g_dl.state == DL_STOPPING) snprintf(out, n, "Traficante de armas (a caminho)");
-    else if (g_dl.state == DL_OPEN) snprintf(out, n, "Traficante de armas (aqui)");
-    else if (ArmNow() < g_armCooldownUntil) snprintf(out, n, "Traficante de armas (nao atende)");
-    else snprintf(out, n, "Traficante de armas ($%d)", g_armCall);
+    bool legal = g_dl.state != DL_NONE ? g_dlLegal : ArmLegalNow();
+    const char* who = legal ? "Armeiro da policia" : "Traficante de armas";
+    if (g_dl.state == DL_COMING || g_dl.state == DL_STOPPING) snprintf(out, n, "%s (a caminho)", who);
+    else if (g_dl.state == DL_OPEN) snprintf(out, n, "%s (venha ate aqui)", who);
+    else if (ArmNow() < (legal ? g_armLegalCool : g_armCooldownUntil)) snprintf(out, n, "%s (nao atende)", who);
+    else if (legal) snprintf(out, n, "%s (gratis)", who);
+    else snprintf(out, n, "%s ($%d)", who, g_armCall);
 }
 static void DealerCall() {
     char* me = PlayerPed();
     if (!me) return;
+    if (g_dl.state == DL_NONE) g_dlLegal = ArmLegalNow();                    // armeiro: nivel 12 no Vigilante, nivel 64 sempre
     if (g_dl.state == DL_COMING || g_dl.state == DL_STOPPING) { GarHelp("O traficante ja esta a caminho."); return; }
-    if (g_dl.state == DL_OPEN) { GarHelp("O traficante ja esta te esperando na van."); return; }
+    if (g_dl.state == DL_OPEN) {                                              // "venha ate aqui": leva a van ate onde voce esta
+        if (g_shopOpen || g_dl.asking) { GarHelp("O traficante ja esta te atendendo."); return; }
+        char* v = VehByRef(g_dl.van);
+        if (!v) return;
+        if (g_dl.doorsOpen) DealerDoors(false);
+        V3 p = EntityPos(me);
+        g_dl.meetLow = !MeetNode(p, &g_dl.meet);
+        g_dl.straight = false; g_dl.los = false; g_dl.tLos = 0;
+        { Cmd c(0x04E0); c.I(g_dl.van).I(20); RunCmd(c); }
+        DealerDrive(g_dl.meet, 14.f);
+        g_dl.lastTarget = p; g_dl.bestDist = 1e9f; g_dl.arriveDist = 0.f; g_dl.pulled = false; g_dl.tFar = 0;
+        g_dl.state = DL_COMING; g_dl.t0 = g_dl.tPhase = g_dl.tProg = g_dl.tMeet = g_dl.tLast = GameMs();
+        Log("traficante: chamado ate (%.0f, %.0f, %.0f)", p.x, p.y, p.z);
+        GarHelp("O traficante esta vindo ate voce.");
+        return;
+    }
     if (g_dl.state != DL_NONE) { GarHelp("O traficante esta ocupado. Ligue daqui a pouco."); return; }
-    if (ArmNow() < g_armCooldownUntil) {
-        char t[40]; ArmWhen(g_armCooldownUntil, t, sizeof t);
+    if (ArmNow() < (g_dlLegal ? g_armLegalCool : g_armCooldownUntil)) {
+        char t[40]; ArmWhen(g_dlLegal ? g_armLegalCool : g_armCooldownUntil, t, sizeof t);
         GarHelp("O traficante nao atende. Ele volta a atender %s.", t);
         Log("traficante: nao atendeu (volta %s)", t);
         return;
     }
     if (*(volatile int*)0xB72914 != 0) { GarHelp("Ligue ao ar livre."); return; }
-    if (Money() < g_armCall) { GarHelp("Ele so vem por $%d.", g_armCall); return; }
+    int price = g_dlLegal ? 0 : g_armCall;
+    if (Money() < price) { GarHelp("Ele so vem por $%d.", price); return; }
     V3 p = EntityPos(me), node; float hd = 0.f;
     if (!FindSpawnNode(p, Rd<const float*>(me, 0x14), &node, &hd)) { GarHelp("Nao achei uma rua para a van vir. Tente de outro lugar."); return; }
     static const int kPed[3] = { 28, 29, 30 };
-    int pm = kPed[GetTickCount() % 3];
-    RequestModel(482, 2); RequestModel(pm, 2); LoadAllRequestedModels(false);
-    if (!ModelLoaded(482) || !ModelLoaded(pm)) { GarHelp("A van nao carregou. Tente de novo."); return; }
+    int pm = g_dlLegal ? 285 : kPed[GetTickCount() % 3], vm = g_dlLegal ? 427 : 482;   // armeiro: Enforcer com um SWAT
+    RequestModel(vm, 2); RequestModel(pm, 2); LoadAllRequestedModels(false);
+    if (!ModelLoaded(vm) || !ModelLoaded(pm)) { GarHelp("A van nao carregou. Tente de novo."); return; }
     int van = -1, ped = -1;
-    { Cmd c(0x00A5); c.I(482).F(node.x).F(node.y).F(node.z).Out(0); RunCmd(c, &van, 1); }
+    { Cmd c(0x00A5); c.I(vm).F(node.x).F(node.y).F(node.z).Out(0); RunCmd(c, &van, 1); }
     char* v = VehByRef(van);
     if (!v) { GarHelp("A van nao pode ser criada agora. Tente de novo."); return; }
     { Cmd c(0x0175); c.I(van).F(hd); RunCmd(c); }
-    { Cmd c(0x0229); c.I(van).I(0).I(0); RunCmd(c); }                        // preta
+    if (!g_dlLegal) { Cmd c(0x0229); c.I(van).I(0).I(0); RunCmd(c); }        // preta
     { Cmd c(0x020A); c.I(van).I(2); RunCmd(c); }                             // trancada
     { Cmd c(0x0129); c.I(van).I(4).I(pm).Out(0); RunCmd(c, &ped, 1); }
-    { Cmd c(0x0249); c.I(482); RunCmd(c); }
+    { Cmd c(0x0249); c.I(vm); RunCmd(c); }
     { Cmd c(0x0249); c.I(pm); RunCmd(c); }
     if (!PedByRef(ped)) { Cmd c(0x00A6); c.I(van); RunCmd(c); GarHelp("O traficante nao pode vir agora. Tente de novo."); return; }
     { Cmd c(0x039E); c.I(ped).I(1); RunCmd(c); }                             // ninguem tira ele da van
@@ -3810,13 +4082,15 @@ static void DealerCall() {
     if (nodes[11] && nodes[9]) { g_dl.doorA = 4; g_dl.doorB = 5; }
     else if (nodes[17]) { g_dl.doorA = 1; g_dl.doorB = -1; }
     else { g_dl.doorA = g_dl.doorB = -1; }
-    DealerDrive(p, 22.f);
-    g_dl.lastTarget = p;
-    AddMoney(-g_armCall); g_dl.paid = true;
-    g_dl.state = DL_COMING; g_dl.t0 = g_dl.tPhase = g_dl.tTarget = g_dl.tLast = GameMs();
-    Log("traficante: a caminho de (%.0f, %.0f), %.0f m, motorista %d, portas %s ($%d)", node.x, node.y, Dist2(node, p), pm,
-        g_dl.doorA == 4 ? "traseiras" : g_dl.doorA == 1 ? "do porta-malas" : "nenhuma", g_armCall);
-    GarHelp("O traficante esta a caminho ($%d). Fique por perto.", g_armCall);
+    g_dl.meetLow = !MeetNode(p, &g_dl.meet);
+    DealerDrive(g_dl.meet, 22.f);
+    g_dl.lastTarget = p; g_dl.bestDist = 1e9f;
+    if (price > 0) { AddMoney(-price); g_dl.paid = true; }
+    g_dl.state = DL_COMING; g_dl.t0 = g_dl.tPhase = g_dl.tTarget = g_dl.tLast = g_dl.tProg = g_dl.tMeet = GameMs();
+    Log("traficante: %sa caminho de (%.0f, %.0f), %.0f m, motorista %d, portas %s ($%d)", g_dlLegal ? "armeiro da policia " : "", node.x, node.y, Dist2(node, p), pm,
+        g_dl.doorA == 4 ? "traseiras" : g_dl.doorA == 1 ? "do porta-malas" : "nenhuma", price);
+    if (g_dlLegal) GarHelp("O armeiro da policia esta a caminho. Fique por perto.");
+    else GarHelp("O traficante esta a caminho ($%d). Fique por perto.", g_armCall);
 }
 
 // ---- a cada quadro
@@ -3865,18 +4139,52 @@ static void DealerTick() {
     switch (g_dl.state) {
     case DL_COMING: {
         if (dead) { DealerGo(DL_LEAVE, pp); return; }
-        if (now - g_dl.tTarget > 3000 && Dist2(g_dl.lastTarget, pp) > 15.f) { DealerDrive(pp, 22.f); g_dl.lastTarget = pp; g_dl.tTarget = now; }
-        if (dist < 14.f) {
+        V3 vp = EntityPos(v);
+        bool level = fabsf(vp.z - pp.z) < 3.5f;
+        // perto, no mesmo nivel e com caminho livre a vista (sem parede, muro ou cerca entre a van e o CJ): vem em
+        // linha reta (canal, beco, estacionamento sem rua no mapa do jogo); senao, segue as ruas
+        if (now - g_dl.tLos >= 1000) {
+            g_dl.tLos = now; g_dl.los = false;
+            if (level && dist < 70.f) {
+                Cmd c(0x06BD); c.F(vp.x).F(vp.y).F(vp.z + 0.8f).F(pp.x).F(pp.y).F(pp.z + 0.3f).I(1).I(0).I(0).I(1).I(0);
+                g_dl.los = RunCmd(c);
+            }
+        }
+        bool straight = level && dist < 70.f && g_dl.los;
+        if (straight != g_dl.straight) {
+            g_dl.straight = straight;
+            { Cmd c(0x04E0); c.I(g_dl.van).I(straight ? 100 : 20); RunCmd(c); }
+            g_dl.tMeet = 0; g_dl.lastTarget = { 1e9f, 1e9f, 0.f };
+            Log("traficante: %s (%.0f m, %.1f m de altura)", straight ? "perto, no seu nivel e com caminho livre; vem reto ate voce" : "volta a seguir as ruas", dist, vp.z - pp.z);
+        }
+        if (now - g_dl.tMeet > 3000 && Dist2(g_dl.lastTarget, pp) > (straight ? 4.f : 15.f)) {
+            if (straight) {                                                    // mira 8 m antes do CJ, devagar
+                float dx = vp.x - pp.x, dy = vp.y - pp.y, l = sqrtf(dx * dx + dy * dy);
+                V3 t = l > 8.f ? V3{ pp.x + dx / l * 8.f, pp.y + dy / l * 8.f, pp.z } : vp;
+                DealerDrive(t, 9.f);
+            }
+            else { g_dl.meetLow = !MeetNode(pp, &g_dl.meet); DealerDrive(g_dl.meet, 22.f); }
+            g_dl.lastTarget = pp; g_dl.tMeet = now;
+        }
+        if (dist < g_dl.bestDist - 3.f) { g_dl.bestDist = dist; g_dl.tProg = now; }
+        bool there = (dist < 14.f && level) || (g_dl.meetLow && Dist2(vp, g_dl.meet) < 12.f);
+        bool stuck = now - g_dl.tProg > 60000;                                // longe: 60 s sem chegar mais perto
+        bool closest = now - g_dl.tProg > 15000 && ((level && dist < 100.f) || (g_dl.pulled && Dist2(vp, g_dl.lastPull) < 15.f));
+        if (there || closest) {
             { Cmd c(0x00AD); c.I(g_dl.van).F(0.f); RunCmd(c); }
-            g_dl.state = DL_STOPPING; g_dl.tPhase = now;
-        } else if (now - g_dl.t0 > 100000) {                                  // preso no transito: aparece numa rua perto
-            int o[4] = {};
-            { Cmd c(0x03D3); c.F(pp.x).F(pp.y).F(pp.z).Out(0).Out(1).Out(2).Out(3); RunCmd(c, o, 4); }
-            { Cmd c(0x00AB); c.I(g_dl.van).F(AsF(o[0])).F(AsF(o[1])).F(AsF(o[2]) + 1.f); RunCmd(c); }
-            { Cmd c(0x0175); c.I(g_dl.van).F(AsF(o[3])); RunCmd(c); }
-            DealerDrive(pp, 22.f);
-            Log("traficante: demorou; apareceu na rua mais perto");
-            g_dl.t0 = now;
+            g_dl.state = DL_STOPPING; g_dl.tPhase = now; g_dl.arriveDist = dist;
+            if (closest) Log("traficante: nao consegue chegar mais perto; para a %.0f m do CJ (%.1f m de altura); CJ em (%.0f, %.0f, %.0f)", dist, vp.z - pp.z, pp.x, pp.y, pp.z);
+        } else if (stuck) {                                                   // perdido ou preso longe: puxa para perto
+            V3 n; float hd = 0.f;
+            if (PullNode(pp, &n, &hd)) {
+                { Cmd c(0x00AB); c.I(g_dl.van).F(n.x).F(n.y).F(n.z + 1.f); RunCmd(c); }
+                { Cmd c(0x0175); c.I(g_dl.van).F(hd); RunCmd(c); }
+                g_dl.pulled = true; g_dl.lastPull = n;
+                g_dl.straight = false; g_dl.tMeet = 0; g_dl.lastTarget = { 1e9f, 1e9f, 0.f };
+                Log("traficante: %s; puxado para (%.0f, %.0f, %.0f), %.0f m do CJ em (%.0f, %.0f, %.0f)",
+                    "60 s sem chegar mais perto", n.x, n.y, n.z, Dist2(n, pp), pp.x, pp.y, pp.z);
+            } else Log("traficante: perdido, sem rua no seu nivel entre 25 e 150 m; CJ em (%.0f, %.0f, %.0f)", pp.x, pp.y, pp.z);
+            g_dl.t0 = g_dl.tProg = now; g_dl.bestDist = 1e9f;
         }
         break;
     }
@@ -3884,25 +4192,44 @@ static void DealerTick() {
         const float* mv = (const float*)(v + 0x44);
         float sp = sqrtf(mv[0] * mv[0] + mv[1] * mv[1] + mv[2] * mv[2]);
         if (sp < 0.02f || now - g_dl.tPhase > 4000) {
-            if (WantedLevel() > 0 && CopNear(EntityPos(v), 60.f, false, nullptr)) {
+            if (!g_dlLegal && WantedLevel() > 0 && CopNear(EntityPos(v), 60.f, false, nullptr)) {
                 GarHelp("A policia esta atras de voce. O traficante nao parou.");
                 Log("traficante: chegou com a policia atras do CJ; foi embora");
                 DealerGo(DL_FLEE, pp);
                 return;
             }
             { Cmd c(0x00AF); c.I(g_dl.van).I(11); RunCmd(c); }               // MISSION_STOP_FOREVER
-            DealerDoors(true);
-            g_dl.state = DL_OPEN; g_dl.tPhase = g_dl.tLast = now; g_dl.armed = true;
-            Log("traficante: chegou a %.0f m; portas abertas", dist);
-            GarHelp("O traficante chegou. Va ate a traseira da van.");
+            g_dl.doorsOpen = false;
+            g_dl.state = DL_OPEN; g_dl.tPhase = g_dl.tLast = now; g_dl.armed = true; g_dl.tFar = 0;
+            V3 vp = EntityPos(v);
+            Log("traficante: chegou a %.0f m (%.1f m de altura de diferenca%s); portas fechadas ate voce chegar na traseira",
+                dist, vp.z - pp.z, g_dl.meetLow ? ", sem rua no seu nivel" : "");
+            if (dist >= 20.f || g_dl.meetLow) GarHelp("O traficante parou a %.0f m, o mais perto que deu. Va ate a traseira da van.", dist);
+            else GarHelp("O traficante chegou. Va ate a traseira da van.");
         }
         break;
     }
     case DL_OPEN: {
         if (dead) { DealerGo(DL_LEAVE, pp); Log("traficante: o CJ caiu; foi embora"); return; }
         V3 rear = VanRear(v);
+        {                                                                      // portas: so com o CJ na traseira
+            float drr = Dist2(rear, pp), dzr = fabsf(rear.z - pp.z);
+            bool inVeh = PlayerVehicle() != nullptr;
+            if (!g_dl.doorsOpen && drr < (float)g_armDoorDist && dzr < 3.f && !inVeh) {
+                DealerDoors(true);
+                Log("traficante: o CJ chegou na traseira; portas abertas");
+            } else if (g_dl.doorsOpen && !g_shopOpen && !g_dl.asking && (drr > g_armDoorDist + 4.f || dzr >= 3.f || inVeh)) {
+                DealerDoors(false);
+                Log("traficante: o CJ saiu da traseira; portas fechadas");
+            }
+            if (g_dl.doorsOpen && now - g_dl.tDoorFix >= 250) {               // segura as portas abertas (o CJ esbarra)
+                g_dl.tDoorFix = now;
+                SetVanDoor(v, g_dl.doorA, 1.f, false);
+                SetVanDoor(v, g_dl.doorB, 1.f, false);
+            }
+        }
         static DWORD copTick = 0;
-        if (now - copTick >= 250) {
+        if (!g_dlLegal && now - copTick >= 250) {                              // o armeiro e legalizado: a policia nao liga
             copTick = now;
             V3 cop = rear;
             if (WantedLevel() > 0 && CopNear(rear, 60.f, false, &cop)) {
@@ -3913,7 +4240,7 @@ static void DealerTick() {
                 DealerGo(DL_FLEE, cop);
                 return;
             }
-            if (CopNear(rear, 40.f, true, &cop)) {
+            if (g_dl.doorsOpen && CopSeesRear(v, rear, &cop)) {
                 if (g_shopOpen) {
                     CloseShop(false);
                     { Cmd c(0x010E); c.I(0).I(2); RunCmd(c); }
@@ -3928,12 +4255,17 @@ static void DealerTick() {
                 return;
             }
         }
-        if (dist > (float)g_armLeave) {
-            GarHelp("Voce se afastou. O traficante foi embora.");
-            Log("traficante: o CJ se afastou %.0f m; foi embora", dist);
-            DealerGo(DL_LEAVE, pp);
-            return;
-        }
+        float leaveAt = (float)g_armLeave;                                     // parou longe: conta a partir de onde parou
+        if (g_dl.arriveDist + 20.f > leaveAt) leaveAt = g_dl.arriveDist + 20.f;
+        if (dist > leaveAt) {                                                  // 10 s de tolerancia (ou o dobro da distancia)
+            if (!g_dl.tFar) { g_dl.tFar = now; GarHelp("Volte para perto da van, ou o traficante vai embora."); }
+            if (now - g_dl.tFar > 10000 || dist > leaveAt * 2.f) {
+                GarHelp("Voce se afastou. O traficante foi embora.");
+                Log("traficante: o CJ se afastou %.0f m; foi embora", dist);
+                DealerGo(DL_LEAVE, pp);
+                return;
+            }
+        } else g_dl.tFar = 0;
         if (!g_shopOpen && now - g_dl.tLast > 180000) {
             GarHelp("O traficante cansou de esperar e foi embora.");
             Log("traficante: 3 minutos sem compra; foi embora");
@@ -3960,7 +4292,7 @@ static void DealerTick() {
             if (!g_dl.tStillMe) g_dl.tStillMe = now;
             if (now - g_dl.tStillMe >= 1000) {
                 g_dl.asking = true; g_dealerYN = true; g_dl.ynWas = 3;          // so vale apertar de novo
-                if (g_origSetHelp) g_origSetHelp("Quer comprar? Sim abre o menu. Nao dispensa o traficante.", true, true, false);
+                if (g_origSetHelp) g_origSetHelp(g_dlLegal ? "Quer comprar? Sim abre o menu. Nao dispensa o armeiro." : "Quer comprar? Sim abre o menu. Nao dispensa o traficante.", true, true, false);
                 Log("traficante: perguntou se quer comprar");
             }
         }
@@ -4378,6 +4710,1770 @@ static bool PatchCallSite(DWORD site, DWORD target, void* fn, const char* what) 
     BYTE rep[5]; rep[0] = 0xE8; *(int*)(rep + 1) = (int)((DWORD)fn - (site + 5));
     return PatchBytes(site, exp, 5, rep, 5, what);
 }
+// Pay 'n' Spray: carro seu nao muda de cor. O conserto sorteia cores novas (CGarage::Update 0x44B125 ->
+// CVehicleModelInfo::ChooseVehicleColour 0x4C8500, para o carro do jogador); aqui, se o carro e seu, as "novas"
+// sao as que ele ja tem. O resto do servico (conserto, lavagem, estrelas) fica igual.
+typedef void (__thiscall* ChooseColour_t)(void* mi, BYTE* c1, BYTE* c2, BYTE* c3, BYTE* c4, int variation);
+static void __thiscall PnsColour(void* mi, BYTE* c1, BYTE* c2, BYTE* c3, BYTE* c4, int variation) {
+    ((ChooseColour_t)0x4C8500)(mi, c1, c2, c3, c4, variation);
+    char* v = PlayerVehicle();
+    if (!g_garOn || !v || FindGarVeh(v) < 0) return;
+    *c1 = Rd<BYTE>(v, 0x434); *c2 = Rd<BYTE>(v, 0x435); *c3 = Rd<BYTE>(v, 0x436); *c4 = Rd<BYTE>(v, 0x437);
+    Log("garagem: Pay 'n' Spray no %s seu: conserta e lava, a cor fica", CarName(Rd<short>(v, 0x22)));
+}
+// Resposta a pedestre que puxou conversa, com skin: o jogo faz o CJ responder com falas que so a voz do jogador tem
+// (LIKE_*_REPLY, LIKE_DISMISS_*, LIKE_NEGATIVE_*, WHERE_YOU_FROM_*, GANGBANG_YES/NO; coluna "player" da tabela
+// 0x8C6A68). Com a voz de um pedestre (tipo 0 comum ou 3 gangue) elas nao existem e a skin fica muda. Aqui, nas
+// chamadas de CPed::Say (0x5EFFE0) da conversa (CPedToPlayerConversations::Update, 0x43B4xx-0x43C0C7), a fala do CJ
+// vira a fala de conversa que essas vozes tem (PCONV_*), com o tom da resposta:
+//   sim a um elogio: AGREE_GOOD (amigavel); sim a uma critica: AGREE_BAD (a contragosto);
+//   nao a um elogio: DISMISS (de pouco caso); nao a uma critica ou a gangue: ANS_NO (irritado).
+// Se a voz nao tiver a fala, tenta a proxima do mesmo tom. Fala de pedestre e voz do CJ passam direto.
+typedef short (__thiscall* PedSay_t)(void* ped, int ctx, int offset, float vol, int a, int b, int c);
+enum { PC_AGREE_BAD = 0xA1, PC_AGREE_GOOD = 0xA2, PC_ANS_NO = 0xA3, PC_DISMISS = 0xA4, PC_STATE_BAD = 0xAA, PC_STATE_GOOD = 0xAB };
+static short __thiscall ConvSay(char* ped, int ctx, int offset, float vol, int a, int b, int c) {
+    PedSay_t say = (PedSay_t)0x5EFFE0;
+    WORD k = (WORD)ctx;
+    if (!ped || ped != PlayerPed()) return say(ped, ctx, offset, vol, a, b, c);
+    int vtype = Rd<short>(ped + 0x294, 0x92);                                // m_nVoiceType: 2 = jogador
+    if (vtype != 0 && vtype != 3) return say(ped, ctx, offset, vol, a, b, c);
+    bool liked = *(volatile BYTE*)0x9691B1 != 0;                              // o pedestre elogiou (1) ou criticou (0)
+    const int* tries = nullptr; const char* tone = "";
+    static const int kYesGood[] = { PC_AGREE_GOOD, PC_STATE_GOOD, PC_AGREE_BAD, 0 };
+    static const int kYesBad[]  = { PC_AGREE_BAD, PC_AGREE_GOOD, PC_STATE_BAD, 0 };
+    static const int kDismiss[] = { PC_DISMISS, PC_ANS_NO, PC_STATE_BAD, 0 };
+    static const int kNo[]      = { PC_ANS_NO, PC_DISMISS, PC_STATE_BAD, 0 };
+    // recrutados: MOVE_IN 0x90, FIGHT 0x59 e ATTACK_PLAYER 0x14 (gangue), GREET_MALE 0xA6, PART_MALE 0xA8, QUESTION 0xA9
+    static const int kJoin[]    = { 0xA6, 0xA9, 0xA5, PC_STATE_GOOD, 0 };
+    static const int kAttack[]  = { 0x59, 0x14, 0x90, PC_STATE_BAD, 0 };
+    static const int kDisband[] = { 0xA8, PC_DISMISS, 0xA7, 0 };
+    static const int kFollow[]  = { 0x90, 0xA6, PC_STATE_GOOD, PC_AGREE_GOOD, 0 };
+    static const int kKeepUp[]  = { 0x90, PC_STATE_BAD, 0xA9, 0 };
+    static const int kWait[]    = { PC_STATE_GOOD, PC_AGREE_GOOD, PC_AGREE_BAD, 0 };
+    // namorada: GREET_FEM 0xA5, PART_FEM 0xA7
+    static const int kListen[]  = { PC_AGREE_GOOD, PC_STATE_GOOD, PC_AGREE_BAD, 0 };
+    static const int kHiGf[]    = { 0xA5, 0xA6, PC_STATE_GOOD, PC_AGREE_GOOD, 0 };
+    static const int kByeGf[]   = { 0xA7, 0xA8, PC_AGREE_GOOD, 0 };
+    switch (k) {
+    case 0x81: case 0x82: case 0x86: case 0x89: case 0x8A: case 0x8B: case 0x8C: case 0xEA: case 0xEC: case 0x6B:
+        if (liked || k == 0xEC || k == 0x6B) { tries = kYesGood; tone = "sim, amigavel"; } else { tries = kYesBad; tone = "sim, a contragosto"; }
+        break;
+    case 0x83: case 0x84: tries = kDismiss; tone = "nao, de pouco caso"; break;
+    case 0x87: case 0x88: case 0xEB: case 0x6A: tries = kNo; tone = "nao, irritado"; break;
+    // ordens aos recrutados (CPlayerPed: 0x5F7D82, 0x60A0E1, 0x60A424, 0x60C920, 0x60F7E4)
+    case 0x7F: tries = kJoin; tone = "chamar para o grupo"; break;
+    case 0x93: case 0x94: tries = kAttack; tone = "mandar atacar"; break;
+    case 0x95: case 0x96: tries = kDisband; tone = "dispensar"; break;
+    case 0x97: case 0x98: case 0x99: case 0x9A: case 0x9B: case 0x9C: tries = kFollow; tone = "mandar seguir"; break;
+    case 0x9D: case 0x9E: tries = kKeepUp; tone = "apressar"; break;
+    case 0x9F: case 0xA0: tries = kWait; tone = "mandar esperar"; break;
+    case 0xF3: tries = kDisband; tone = "dispensar o grupo"; break;
+    // namorada e encontros (gf_date, gf_meeting e telefone, pelos comandos de fala dos scripts)
+    case 0xF2: tries = kListen; tone = "ouvindo a namorada"; break;                           // UH_HUH
+    case 0xF0: tries = kHiGf; tone = "cumprimentar a namorada"; break;                        // GREETING_GFRIEND
+    case 0xF1: tries = kByeGf; tone = "despedir da namorada"; break;                          // PARTING_GFRIEND
+    case 0xF4: case 0xF5: case 0xF6: case 0x09: case 0x0A: case 0x2E: case 0xF9: case 0x8F:
+        tries = kYesGood; tone = "sim, amigavel"; break;                                      // aceitar convite, cafe, numero...
+    case 0x8D: tries = kYesBad; tone = "talvez"; break;                                       // MEET_GFRIEND_AGAIN_MAYBE
+    case 0x2F: case 0xFA: case 0x8E: tries = kNo; tone = "nao"; break;                       // recusar cafe, numero, encontro
+    default: return say(ped, ctx, offset, vol, a, b, c);
+    }
+    for (int i = 0; tries[i]; i++) {
+        short r = say(ped, tries[i], offset, vol, a, b, c);
+        if (r >= 0) { Log("conversa: a skin fala (%s): fala 0x%X no lugar da 0x%X do CJ", tone, tries[i], k); return r; }
+    }
+    char tl[64]; int o = 0; tl[0] = 0;
+    for (int i = 0; tries[i] && o < 56; i++) o += snprintf(tl + o, sizeof tl - o, " 0x%X", tries[i]);
+    Log("conversa: a voz da skin nao tocou nenhuma fala (%s, 0x%X; tentou%s; %s)", tone, k, tl,
+        Rd<BYTE>(ped + 0x294, 0x98) ? "ja estava falando" : "a voz nao tem essas falas ou repetiu ha pouco");
+    return -1;
+}
+static void ApplyConvSay() {
+    static const DWORD sites[] = { 0x43B443, 0x43B472, 0x43B4D2, 0x43B50C, 0x43B58D, 0x43B5DF, 0x43B66C, 0x43B6B4, 0x43B714,
+        0x43B74E, 0x43B7AD, 0x43B7E7, 0x43B84C, 0x43B886, 0x43B8DE, 0x43B91C, 0x43B98F, 0x43BA2E, 0x43BB0C, 0x43BC00,
+        0x43BD06, 0x43BE4A, 0x43BEC8, 0x43BEF6, 0x43BF11, 0x43BF4C, 0x43C0C7,
+        0x5F7D82, 0x60A0E1, 0x60A424, 0x60C920, 0x60F7E4,                   // ordens aos recrutados
+        0x4774CD, 0x47AB9F, 0x479361, 0x48E475, 0x682E6D };                 // falas pedidas por script (namorada etc.)
+    int ok = 0, n = (int)(sizeof sites / sizeof sites[0]);
+    for (int i = 0; i < n; i++) {
+        BYTE exp[5]; exp[0] = 0xE8; *(int*)(exp + 1) = (int)(0x5EFFE0 - (sites[i] + 5));
+        BYTE rp[5];  rp[0] = 0xE8;  *(int*)(rp + 1) = (int)((DWORD)&ConvSay - (sites[i] + 5));
+        if (memcmp((void*)sites[i], exp, 5) != 0) continue;
+        DWORD old; VirtualProtect((void*)sites[i], 5, PAGE_EXECUTE_READWRITE, &old);
+        memcpy((void*)sites[i], rp, 5);
+        VirtualProtect((void*)sites[i], 5, old, &old);
+        ok++;
+    }
+    Log("conversa: voz da skin na conversa, nas ordens aos recrutados e nas falas de script em %d de %d chamadas", ok, n);
+}
+// ---------------------------------------------------------------- Vigilante ([Vigilante], 3.34)
+// Na missao Vigilante (script 'copcar'):
+//  - a policia nao persegue o CJ (nivel de procurado zerado e SET_POLICE_IGNORE_PLAYER enquanto durar);
+//  - tempo fora da viatura: o script da 60 s (56@ = 60000 em dois lugares do codigo da missao); troco por OutOfCarSeconds
+//    no codigo da missao ja carregado (ele e recarregado a cada vez que a missao comeca);
+//  - os suspeitos sao os personagens que a missao cria (tipo MISSION1, 24, criados por script); policiais da rua
+//    perto deles (HelpRadius) recebem a tarefa de matar o suspeito mais perto (a pe) ou de perseguir o carro dele;
+//  - Sim: reforco. Duas viaturas, cada uma com seu tempo de espera: em uso ate a perseguicao em que ela foi
+//    chamada acabar (todos os suspeitos daquela leva mortos ou a missao acabou), depois BackupCooldown s.
+//    A primeira de uma perseguicao vem com 2 policiais de pistola; a segunda na mesma perseguicao, com 4 de MP5.
+//  - Nao: uma viatura com um policial so, que para perto, desce e deixa a viatura para o CJ (SingleCooldown s).
+//  Os policiais do reforco sao policiais de verdade do jogo (CREATE_CHAR tipo COP, CCopPed): a policia nao briga
+//  com eles. Modelo: FemaleModel em FemaleChance% das vezes (se o jogo tiver esse modelo), senao revezando o
+//  policial da regiao e os de Models.
+// Depois do nivel 12 do Vigilante (estatistica 157, maior nivel), fora da missao: de 1 a MaxStars estrelas, o nivel
+// cai mais rapido quando o jogo ja esta baixando (sem policial a 18 m) e nao ha policial a CopRadius m: cada
+// estrela inteira leva StarSeconds s na cidade (no interior, metade, como no jogo). O jogo baixa 1 ponto de "caos"
+// por segundo (2 no interior); a faixa de cada estrela tem 130, 370, 650 e 1200 pontos (CWanted::UpdateWantedLevel).
+static int   g_vgOn = 1, g_vgNoChase = 1, g_vgOutSec = 120, g_vgHelpOn = 1, g_vgPerk = 1, g_vgMaxStars = 4;
+static float g_vgHelpR = 100.f, g_vgCool = 60.f, g_vgOneCool = 60.f, g_vgStarSec = 65.f, g_vgCopR = 60.f, g_vgStar64 = 32.f;
+static float g_vgSpawnMin = 30.f, g_vgSpawnMax = 70.f;
+static int   g_vgHealth = 300, g_vgArmour = 100, g_vgBonusEvery = 3, g_vgNoAim = 1;
+static char  g_vgModels[96] = "dsher,csher";
+
+struct VgUnit {
+    bool  on, squad, single, dbNoted;
+    int   car[2], blip[2], ncar, cph[2], tgt[2];                               // cph: 0 dirigindo, 1 a pe, 2 voltando a viatura
+    int   ped[4], weap[4], model[4], pcar[4], seat[4], n;                      // seat -1: motorista
+    int   phase, target, slot;
+    DWORD t0, tCmd, tDB, tFar, tStuck, tResp, tCar[2], tBoard[2];
+};
+struct VgSlot { int state, chase; DWORD coolUntil; };                        // 0 livre, 1 em uso, 2 esperando
+struct VgAssign { int ped, target; DWORD t; bool drive; };
+static VgUnit   g_vu[3];                                                     // 0 e 1: reforco; 2: viatura para o CJ
+static VgSlot   g_vs[2];
+static VgAssign g_va[32];
+static struct {
+    bool active, ignoreSet, inChase; char* script; int chase, nSus, nFreed, freed[16], lastLvl, nNoAim, noAim[128]; WORD ynWas; DWORD tNoSus, tHelp, oneUntil, tCops;
+    bool havePrev, riseUsed; int prevTimer, lastRise, pendLvl, lvlSeen; DWORD tRise, tLvl;   // bonus dobrado (3.40)
+    bool timerNoted; DWORD tTimer;                                                            // nivel 32 sem timer (3.41)
+} g_vg;
+static int g_vgPrevChaos = -1;
+
+typedef void* (__cdecl* GetMIByName_t)(const char*, int*);
+typedef void  (__thiscall* UpdWanted_t)(void*);
+static int ModelByName(const char* name) {
+    if (!name || !*name) return -1;
+    int idx = -1;
+    void* mi = ((GetMIByName_t)0x4C5940)(name, &idx);                         // CModelInfo::GetModelInfo(name, &index)
+    return mi ? idx : -1;
+}
+static bool VgSuspect(const char* p) {
+    return p && Rd<int>(p, 0x598) == 24 && Rd<BYTE>(p, 0x484) == 2 && Rd<float>(p, 0x540) > 0.f;   // MISSION1, script
+}
+static char* VgCarOf(const char* p) { return (p && (Rd<BYTE>(p, 0x46D) & 1)) ? Rd<char*>(p, 0x58C) : nullptr; }
+static float VgSpeed(const char* e) { const float* v = (const float*)(e + 0x44); return sqrtf(v[0] * v[0] + v[1] * v[1]) * 50.f; }
+static bool VgOurs(const char* p) {
+    int r = PedRef(p);
+    for (auto& u : g_vu) if (u.on) for (int i = 0; i < u.n; i++) if (u.ped[i] == r) return true;
+    return false;
+}
+template <class F> static void ForEachPed(F f) {
+    char* pool = *(char**)0xB74490;
+    if (!pool) return;
+    int size = Rd<int>(pool, 8);
+    for (int i = 0; i < size; i++) {
+        if (Rd<BYTE*>(pool, 4)[i] & 0x80) continue;
+        f(Rd<char*>(pool, 0) + i * 0x7C4);
+    }
+}
+static char* VgNearestSuspect(V3 from, float maxD = 1e9f) {
+    char* best = nullptr; float bd = maxD;
+    ForEachPed([&](char* p) { if (VgSuspect(p)) { float d = Dist2(EntityPos(p), from); if (d < bd) { bd = d; best = p; } } });
+    return best;
+}
+static bool CopNear(V3 at, float r) {
+    bool found = false;
+    ForEachPed([&](char* p) { if (!found && Rd<int>(p, 0x598) == 6 && Rd<float>(p, 0x540) > 0.f && Dist2(EntityPos(p), at) < r) found = true; });
+    return found;
+}
+// rua perto do CJ para a viatura nascer: de SpawnMin a SpawnMax, fora da tela; sem isso, mais longe; por fim, na tela
+static bool VgSpawnNode(V3 pp, V3* out, float* hd, const V3* avoid = nullptr) {
+    bool gotOn = false; V3 on = {}; float onHd = 0.f;
+    for (int pass = 0; pass < 2; pass++) {
+        float dmin = pass ? g_vgSpawnMax : g_vgSpawnMin, dmax = pass ? g_vgSpawnMax * 2.f : g_vgSpawnMax;
+        for (int n = 1; n <= 60; n++) {
+            int o[4] = {};
+            Cmd c(0x06F8); c.F(pp.x).F(pp.y).F(pp.z).I(n).Out(0).Out(1).Out(2).Out(3); RunCmd(c, o, 4);
+            V3 q = { AsF(o[0]), AsF(o[1]), AsF(o[2]) };
+            if (q.x == 0.f && q.y == 0.f) continue;
+            float d = Dist2(q, pp);
+            if (d < dmin || d > dmax || fabsf(q.z - pp.z) > 8.f) continue;
+            if (avoid && Dist2(q, *avoid) < 10.f) continue;
+            bool seen = false;
+            { Cmd s2(0x00C2); s2.F(q.x).F(q.y).F(q.z + 1.f).F(4.f); seen = RunCmd(s2); }
+            if (!seen) { *out = q; *hd = AsF(o[3]); return true; }
+            if (!gotOn) { on = q; onHd = AsF(o[3]); gotOn = true; }
+        }
+    }
+    if (gotOn) { *out = on; *hd = onHd; return true; }
+    return false;
+}
+static int g_fcChanceV = 40;
+static int VgPickModel(int zoneCop, int femModel) {
+    static int turn = 0;
+    if (femModel > 0 && (rand() % 100) < g_fcChanceV) return femModel;
+    int list[8]; int n = 0; list[n++] = zoneCop;
+    char buf[96]; strncpy(buf, g_vgModels, sizeof buf - 1); buf[sizeof buf - 1] = 0;
+    for (char* t = strtok(buf, ", ;"); t && n < 8; t = strtok(nullptr, ", ;")) { int m = ModelByName(t); if (m > 0 && m != zoneCop) list[n++] = m; }
+    return list[(turn++) % n];
+}
+static bool VgCarUsable(int ref) {
+    char* car = VehByRef(ref);
+    if (!car) return false;
+    { Cmd c(0x02BF); c.I(ref); if (RunCmd(c)) return false; }                  // na agua
+    { Cmd c(0x01F4); c.I(ref); if (RunCmd(c)) return false; }                  // de rodas para cima
+    int h = 1000; { Cmd c(0x0227); c.I(ref).Out(0); RunCmd(c, &h, 1); }
+    return h > 300;
+}
+// policial do reforco: arma na mao, triplo de vida, colete, sem morte de um tiro so, e a mira do CJ nao trava nele
+static void VgSetupCop(int o, int w) {
+    { Cmd c(0x01B2); c.I(o).I(w).I(9999); RunCmd(c); }
+    { Cmd c(0x01B9); c.I(o).I(w); RunCmd(c); }
+    { Cmd c(0x08AF); c.I(o).I(g_vgHealth); RunCmd(c); }
+    { Cmd c(0x0223); c.I(o).I(g_vgHealth); RunCmd(c); }
+    if (g_vgArmour > 0) { Cmd c(0x035F); c.I(o).I(g_vgArmour); RunCmd(c); }
+    { Cmd c(0x0446); c.I(o).I(0); RunCmd(c); }
+    if (g_vgNoAim) { Cmd c(0x0568); c.I(o).I(1); RunCmd(c); }
+}
+static void VgDropBlips(VgUnit& u) {
+    for (int c = 0; c < 2; c++) if (u.blip[c] >= 0) { Cmd x(0x0164); x.I(u.blip[c]); RunCmd(x); u.blip[c] = -1; }
+}
+static void VgReleaseUnit(VgUnit& u, bool driveOff) {
+    if (!u.on) return;
+    VgDropBlips(u);
+    for (int c = 0; c < u.ncar; c++) {
+        char* car = VehByRef(u.car[c]);
+        if (!car) continue;
+        { Cmd x(0x0397); x.I(u.car[c]).I(0); RunCmd(x); }
+        char* drv = Rd<char*>(car, 0x460);
+        if (driveOff && drv && VgOurs(drv)) {
+            { Cmd x(0x00AD); x.I(u.car[c]).F(15.f); RunCmd(x); }
+            { Cmd x(0x00AE); x.I(u.car[c]).I(0); RunCmd(x); }
+            { Cmd x(0x00A8); x.I(u.car[c]); RunCmd(x); }
+        }
+    }
+    for (int i = 0; i < u.n; i++) if (PedByRef(u.ped[i])) {
+        { Cmd x(0x0568); x.I(u.ped[i]).I(0); RunCmd(x); }
+        { Cmd x(0x01C2); x.I(u.ped[i]); RunCmd(x); }
+    }
+    for (int c = 0; c < u.ncar; c++) if (VehByRef(u.car[c])) { Cmd x(0x01C3); x.I(u.car[c]); RunCmd(x); }
+    u.on = false;
+}
+// cria as viaturas e os policiais de u (u.n, u.model e u.weap ja definidos) perto de 'nearPt'.
+// Viatura de 2 lugares (Police Ranger no interior): vem uma segunda viatura com os outros policiais.
+static bool VgBuild(VgUnit& u, V3 nearPt) {
+    int level = 1;
+    { Cmd c(0x07EF); c.F(nearPt.x).F(nearPt.y).F(nearPt.z).Out(0); RunCmd(c, &level, 1); }
+    static const int kCar[4] = { 599, 596, 597, 598 }, kPed[4] = { 283, 280, 281, 282 };
+    if (level < 0 || level > 3) level = 1;
+    int carM = kCar[level], zoneCop = kPed[level];
+    RequestModel(carM, 2);
+    for (int i = 0; i < u.n; i++) RequestModel(u.model[i], 2);
+    RequestModel(zoneCop, 2);
+    RequestModel(346, 2); RequestModel(348, 2); RequestModel(349, 2); RequestModel(353, 2);   // pistola, Desert Eagle, escopeta, MP5
+    LoadAllRequestedModels(false);
+    for (int i = 0; i < u.n; i++) if (!ModelLoaded(u.model[i])) u.model[i] = zoneCop;
+    if (!ModelLoaded(carM) || !ModelLoaded(zoneCop)) { Log("vigilante: modelos da viatura nao carregaram"); return false; }
+    int nCops = u.n; u.n = 0; u.ncar = 0;
+    int mdl[4], wp[4];
+    memcpy(mdl, u.model, sizeof mdl); memcpy(wp, u.weap, sizeof wp);
+    V3 first = {}; bool haveFirst = false; float firstHd = 0.f;
+    int next = 0;
+    while (next < nCops && u.ncar < 2) {
+        V3 n; float hd = 0.f;
+        if (!VgSpawnNode(nearPt, &n, &hd, haveFirst ? &first : nullptr)) {
+            if (!haveFirst) { Log("vigilante: nao achei rua perto para a viatura"); break; }
+            float r = firstHd * 3.14159265f / 180.f;                           // 3.41: a segunda vem logo atras da primeira
+            n = { first.x + sinf(r) * 9.f, first.y - cosf(r) * 9.f, first.z }; hd = firstHd;
+            Log("vigilante: sem outra rua; a segunda viatura nasce atras da primeira");
+        }
+        int cr = -1;
+        { Cmd c(0x00A5); c.I(carM).F(n.x).F(n.y).F(n.z).Out(0); RunCmd(c, &cr, 1); }
+        char* car = VehByRef(cr);
+        if (!car) break;
+        { Cmd c(0x0175); c.I(cr).F(hd); RunCmd(c); }
+        int maxp = 3;
+        { Cmd c(0x01EA); c.I(cr).Out(0); RunCmd(c, &maxp, 1); }
+        if (maxp < 0) maxp = 0;
+        if (maxp > 3) maxp = 3;
+        int ci = u.ncar++;
+        u.car[ci] = cr; u.cph[ci] = 0; u.tgt[ci] = -1; u.tCar[ci] = 0; u.blip[ci] = -1;
+        for (int s = -1; s < maxp && next < nCops; s++, next++) {
+            int o = -1;
+            if (s < 0) { Cmd c(0x0129); c.I(cr).I(6).I(mdl[next]).Out(0); RunCmd(c, &o, 1); }
+            else       { Cmd c(0x01C8); c.I(cr).I(6).I(mdl[next]).I(s).Out(0); RunCmd(c, &o, 1); }
+            if (!PedByRef(o)) continue;
+            VgSetupCop(o, wp[next]);
+            u.ped[u.n] = o; u.weap[u.n] = wp[next]; u.model[u.n] = mdl[next]; u.pcar[u.n] = ci; u.seat[u.n] = s; u.n++;
+        }
+        { Cmd c(0x0397); c.I(cr).I(1); RunCmd(c); }                           // sirene
+        if (u.squad) {
+            { Cmd c(0x02AC); c.I(cr).I(1).I(0).I(0).I(0).I(0); RunCmd(c); }   // a prova de bala
+            { Cmd c(0x0229); c.I(cr).I(0).I(0); RunCmd(c); }                   // toda preta
+        }
+        { Cmd c(0x0186); c.I(cr).Out(0); RunCmd(c, &u.blip[ci], 1); }
+        if (u.blip[ci] >= 0) { Cmd c(0x0165); c.I(u.blip[ci]).I(2); RunCmd(c); }   // azul
+        if (!haveFirst) { first = n; firstHd = hd; haveFirst = true; }
+        Log("vigilante: viatura %d (%d lugares) nasceu a %.0f m", carM, maxp + 1, Dist2(n, nearPt));
+    }
+    { Cmd c(0x0249); c.I(carM); RunCmd(c); }
+    for (int i = 0; i < 4; i++) { Cmd c(0x0249); c.I(mdl[i]); RunCmd(c); }
+    if (!u.n) {
+        for (int c = 0; c < u.ncar; c++) { Cmd x(0x00A6); x.I(u.car[c]); RunCmd(x); }
+        VgDropBlips(u); u.ncar = 0;
+        return false;
+    }
+    return true;
+}
+static bool VgSpawn(VgUnit& u, int nCops, bool squad, bool single) {
+    char* me = PlayerPed();
+    if (!me) return false;
+    V3 pp = EntityPos(me);
+    int level = 1;
+    { Cmd c(0x07EF); c.F(pp.x).F(pp.y).F(pp.z).Out(0); RunCmd(c, &level, 1); }
+    static const int kPed[4] = { 283, 280, 281, 282 };
+    int zoneCop = kPed[(level < 0 || level > 3) ? 1 : level];
+    int fem = FemCopModel((level < 0 || level > 3) ? 1 : level);              // policial feminina da regiao (3.41)
+    static int femNoted = 0;
+    if (femNoted != fem) { femNoted = fem; Log("vigilante: policial feminina da regiao %s", fem > 0 ? "no revezamento" : "nao existe neste jogo; fica so o revezamento"); }
+    memset(&u, 0, sizeof u); u.blip[0] = u.blip[1] = -1; u.target = -1;
+    u.squad = squad; u.single = single; u.n = nCops;
+    // pesado: todos de MP5. Normal: motorista de pistola, carona da frente de escopeta, os de tras sorteados
+    static const int kRear[4] = { 29, 25, 22, 24 };                           // MP5, escopeta, pistola, Desert Eagle
+    for (int i = 0; i < nCops; i++) {
+        u.model[i] = VgPickModel(zoneCop, fem);
+        u.weap[i] = squad ? 29 : single ? 22 : i == 0 ? 22 : i == 1 ? 25 : kRear[rand() % 4];
+    }
+    if (!VgBuild(u, pp)) return false;
+    u.on = true; u.t0 = u.tCmd = GameMs(); u.phase = 0;
+    char ml[80]; int o = 0; ml[0] = 0;
+    for (int i = 0; i < u.n; i++) o += snprintf(ml + o, sizeof ml - o, "%s%d/%d", i ? "," : "", u.model[i], u.weap[i]);
+    Log("vigilante: %s com %d policiais em %d viatura(s) (modelo/arma %s%s)", single ? "viatura para voce" : squad ? "reforco pesado" : "reforco",
+        u.n, u.ncar, ml, squad ? ", viatura preta a prova de bala" : "");
+    return true;
+}
+// sempre de arma na mao: o policial recebe a arma (se nao tiver) e ela vira a atual antes de cada ordem de atacar
+static void VgArm(int ped, int w) {
+    { Cmd c(0x01B2); c.I(ped).I(w).I(200); RunCmd(c); }
+    { Cmd c(0x01B9); c.I(ped).I(w); RunCmd(c); }
+}
+static void VgKill(int ped, int target, int w = 22) { VgArm(ped, w); Cmd c(0x05E2); c.I(ped).I(target); RunCmd(c); }
+static bool VgAlive(int ref) { char* p = PedByRef(ref); return p && Rd<float>(p, 0x540) > 0.f; }
+// reforco perdido (longe dos suspeitos, preso, na agua, sem viatura): some e volta perto do suspeito, nas viaturas
+static void VgRespawn(VgUnit& u, V3 nearPt, const char* why) {
+    VgUnit nu = u;
+    int k = 0;
+    for (int i = 0; i < u.n; i++) if (VgAlive(u.ped[i])) { nu.model[k] = u.model[i]; nu.weap[k] = u.weap[i]; k++; }
+    VgDropBlips(u);
+    for (int i = 0; i < u.n; i++) if (PedByRef(u.ped[i])) { Cmd x(0x009B); x.I(u.ped[i]); RunCmd(x); }
+    for (int c = 0; c < u.ncar; c++) if (VehByRef(u.car[c])) { Cmd x(0x00A6); x.I(u.car[c]); RunCmd(x); }
+    nu.n = k; nu.dbNoted = false;
+    if (!k || !VgBuild(nu, nearPt)) { u.on = false; Log("vigilante: reforco perdido (%s) e nao deu para trazer de volta", why); return; }
+    DWORD now = GameMs();
+    nu.on = true; nu.tResp = now; nu.tFar = 0; nu.tStuck = 0; nu.t0 = now;
+    u = nu;
+    Log("vigilante: reforco perdido (%s); %d policiais voltaram em %d viatura(s) perto do suspeito", why, u.n, u.ncar);
+}
+static void VgSingleTick(VgUnit& u, V3 pp, DWORD now) {
+    char* car = VehByRef(u.car[0]);
+    if (!car) { VgReleaseUnit(u, false); return; }
+    char* drv = u.n ? PedByRef(u.ped[0]) : nullptr;
+    bool drvIn = drv && Rd<float>(drv, 0x540) > 0.f && VgCarOf(drv) == car;
+    float d = Dist2(EntityPos(car), pp);
+    if (u.phase == 0) {
+        if (!drvIn) { u.phase = 2; return; }
+        if (d < 14.f) { Cmd c(0x00AD); c.I(u.car[0]).F(0.f); RunCmd(c); u.phase = 1; u.tCmd = now; return; }
+        if (now - u.tCmd > 2000 || u.tCmd == u.t0) {
+            u.tCmd = now;
+            { Cmd c(0x00AD); c.I(u.car[0]).F(25.f); RunCmd(c); }
+            { Cmd c(0x00AE); c.I(u.car[0]).I(2); RunCmd(c); }
+            { Cmd c(0x00A7); c.I(u.car[0]).F(pp.x).F(pp.y).F(pp.z); RunCmd(c); }
+        }
+    } else if (u.phase == 1) {
+        if (VgSpeed(car) < 1.f || now - u.tCmd > 4000) {
+            { Cmd c(0x0397); c.I(u.car[0]).I(0); RunCmd(c); }
+            { Cmd c(0x020A); c.I(u.car[0]).I(1); RunCmd(c); }                // destrancada
+            if (drv) { Cmd c(0x0633); c.I(u.ped[0]); RunCmd(c); }
+            u.phase = 2; u.tCmd = now;
+            Log("vigilante: a viatura para voce chegou a %.0f m; o policial desce", d);
+        }
+    } else if (u.phase == 2) {
+        if (drv && !VgCarOf(drv) && now - u.tCmd > 500) {
+            { Cmd c(0x05DE); c.I(u.ped[0]); RunCmd(c); }                       // anda pela rua
+            { Cmd c(0x01C2); c.I(u.ped[0]); RunCmd(c); }
+            u.n = 0; u.phase = 3;
+        } else if (!drv) { u.n = 0; u.phase = 3; }
+    }
+    if (u.phase == 3 && (PlayerVehicle() == car || d > 150.f)) {
+        VgDropBlips(u);
+        { Cmd c(0x01C3); c.I(u.car[0]); RunCmd(c); }
+        u.on = false;
+        Log("vigilante: viatura entregue (%s)", PlayerVehicle() == car ? "voce entrou" : "voce se afastou");
+    }
+}
+static void VgUnitTick(VgUnit& u, V3 pp, DWORD now) {
+    if (!u.on) return;
+    if (u.single) { VgSingleTick(u, pp, now); return; }
+    int alive = 0; V3 at = {};
+    for (int i = 0; i < u.n; i++) if (VgAlive(u.ped[i])) { if (!alive) at = EntityPos(PedByRef(u.ped[i])); alive++; }
+    if (!alive) { VgReleaseUnit(u, false); return; }
+    char* t = VgNearestSuspect(at);
+    if (!t) return;                                                          // espera a proxima leva
+    int tr = PedRef(t);
+    char* tcar = VgCarOf(t);
+    V3 tp = EntityPos(t);
+    float dU = 1e9f, dJ = 1e9f;                                               // policial mais perto do suspeito / do CJ
+    for (int i = 0; i < u.n; i++) if (VgAlive(u.ped[i])) {
+        V3 q = EntityPos(PedByRef(u.ped[i]));
+        float a = Dist2(q, tp), b = Dist2(q, pp);
+        if (a < dU) dU = a;
+        if (b < dJ) dJ = b;
+    }
+    bool anyUsable = false, stuck = false;
+    for (int c = 0; c < u.ncar; c++) {
+        char* car = VehByRef(u.car[c]);
+        bool usable = VgCarUsable(u.car[c]);
+        if (usable) anyUsable = true;
+        int di = -1, members = 0;
+        for (int i = 0; i < u.n; i++) if (u.pcar[i] == c && VgAlive(u.ped[i])) { members++; if (u.seat[i] < 0) di = i; }
+        if (!members) continue;
+        if (di < 0) {                                                        // motorista morreu: outro da viatura assume
+            for (int i = 0; i < u.n; i++) if (u.pcar[i] == c && VgAlive(u.ped[i])) { u.seat[i] = -1; di = i; break; }
+        }
+        char* drv = PedByRef(u.ped[di]);
+        bool drvIn = usable && VgCarOf(drv) == car;
+        V3 cpos = car ? EntityPos(car) : EntityPos(drv);
+        float d = Dist2(cpos, tp);
+        if (u.cph[c] == 0) {
+            if (!drvIn) { u.cph[c] = 1; u.tCar[c] = 0; continue; }
+            if (VgSpeed(car) < 1.f && d > 30.f) { if (!u.tStuck) u.tStuck = now; else if (now - u.tStuck > 8000) stuck = true; }
+            else u.tStuck = 0;
+            // caronas atiram de dentro da viatura (o motorista so dirige), cada um com a propria arma
+            if (d < 60.f && now - u.tDB > 3000) {
+                int shooting = 0;
+                for (int i = 0; i < u.n; i++) {
+                    if (u.pcar[i] != c || u.seat[i] < 0 || !VgAlive(u.ped[i]) || VgCarOf(PedByRef(u.ped[i])) != car) continue;
+                    VgArm(u.ped[i], u.weap[i] ? u.weap[i] : 22);
+                    Cmd x(0x0713); x.I(u.ped[i]).I(tr).I(-1).F(0.f).F(0.f).F(0.f).F(60.f).I(8).I(u.seat[i] == 1 ? 0 : 1).I(60); RunCmd(x);
+                    shooting++;
+                }
+                if (shooting && !u.dbNoted) { u.dbNoted = true; Log("vigilante: %d policiais atirando de dentro da viatura (%.0f m do suspeito)", shooting, d); }
+            }
+            bool arrive = d < (tcar ? 18.f : 25.f) && (!tcar || VgSpeed(tcar) < 4.f);
+            if (arrive) { u.cph[c] = 1; u.tCar[c] = 0; Log("vigilante: reforco chegou (%.0f m do suspeito); policiais descem", d); continue; }
+            if (tr != u.tgt[c] || now - u.tCar[c] > 2500) {
+                u.tgt[c] = tr; u.tCar[c] = now;
+                if (tcar) { Cmd x(0x06E1); x.I(u.ped[di]).I(u.car[c]).I(VehRef(tcar)).I(15).F(40.f).I(2); RunCmd(x); }
+                else {
+                    { Cmd x(0x00AD); x.I(u.car[c]).F(35.f); RunCmd(x); }
+                    { Cmd x(0x00AE); x.I(u.car[c]).I(2); RunCmd(x); }
+                    { Cmd x(0x00A7); x.I(u.car[c]).F(tp.x).F(tp.y).F(tp.z); RunCmd(x); }
+                }
+            }
+        } else if (u.cph[c] == 1) {
+            // a pe; se o suspeito fugiu de carro e a viatura esta inteira e perto, todos voltam para ela
+            float nearPt = car ? Dist2(EntityPos(drv), cpos) : 1e9f;
+            if (tcar && d > 50.f && usable && nearPt < 45.f) {
+                for (int i = 0; i < u.n; i++) {
+                    if (u.pcar[i] != c || !VgAlive(u.ped[i])) continue;
+                    if (u.seat[i] < 0) { Cmd x(0x05CB); x.I(u.ped[i]).I(u.car[c]).I(15000); RunCmd(x); }
+                    else { Cmd x(0x05CA); x.I(u.ped[i]).I(u.car[c]).I(15000).I(u.seat[i]); RunCmd(x); }
+                }
+                u.cph[c] = 2; u.tBoard[c] = now;
+                Log("vigilante: suspeito fugiu de carro (%.0f m); policiais voltam para a viatura", d);
+                continue;
+            }
+            if (now - u.tCar[c] > 3000 || tr != u.tgt[c]) {
+                u.tCar[c] = now; u.tgt[c] = tr;
+                for (int i = 0; i < u.n; i++) {
+                    if (u.pcar[i] != c || !VgAlive(u.ped[i])) continue;
+                    char* pt = VgNearestSuspect(EntityPos(PedByRef(u.ped[i])));
+                    if (pt) VgKill(u.ped[i], PedRef(pt), u.weap[i] ? u.weap[i] : 22);
+                }
+            }
+        } else if (u.cph[c] == 2) {
+            bool allIn = true;
+            for (int i = 0; i < u.n; i++) if (u.pcar[i] == c && VgAlive(u.ped[i]) && VgCarOf(PedByRef(u.ped[i])) != car) allIn = false;
+            if (drvIn && (allIn || now - u.tBoard[c] > 10000)) { u.cph[c] = 0; u.tgt[c] = -1; u.tDB = 0; }
+            else if (now - u.tBoard[c] > 20000 || !usable) { u.cph[c] = 1; u.tCar[c] = 0; }
+        }
+    }
+    if (u.ncar) u.tDB = (now - u.tDB > 3000) ? now : u.tDB;
+    // perdido: longe do suspeito, preso, ou a pe sem viatura e o suspeito fugindo de carro; volta se o CJ estiver longe
+    const char* why = nullptr;
+    if (dU > 120.f) why = "longe do suspeito";
+    else if (stuck) why = "viatura presa";
+    else if (!anyUsable && tcar && dU > 50.f) why = "sem viatura e o suspeito fugindo de carro";
+    if (!why) { u.tFar = 0; return; }
+    if (!u.tFar) u.tFar = now;
+    if (now - u.tFar > 5000 && dJ > 80.f && now - u.tResp > 15000) VgRespawn(u, tp, why);
+}
+// policiais da rua: matam o suspeito mais perto (ou perseguem o carro dele, se estao dirigindo)
+static char* TgNearest(V3 from, float maxD, bool attackers);
+static void VgStreetCops(DWORD now, bool targets = false) {
+    int issued = 0;
+    ForEachPed([&](char* p) {
+        if (issued >= 6 || Rd<int>(p, 0x598) != 6 || Rd<float>(p, 0x540) <= 0.f || Rd<BYTE>(p, 0x484) != 1 || VgOurs(p)) return;
+        V3 cp = EntityPos(p);
+        char* t = targets ? TgNearest(cp, g_vgHelpR, false) : VgNearestSuspect(cp, g_vgHelpR);
+        if (!t) return;
+        int pr = PedRef(p), tr = PedRef(t);
+        VgAssign* a = nullptr;
+        for (auto& x : g_va) if (x.ped == pr && x.ped) { a = &x; break; }
+        char* mycar = VgCarOf(p); char* tcar = VgCarOf(t);
+        bool drive = mycar && tcar && Rd<char*>(mycar, 0x460) == p;
+        // dirigindo, a ordem e renovada a cada 2 s: se a viatura bate num civil, o jogo poe o policial atras dele
+        if (a && a->target == tr && a->drive == drive && now - a->t < (drive ? 2000u : 6000u)) return;
+        if (!a) { for (auto& x : g_va) if (!x.ped || !PedByRef(x.ped) || now - x.t > 30000) { a = &x; break; } }
+        if (!a) return;
+        if (drive) {
+            int cr = VehRef(mycar);
+            { Cmd c(0x0397); c.I(cr).I(1); RunCmd(c); }                         // sirene
+            { Cmd c(0x06E1); c.I(pr).I(cr).I(VehRef(tcar)).I(15).F(40.f).I(2); RunCmd(c); }
+        } else VgKill(pr, tr, 22);                                           // a pe: sempre pistola
+        if (!a->ped || a->ped != pr) issued++;
+        a->ped = pr; a->target = tr; a->t = now; a->drive = drive;
+    });
+    if (issued) Log("vigilante: %d policiais da rua foram atras %s", issued, targets ? "dos seus alvos" : "dos suspeitos");
+}
+static int VgPatchGrace(char* ms) {
+    BYTE* base = Rd<BYTE*>(ms, 0x10);                                         // m_pBaseIP: inicio do codigo da missao
+    if (!base) return 0;
+    static const BYTE A[] = { 0x18, 0x00, 0x02, 0x78, 0x80, 0x01, 0x60, 0xEA, 0x00, 0x00 };   // $8222 > 60000
+    static const BYTE B[] = { 0x06, 0x00, 0x03, 0x38, 0x00, 0x01, 0x60, 0xEA, 0x00, 0x00 };   // 56@ = 60000
+    int v = g_vgOutSec * 1000, n = 0;
+    for (int i = 0; i < 0x6000; i++)
+        if (!memcmp(base + i, A, sizeof A) || !memcmp(base + i, B, sizeof B)) { memcpy(base + i + 6, &v, 4); n++; i += 9; }
+    return n;
+}
+// nivel 64: o codigo da missao carregada passa a aceitar qualquer veiculo e a pe. Nos dois pontos que guardam o
+// carro do CJ (13987, 19017), IS_CHAR_IN_ANY_POLICE_VEHICLE $3 vira IS_CHAR_IN_ANY_CAR $3; nos dois que contam o
+// tempo fora da viatura (14332, 18674), NOT IS_CHAR_IN_ANY_POLICE_VEHICLE $3 vira NOT IS_PLAYER_PLAYING $2 (falso).
+static int VgPatch64(char* ms) {
+    BYTE* base = Rd<BYTE*>(ms, 0x10);
+    if (!base) return 0;
+    static const BYTE pos[5] = { 0x6C, 0x05, 0x02, 0x0C, 0x00 }, neg[5] = { 0x6C, 0x85, 0x02, 0x0C, 0x00 };
+    static const BYTE anyCar[5] = { 0xDF, 0x00, 0x02, 0x0C, 0x00 }, notPlaying[5] = { 0x56, 0x82, 0x02, 0x08, 0x00 };
+    static const int kPos[2] = { 13987, 19017 }, kNeg[2] = { 14332, 18674 };
+    int n = 0;
+    for (int i = 0; i < 2; i++) {
+        if (!memcmp(base + kPos[i], pos, 5)) { memcpy(base + kPos[i], anyCar, 5); n++; }
+        if (!memcmp(base + kNeg[i], neg, 5)) { memcpy(base + kNeg[i], notPlaying, 5); n++; }
+    }
+    return n;
+}
+static bool VigActiveNow() { return g_vg.active; }
+static bool ArmLegalNow() { int L = VigLevel(); return L >= 64 || (L >= 12 && g_vg.active); }
+static bool Vg32() { return VigLevel() >= 32; }                                // nivel 32: reforco sem espera (3.43)
+static void VgChaseEnd(DWORD now, const char* why) {
+    for (int s = 0; s < 2; s++) if (g_vs[s].state == 1) {
+        g_vs[s].state = 2; g_vs[s].coolUntil = now + (Vg32() ? 0 : (DWORD)(g_vgCool * 1000.f));
+        VgReleaseUnit(g_vu[s], true);
+    }
+    g_vg.inChase = false; g_vg.nFreed = 0;
+    Log("vigilante: fim da perseguicao (%s)", why);
+}
+static void VgStop() {
+    DWORD now = GameMs();
+    VgChaseEnd(now, "missao acabou");
+    VgReleaseUnit(g_vu[2], false);
+    if (g_vg.ignoreSet) { Cmd c(0x01F7); c.I(0).I(0); RunCmd(c); }
+    for (int i = 0; i < g_vg.nNoAim; i++) if (PedByRef(g_vg.noAim[i])) { Cmd c(0x0568); c.I(g_vg.noAim[i]).I(0); RunCmd(c); }
+    g_vigYN = false;
+    memset(&g_va, 0, sizeof g_va);
+    bool keep = true; DWORD ou = g_vg.oneUntil; (void)keep;
+    memset(&g_vg, 0, sizeof g_vg); g_vg.oneUntil = ou;
+    Log("vigilante: missao terminou");
+}
+static int VgSlotFree(DWORD now) {
+    if (Vg32()) {                                                             // vaga livre = viatura que nao esta mais com voce
+        for (int s = 0; s < 2; s++) if (g_vs[s].state != 1 || !g_vu[s].on) return s;
+        return -1;
+    }
+    DWORD maxWait = (DWORD)(g_vgCool * 1000.f) + 5000;
+    for (int s = 0; s < 2; s++) {
+        if (g_vs[s].state == 2 && (DWORD)(g_vs[s].coolUntil - now) > maxWait && (int)(now - g_vs[s].coolUntil) < 0)
+            g_vs[s].state = 0;                                                // o relogio do jogo voltou (jogo carregado)
+        if (g_vs[s].state == 0 || (g_vs[s].state == 2 && (int)(now - g_vs[s].coolUntil) >= 0)) return s;
+    }
+    return -1;
+}
+// reforco: 2 vagas. Ate o nivel 31: so na perseguicao, a vaga fica em uso ate a perseguicao acabar e depois espera
+// Cooldown s; a 2a viatura da mesma perseguicao e a pesada. Nivel 32+: a qualquer hora no Vigilante, sem espera,
+// ate 2 viaturas com voce; com uma ja com voce, a outra vem sempre pesada (4 de MP5, preta e blindada).
+static bool VgBackupReady(DWORD now) { return g_vg.active && (g_vg.inChase || Vg32()) && VgSlotFree(now) >= 0; }
+static void VgOneClockFix(DWORD now) {
+    if (g_vg.oneUntil && (DWORD)(g_vg.oneUntil - now) > (DWORD)(g_vgOneCool * 1000.f) + 5000 && (int)(now - g_vg.oneUntil) < 0) g_vg.oneUntil = 0;
+}
+static bool VgCarReady(DWORD now) { return g_vg.active && !g_vu[2].on && !((int)(now - g_vg.oneUntil) < 0 && g_vg.oneUntil); }
+static void VgCallBackup(DWORD now) {
+    bool lvl32 = Vg32();
+    if (!g_vg.inChase && !lvl32) { GarHelp("Sem suspeitos agora. O reforco vem quando houver perseguicao."); return; }
+    int s = VgSlotFree(now);
+    if (s < 0) {
+        DWORD w = 0xFFFFFFFF; bool busy = false;
+        for (auto& x : g_vs) { if (x.state == 1) busy = true; else if (x.state == 2) { DWORD r = x.coolUntil - now; if (r < w) w = r; } }
+        if (lvl32 || w == 0xFFFFFFFF) GarHelp(busy ? "As duas viaturas de reforco ja estao com voce." : "Reforco indisponivel.");
+        else GarHelp("Reforco indisponivel. Proxima viatura em %u s.", (unsigned)((w + 999) / 1000));
+        return;
+    }
+    bool second = lvl32 ? (g_vs[1 - s].state == 1 && g_vu[1 - s].on)
+                        : (g_vs[1 - s].state == 1 && g_vs[1 - s].chase == g_vg.chase);
+    VgReleaseUnit(g_vu[s], true);
+    if (VgSpawn(g_vu[s], 4, second, false)) {
+        g_vu[s].slot = s; g_vs[s].state = 1; g_vs[s].chase = g_vg.chase;
+        GarHelp(second ? "Reforco pesado a caminho: 4 policiais com MP5, viatura blindada." : "Reforco a caminho: 4 policiais.");
+    } else GarHelp("Nao deu para mandar a viatura agora. Tente de novo.");
+}
+static void VgCallCar(DWORD now) {
+    VgOneClockFix(now);
+    if (g_vu[2].on) GarHelp("A sua viatura ja esta a caminho.");
+    else if ((int)(now - g_vg.oneUntil) < 0 && g_vg.oneUntil) GarHelp("Viatura nova em %u s.", (unsigned)((g_vg.oneUntil - now + 999) / 1000));
+    else if (VgSpawn(g_vu[2], 1, false, true)) { g_vg.oneUntil = now + (DWORD)(g_vgOneCool * 1000.f); GarHelp("Uma viatura esta vindo para voce."); }
+    else GarHelp("Nao deu para mandar a viatura agora. Tente de novo.");
+}
+static void VgCmdBackup() { if (g_vg.active) VgCallBackup(GameMs()); }
+static void VgCmdCar() { if (g_vg.active) VgCallCar(GameMs()); }
+static void VigTick() {
+    if (!g_vgOn) return;
+    char* ms = MissionScript();
+    bool vig = ms && !_strnicmp(ms + 8, "copcar", 7);
+    if (!vig) { if (g_vg.active) VgStop(); return; }
+    char* me = PlayerPed();
+    if (!me) return;
+    DWORD now = GameMs();
+    if (!g_vg.active || g_vg.script != ms) {
+        DWORD ou = g_vg.oneUntil;
+        memset(&g_vg, 0, sizeof g_vg); g_vg.oneUntil = ou;
+        g_vg.active = true; g_vg.script = ms; g_vg.ynWas = 0xFFFF;
+        int n = g_vgOutSec > 0 ? VgPatchGrace(ms) : 0;
+        int lvl = VigLevel();
+        if (lvl >= 64) { int k = VgPatch64(ms); Log("vigilante: nivel %d: qualquer veiculo e a pe (%d de 4 pontos do script)", lvl, k); }
+        if (g_vgNoChase) { Cmd c(0x01F7); c.I(0).I(1); RunCmd(c); g_vg.ignoreSet = true; }
+        RequestModel(346, 2); RequestModel(349, 2); LoadAllRequestedModels(false);   // pistola e escopeta dos policiais
+        Log("vigilante: missao comecou (policia %s, fora da viatura %d s em %d de 4 pontos do script)",
+            g_vgNoChase ? "ignora voce" : "normal", g_vgOutSec, n);
+        if (NewButtons()) GarHelp("Vigilante: o botao Reforco chama a policia e o Viatura traz uma viatura para voce.");
+        else GarHelp("Vigilante: Sim chama reforco, Nao chama uma viatura para voce.");
+    }
+    g_vigYN = true;
+    if (g_vgNoChase) {
+        char* w = *(char**)0xB7CD9C;                                          // CWanted do jogador
+        if (w && Rd<int>(w, 0x2C) > 0) { Cmd c(0x0110); c.I(0); RunCmd(c); }   // CLEAR_WANTED_LEVEL
+    }
+    // suspeitos e perseguicao
+    int nSus = 0;
+    ForEachPed([&](char* p) { if (VgSuspect(p)) nSus++; });
+    if (nSus > 0 && !g_vg.inChase) { g_vg.inChase = true; g_vg.chase++; Log("vigilante: perseguicao %d (%d suspeitos)", g_vg.chase, nSus); }
+    if (g_vg.inChase && nSus == 0) {
+        if (!g_vg.tNoSus) g_vg.tNoSus = now;
+        else if (now - g_vg.tNoSus > 2500) { VgChaseEnd(now, "suspeitos mortos"); g_vg.tNoSus = 0; }
+    } else g_vg.tNoSus = 0;
+    g_vg.nSus = nSus;
+    // Sim / Nao (overlay ate o 3.6; no 3.7 sao os botoes Reforco e Viatura, comandos 6 e 7)
+    WORD raw = NewButtons() ? 0 : g_vigRaw;
+    WORD pressed = raw & ~g_vg.ynWas;
+    g_vg.ynWas = raw;
+    if ((pressed & DPAD_RIGHT) && !g_rcYN) VgCallBackup(now);                // Sim: reforco (o recrutar tem a vez)
+    if (pressed & DPAD_LEFT) VgCallCar(now);                                 // Nao: viatura para o CJ
+    V3 pp = EntityPos(me);
+    for (auto& u : g_vu) VgUnitTick(u, pp, now);
+    if (g_vg.inChase && now - g_vg.tCops > 1000) {
+        g_vg.tCops = now;
+        // o script marca cada suspeito com SET_CHAR_ONLY_DAMAGED_BY_PLAYER (so o CJ fere): a policia atirava e nao
+        // fazia dano. Aqui a marca sai; a missao conta o suspeito morto (IS_CHAR_DEAD) seja quem for que matou.
+        int freed = 0;
+        ForEachPed([&](char* p) {
+            if (!VgSuspect(p)) return;
+            int r = PedRef(p);
+            for (int i = 0; i < g_vg.nFreed; i++) if (g_vg.freed[i] == r) return;
+            { Cmd c(0x02A9); c.I(r).I(0); RunCmd(c); }
+            if (g_vg.nFreed < 16) g_vg.freed[g_vg.nFreed++] = r;
+            freed++;
+        });
+        if (freed) Log("vigilante: %d suspeitos agora levam dano da policia tambem", freed);
+        if (g_vgHelpOn) VgStreetCops(now);
+        // a mira automatica do CJ nao trava em policial durante o Vigilante (SET_CHAR_NEVER_TARGETTED; desfeito no fim)
+        if (g_vgNoAim) ForEachPed([&](char* p) {
+            if (g_vg.nNoAim >= 128 || Rd<int>(p, 0x598) != 6 || Rd<float>(p, 0x540) <= 0.f || VgOurs(p) || RcIsRecruit(p)) return;
+            int r = PedRef(p);
+            for (int i = 0; i < g_vg.nNoAim; i++) if (g_vg.noAim[i] == r) return;
+            { Cmd c(0x0568); c.I(r).I(1); RunCmd(c); }
+            g_vg.noAim[g_vg.nNoAim++] = r;
+        });
+    }
+    // bonus de tempo dobrado a cada BonusEvery niveis (3.40): o mod mede quanto o timer $8222 (ms) subiu na troca de
+    // nivel ($8227) e soma o mesmo tanto de novo. O timer so desce sozinho; subida e o bonus que o script deu. Vale a
+    // subida de ate 6 s antes a 10 s depois da troca. (Ate a 3.39 lia o bonus em 63@, com teto de 60 s; nos niveis 3, 6 e 9
+    // nao dobrava.)
+    // nivel 32: sem timer. O relogio sai da tela (CLEAR_ONSCREEN_TIMER $8222); sem ele o jogo nao desconta o tempo.
+    // O valor fica em 1 h para a conta do tempo fora da viatura (min($8222, OutOfCarSeconds)) continuar igual.
+    bool noTimer = VigLevel() >= 32;
+    if (noTimer) {
+        volatile int* timer = (volatile int*)(0xA49960 + 8222 * 4);
+        if (*timer != -100) {
+            if (now - g_vg.tTimer >= 500 || now < g_vg.tTimer) { g_vg.tTimer = now; Cmd c(0x014F); c.G(8222); RunCmd(c); }
+            if (*timer < 3600000) {
+                if (!g_vg.timerNoted) { g_vg.timerNoted = true; Log("vigilante: nivel %d, missao sem timer", VigLevel()); }
+                *timer = 3600000;
+            }
+        }
+    }
+    if (g_vgBonusEvery > 0 && !noTimer) {
+        volatile int* lvlVar = (volatile int*)(0xA49960 + 8227 * 4);
+        volatile int* timer  = (volatile int*)(0xA49960 + 8222 * 4);
+        int lvl = *lvlVar, t = *timer;
+        int l63 = *(volatile int*)(0xA48960 + 63 * 4);
+        if (g_vg.havePrev) {
+            int rise = t - g_vg.prevTimer;
+            if (rise > 500 && rise <= 600000) {
+                g_vg.lastRise = rise; g_vg.tRise = now; g_vg.riseUsed = false;
+                Log("vigilante: o timer subiu +%d s (nivel %d, 63@=%d)", (rise + 500) / 1000, lvl, l63);
+            }
+        }
+        g_vg.prevTimer = t; g_vg.havePrev = true;
+        if (!g_vg.lastLvl) g_vg.lastLvl = lvl;
+        else if (lvl > g_vg.lastLvl) {
+            g_vg.lastLvl = lvl; g_vg.lvlSeen = lvl; g_vg.tLvl = now;
+            g_vg.pendLvl = (lvl % g_vgBonusEvery == 0) ? lvl : 0;
+        } else if (lvl < g_vg.lastLvl) { g_vg.lastLvl = lvl; g_vg.pendLvl = 0; }
+        if (g_vg.pendLvl) {
+            if (!g_vg.riseUsed && g_vg.tRise && (int)(g_vg.tRise - g_vg.tLvl) > -6000 && t > 0) {
+                int add = g_vg.lastRise;
+                *timer = t + add;
+                g_vg.prevTimer = t + add; g_vg.riseUsed = true;
+                int sec = (add + 500) / 1000;
+                GarHelp("Nivel %d: bonus de tempo dobrado, +%d s a mais.", g_vg.pendLvl, sec);
+                Log("vigilante: nivel %d, o jogo deu +%d s e o bonus foi dobrado (+%d s; 63@=%d)", g_vg.pendLvl, sec, sec, l63);
+                g_vg.pendLvl = 0;
+            } else if (now - g_vg.tLvl > 10000) {
+                Log("vigilante: nivel %d, o timer nao subiu ate 10 s depois da troca (timer %d s, 63@=%d); bonus nao dobrado",
+                    g_vg.pendLvl, t / 1000, l63);
+                g_vg.pendLvl = 0;
+            }
+        }
+    }
+}
+// depois do nivel 12: o nivel de procurado cai mais rapido, ate MaxStars estrelas
+static void WantedPerkTick() {
+    char* w = *(char**)0xB7CD9C;
+    if (!g_vgPerk || !w) { g_vgPrevChaos = -1; return; }
+    int chaos = Rd<int>(w, 0);
+    int stat = VigLevel();                                                    // maior nivel do Vigilante
+    if (stat < 12 || g_vg.active || g_vgPrevChaos < 0 || chaos >= g_vgPrevChaos) { g_vgPrevChaos = chaos; return; }
+    int drop = g_vgPrevChaos - chaos, prev = g_vgPrevChaos;
+    g_vgPrevChaos = chaos;
+    if (drop > 4) return;                                                    // nao foi o jogo baixando (script, suborno...)
+    static const int T[] = { 0, 50, 180, 550, 1200, 2400 };
+    int lvl = 0; while (lvl < 5 && prev >= T[lvl + 1]) lvl++;
+    if (lvl < 1 || lvl > g_vgMaxStars || lvl > 4) return;
+    char* me = PlayerPed();
+    if (!me || CopNear(EntityPos(me), g_vgCopR)) return;
+    float span = (float)(T[lvl + 1] - T[lvl]);
+    if (lvl == 1) span = 130.f;
+    float secs = stat >= 64 ? g_vgStar64 : g_vgStarSec;                       // nivel 64: 4x a velocidade do jogo
+    float mult = span / (secs > 1.f ? secs : 1.f);
+    int extra = (int)(drop * (mult - 1.f) + 0.5f);
+    if (extra <= 0) return;
+    int nc = chaos - extra; if (nc < 0) nc = 0;
+    *(volatile int*)w = nc;
+    ((UpdWanted_t)0x561C90)(w);                                               // CWanted::UpdateWantedLevel
+    g_vgPrevChaos = nc;
+    static DWORD tLog = 0; DWORD t = GetTickCount();
+    if (t - tLog > 10000) { tLog = t; Log("procurado: caindo mais rapido (%d estrelas, caos %d -> %d)", lvl, chaos, nc); }
+}
+// ---------------------------------------------------------------- recompensas do Vigilante (3.41)
+// Nivel = estatistica 157 (maior nivel do Vigilante completado) ou [Vigilante] TestLevel, para testar.
+//  12+: mirar num policial sem estar procurado nao da nada (CEventGunAimedAt::AffectsPed 0x4B4EE0 e o crime de
+//       mirar); mira travada num policial da rua + Sim recruta ele (1); no Vigilante o telefone liga para o
+//       armeiro da policia (gratis, Enforcer com um SWAT, a policia nao liga).
+//  21+: alarme de carro roubado perto da policia, viatura roubada e batida em viatura nao dao estrela; ate 3
+//       recrutas, com Desert Eagle, doze de combate ou M4.
+//  32+: Vigilante sem timer: o relogio sai da tela (sem ele o jogo nao desconta o tempo) e o tempo fica alto.
+//  64+: Vigilante a qualquer hora: a pe pelo telefone, em qualquer veiculo pelo botao de submissao (o codigo da
+//       missao carregada passa a aceitar qualquer veiculo e a pe); armeiro sempre; a policia ignora qualquer
+//       crime (estrela so por script de missao) e vai atras dos seus alvos; estrelas caem 4x mais rapido ate a
+//       4a; quem traz o carro da garagem e uma policial da regiao.
+// Crimes: CCrime::ReportCrime 0x532010, CWanted::RegisterCrime 0x562410 e RegisterCrime_Immediately 0x562430 com
+// filtro por tipo; e as chamadas de SetWantedLevelNoDrop que nao passam por eles (alarme 0x66B285/0x6AE0C3,
+// viatura roubada 0x66B2EE/0x4BB7D9, batida 0x6A7A54/0x6B90AD, tiro em viatura 0x6D82A4). Zona restrita
+// (CCullZones, Area 69) e estrela dada por script ficam como no jogo.
+static int   g_vgTestLevel = 0, g_rcOn = 1, g_rcMax12 = 1, g_rcMax21 = 3, g_vg64Help = 1;
+static int VigLevel() {
+    if (g_vgTestLevel > 0) return g_vgTestLevel;
+    return *(volatile int*)(0xB79000 + (157 - 120) * 4);
+}
+static int WantedNow() { char* w = *(char**)0xB7CD9C; return w ? Rd<int>(w, 0x2C) : 0; }
+static bool OnMission() { return *(volatile int*)(0xA49960 + 409 * 4) != 0; }          // $409 ($ONMISSION)
+static bool InPlayerGroup(const char* p) {
+    char* me = PlayerPed();
+    const char* pd = me ? Rd<const char*>(me, 0x480) : nullptr;
+    if (!pd || !p) return false;
+    unsigned idx = Rd<unsigned>(pd, 0x38);
+    if (idx >= 8) return false;
+    const char* members = (const char*)0xC09920 + idx * 0x2D4 + 0x8 + 0x4;
+    for (int i = 0; i < 7; i++) if (Rd<const char*>(members, i * 4) == p) return true;
+    return false;
+}
+
+// ---- crimes ignorados
+static const char* CrimeName(int t) {
+    static const char* n[] = { "nenhum", "tiro", "agressao", "agressao a policial", "dano a carro", "dano a viatura",
+        "roubo de carro", "sinal vermelho", "dano a veiculo", "excesso de velocidade", "atropelamento",
+        "atropelar policial", "derrubar helicoptero", "fogo em pedestre", "fogo em policial", "fogo em carro",
+        "derrubar aviao", "explosao", "facada", "facada em policial", "destruir veiculo", "batida", "mirar em policial" };
+    return t >= 0 && t < (int)(sizeof n / sizeof n[0]) ? n[t] : "?";
+}
+static bool CrimeIgnored(int t) {
+    int L = VigLevel();
+    if (L >= 64) return true;
+    if (L >= 21 && (t == 6 || t == 8 || t == 21)) return true;               // roubo de carro, dano a veiculo, batida
+    if (L >= 12 && t == 22 && WantedNow() == 0) return true;                   // mirar em policial
+    return false;
+}
+static void NoteIgnored(const char* what) {
+    static DWORD tLog = 0; static int n = 0;
+    n++;
+    DWORD t = GetTickCount();
+    if (t - tLog > 5000) { tLog = t; Log("policia: ignorou %s (nivel %d do Vigilante; %d no total)", what, VigLevel(), n); }
+}
+typedef void (__cdecl* ReportCrime_t)(int, void*, void*);
+typedef void (__thiscall* RegCrime_t)(void*, int, const void*, unsigned, int);
+typedef bool (__thiscall* AimAffects_t)(void*, char*);
+typedef void (__thiscall* SetWantedND_t)(void*, int);
+static ReportCrime_t g_origReportCrime = nullptr;
+static RegCrime_t    g_origRegCrime = nullptr, g_origRegCrimeNow = nullptr;
+static AimAffects_t  g_origAimAffects = nullptr;
+static void __cdecl ReportCrimeDetour(int t, void* victim, void* by) {
+    if (by && by == (void*)PlayerPed() && CrimeIgnored(t)) { NoteIgnored(CrimeName(t)); return; }
+    g_origReportCrime(t, victim, by);
+}
+static void __thiscall RegCrimeDetour(void* w, int t, const void* pos, unsigned id, int dc) {
+    if (CrimeIgnored(t)) { NoteIgnored(CrimeName(t)); return; }
+    g_origRegCrime(w, t, pos, id, dc);
+}
+static void __thiscall RegCrimeNowDetour(void* w, int t, const void* pos, unsigned id, int dc) {
+    if (CrimeIgnored(t)) { NoteIgnored(CrimeName(t)); return; }
+    g_origRegCrimeNow(w, t, pos, id, dc);
+}
+// mirar num policial sem estar procurado: o policial nem reage (e o crime de mirar nao sai)
+static bool __thiscall AimAffectsDetour(void* ev, char* ped) {
+    if (ped && Rd<int>(ped, 0x598) == 6 && Rd<char*>((char*)ev, 0x14) == PlayerPed() && VigLevel() >= 12 && WantedNow() == 0)
+        return false;
+    return g_origAimAffects(ev, ped);
+}
+static void __thiscall PlrWantedSteal(void* plr, int lvl) {
+    if (VigLevel() >= 21) { NoteIgnored("roubo de carro"); return; }
+    ((SetWantedND_t)0x609F30)(plr, lvl);
+}
+static void __thiscall PlrWantedRam(void* plr, int lvl) {
+    if (VigLevel() >= 21) { NoteIgnored("batida em viatura"); return; }
+    ((SetWantedND_t)0x609F30)(plr, lvl);
+}
+static void __thiscall PlrWantedShootCar(void* plr, int lvl) {
+    if (VigLevel() >= 64) { NoteIgnored("dano a viatura"); return; }
+    ((SetWantedND_t)0x609F30)(plr, lvl);
+}
+static void __thiscall WantedStealCopCar(void* w, int lvl) {
+    if (VigLevel() >= 21) { NoteIgnored("roubo de viatura"); return; }
+    ((SetWantedND_t)0x562570)(w, lvl);
+}
+static void ApplyCrimePatches() {
+    PatchCallSite(0x66B285, 0x609F30, (void*)&PlrWantedSteal, "policia: alarme de carro roubado (nivel 21)");
+    PatchCallSite(0x6AE0C3, 0x609F30, (void*)&PlrWantedSteal, "policia: alarme perto da viatura (nivel 21)");
+    PatchCallSite(0x66B2EE, 0x609F30, (void*)&PlrWantedSteal, "policia: viatura roubada (nivel 21)");
+    PatchCallSite(0x4BB7D9, 0x562570, (void*)&WantedStealCopCar, "policia: tirar policial da viatura (nivel 21)");
+    PatchCallSite(0x6A7A54, 0x609F30, (void*)&PlrWantedRam, "policia: batida em viatura (nivel 21)");
+    PatchCallSite(0x6B90AD, 0x609F30, (void*)&PlrWantedRam, "policia: batida em moto da policia (nivel 21)");
+    PatchCallSite(0x6D82A4, 0x609F30, (void*)&PlrWantedShootCar, "policia: dano a viatura (nivel 64)");
+}
+static void InstallCrimeHooks() {
+    HookGame(0x532010, (void*)&ReportCrimeDetour, (void**)&g_origReportCrime, "dos crimes (CCrime::ReportCrime)");
+    HookGame(0x562410, (void*)&RegCrimeDetour, (void**)&g_origRegCrime, "dos crimes (CWanted::RegisterCrime)");
+    HookGame(0x562430, (void*)&RegCrimeNowDetour, (void**)&g_origRegCrimeNow, "dos crimes (RegisterCrime_Immediately)");
+    HookGame(0x4B4EE0, (void*)&AimAffectsDetour, (void**)&g_origAimAffects, "da mira em policial (CEventGunAimedAt)");
+}
+
+// ---- alvos: quem atacou voce, o seu carro ou os recrutas, e quem voce atacou (60 s)
+struct TgEntry { int ref; DWORD until; bool attacker; };
+static TgEntry g_tg[16];
+static int     g_nTg = 0;
+static float   g_tgHp[256];
+static BYTE    g_tgId[256];
+static float   g_tgMeHp = -1.f, g_tgCarHp = -1.f;
+static char*   g_tgCar = nullptr;
+static char* PedFromDamager(char* e) {                                       // o pedestre (ou o motorista) que causou o dano
+    if (!e) return nullptr;
+    BYTE t = Rd<BYTE>(e, 0x36) & 7;
+    if (t == 3) return e;
+    if (t == 2) return Rd<char*>(e, 0x460);
+    return nullptr;
+}
+static void TgAdd(char* p, bool attacker, DWORD now, const char* why) {
+    char* me = PlayerPed();
+    if (!p || p == me || (Rd<BYTE>(p, 0x36) & 7) != 3 || Rd<float>(p, 0x540) <= 0.f) return;
+    int type = Rd<int>(p, 0x598);
+    if (type == 6 || type <= 1 || RcIsRecruit(p) || VgOurs(p) || InPlayerGroup(p)) return;
+    int ref = PedRef(p);
+    for (int i = 0; i < g_nTg; i++) if (g_tg[i].ref == ref) { g_tg[i].until = now + 60000; g_tg[i].attacker |= attacker; return; }
+    if (g_nTg >= 16) { int o = 0; for (int i = 1; i < g_nTg; i++) if ((int)(g_tg[i].until - g_tg[o].until) < 0) o = i; g_tg[o] = g_tg[--g_nTg]; }
+    g_tg[g_nTg++] = { ref, now + 60000, attacker };
+    static DWORD tLog = 0; DWORD t = GetTickCount();
+    if (t - tLog > 3000) { tLog = t; Log("alvos: pedestre %d (tipo %d) %s; %d alvos", Rd<short>(p, 0x22), type, why, g_nTg); }
+}
+// alvo mais perto de 'from' (so quem atacou, com attackers)
+static char* TgNearest(V3 from, float maxD, bool attackers) {
+    char* best = nullptr; float bd = maxD;
+    for (int i = 0; i < g_nTg; i++) {
+        if (attackers && !g_tg[i].attacker) continue;
+        char* p = PedByRef(g_tg[i].ref);
+        if (!p || Rd<float>(p, 0x540) <= 0.f) continue;
+        float d = Dist2(EntityPos(p), from);
+        if (d < bd) { bd = d; best = p; }
+    }
+    return best;
+}
+static void TgTick(DWORD now) {
+    static DWORD tT = 0;
+    if (now - tT < 250 && now >= tT) return;
+    tT = now;
+    char* me = PlayerPed();
+    if (!me || VigLevel() < 12) { g_nTg = 0; g_tgMeHp = -1.f; return; }
+    for (int i = g_nTg - 1; i >= 0; i--) {
+        char* p = PedByRef(g_tg[i].ref);
+        if (!p || Rd<float>(p, 0x540) <= 0.f || (int)(now - g_tg[i].until) > 0) g_tg[i] = g_tg[--g_nTg];
+    }
+    float hp = Rd<float>(me, 0x540) + Rd<float>(me, 0x548);
+    if (g_tgMeHp >= 0.f && hp < g_tgMeHp - 0.5f) TgAdd(PedFromDamager(Rd<char*>(me, 0x764)), true, now, "atacou voce");
+    g_tgMeHp = hp;
+    char* car = PlayerVehicle();
+    if (car != g_tgCar) { g_tgCar = car; g_tgCarHp = car ? Rd<float>(car, 0x4C0) : -1.f; }
+    else if (car) {
+        float h = Rd<float>(car, 0x4C0);
+        if (h < g_tgCarHp - 1.f) TgAdd(PedFromDamager(Rd<char*>(car, 0x50C)), true, now, "atacou o seu carro");
+        g_tgCarHp = h;
+    }
+    char* pool = *(char**)0xB74490;
+    if (!pool) return;
+    int size = Rd<int>(pool, 8); if (size > 256) size = 256;
+    for (int i = 0; i < size; i++) {
+        BYTE flag = Rd<BYTE*>(pool, 4)[i];
+        if (flag & 0x80) { g_tgId[i] = 0xFF; continue; }
+        char* p = Rd<char*>(pool, 0) + i * 0x7C4;
+        float h = Rd<float>(p, 0x540) + Rd<float>(p, 0x548);
+        if (g_tgId[i] == flag && h < g_tgHp[i] - 0.5f && p != me) {
+            char* src = PedFromDamager(Rd<char*>(p, 0x764));
+            if (src == me) TgAdd(p, false, now, "foi atacado por voce");
+            else if (src && RcIsRecruit(p)) TgAdd(src, true, now, "atacou um recruta");
+        }
+        g_tgId[i] = flag; g_tgHp[i] = h;
+    }
+}
+
+// ---- mira do drive-by ([MiraDriveBy], 3.42; gancho novo na 3.43)
+// No drive-by (moto, carro, motorista ou passageiro) o tiro do CJ sai na direcao da camera (modo 0x31/0x37): a tarefa
+// CTaskSimpleGangDriveBy::FireGun (0x627CC0) tira o alvo de Find3rdPersonCamTargetVector a 20 m e chama CWeapon::Fire em
+// 0x628328 com ele; em rampa ou desnivel a camera inclina e o tiro vai no chao ou para o alto. O jogo so tem mira
+// automatica para as armas do proprio veiculo (Hunter: CWeapon::DoDriveByAutoAiming 0x73D720). A 3.42 acertava o fim
+// do tiro dentro de FireInstantHit (CBirds::HandleGunShot), mas o log nao mostrou nenhum acerto: agora o alvo e trocado
+// na chamada de CWeapon::Fire do drive-by, antes do jogo calcular o tiro, e o alcance e o da arma (nao os 20 m).
+//  1) alvo: suspeito do Vigilante (ou o veiculo em que ele esta) e os alvos de 60 s (quem atacou voce, o seu carro ou
+//     os recrutas, e quem voce atacou), ate Cone graus para cada lado e no alcance da arma, sem predio no meio: o tiro
+//     vai nele (o mais perto da direcao do tiro, depois o mais perto de voce);
+//  2) sem alvo: pedestre ou veiculo ate ConeAltura graus: so a altura do tiro muda (como a "doom aiming" do jogo,
+//     0x73CDC0), o lado continua o seu. Policial e viatura so entram se voce estiver com estrelas.
+static int   g_daOn = 1, g_daCars = 1;
+static float g_daCone = 35.f, g_daConeZ = 12.f;
+typedef bool (__cdecl* LosClear_t)(const V3*, const V3*, bool, bool, bool, bool, bool, bool, bool);
+static bool DaClear(const V3& a, const V3& b) { return ((LosClear_t)0x56A490)(&a, &b, true, false, false, false, false, false, false); }   // CWorld::GetIsLineOfSightClear, so predios
+static float DaAngle(float ax, float ay, float bx, float by) {                 // graus entre dois vetores no plano
+    float la = sqrtf(ax * ax + ay * ay), lb = sqrtf(bx * bx + by * by);
+    if (la < 1e-3f || lb < 1e-3f) return 180.f;
+    float c = (ax * bx + ay * by) / (la * lb);
+    if (c > 1.f) c = 1.f;
+    if (c < -1.f) c = -1.f;
+    return acosf(c) * 57.29578f;
+}
+static float DaJitter(float r) { return r * (float)((rand() % 201) - 100) / 100.f; }
+static void DaAim(V3* s, V3* e, float range) {
+    char* me = PlayerPed(); char* myCar = PlayerVehicle();
+    if (!me || !myCar) return;
+    int sub = Rd<int>(myCar, 0x594);                                            // 2 quadriciclo, 9 moto, 10 bicicleta
+    bool bike = sub == 2 || sub == 9 || sub == 10;
+    if (!bike && !g_daCars) return;
+    float fx = e->x - s->x, fy = e->y - s->y, fz = e->z - s->z;
+    { float L = sqrtf(fx * fx + fy * fy + fz * fz);                            // o alvo da camera fica a uns 20 m: estica
+      if (L > 0.01f) { e->x = s->x + fx / L * range; e->y = s->y + fy / L * range; e->z = s->z + fz / L * range; } }
+    // 1) suspeitos e alvos
+    const char* bestE = nullptr; V3 bestAt = {}; float best = 1e9f; bool bestCar = false;
+    auto consider = [&](const char* ped) {
+        if (!ped || ped == me || Rd<float>(ped, 0x540) <= 0.f) return;
+        const char* car = VgCarOf(ped);
+        if (car == myCar) return;
+        V3 at = car ? EntityPos(car) : EntityPos(ped);
+        if (!car) at.z += 0.3f;                                                 // peito
+        float dx = at.x - s->x, dy = at.y - s->y, dz = at.z - s->z;
+        float d = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (d < 1.5f || d > range) return;
+        float ang = DaAngle(fx, fy, dx, dy);
+        if (ang > g_daCone) return;
+        float score = ang / g_daCone + 0.5f * d / range;
+        if (score >= best || !DaClear(*s, at)) return;
+        best = score; bestAt = at; bestE = car ? car : ped; bestCar = car != nullptr;
+    };
+    if (g_daCone > 0.f) {
+        if (VigActiveNow()) ForEachPed([&](char* p) { if (VgSuspect(p)) consider(p); });
+        for (int i = 0; i < g_nTg; i++) consider(PedByRef(g_tg[i].ref));
+    }
+    static const char* lastE = nullptr; static DWORD tLog = 0;
+    DWORD now = GetTickCount();
+    if (bestE) {
+        float j = bestCar ? 0.3f : 0.1f;
+        bestAt.x += DaJitter(j); bestAt.y += DaJitter(j); bestAt.z += DaJitter(j * 0.5f);
+        float dx = bestAt.x - s->x, dy = bestAt.y - s->y, dz = bestAt.z - s->z;
+        float d = sqrtf(dx * dx + dy * dy + dz * dz);
+        float L = range > d + 3.f ? range : d + 3.f;
+        e->x = s->x + dx / d * L; e->y = s->y + dy / d * L; e->z = s->z + dz / d * L;
+        if (bestE != lastE && now - tLog > 2000) {
+            tLog = now; lastE = bestE;
+            if (bestCar) Log("mira do drive-by: no %s do alvo, a %d m", CarName(Rd<short>(bestE, 0x22)), (int)d);
+            else Log("mira do drive-by: no alvo (pedestre %d), a %d m", Rd<short>(bestE, 0x22), (int)d);
+        }
+        return;
+    }
+    // 2) so a altura: o pedestre ou veiculo mais perto da direcao do tiro
+    if (g_daConeZ <= 0.f) return;
+    bool wanted = WantedNow() > 0;
+    const char* zE = nullptr; V3 zAt = {}; float zBest = g_daConeZ;
+    float f2 = sqrtf(fx * fx + fy * fy);
+    auto considerZ = [&](const char* ent, V3 at) {
+        float dx = at.x - s->x, dy = at.y - s->y;
+        float d2 = sqrtf(dx * dx + dy * dy);
+        if (d2 < 1.5f || d2 > range) return;
+        float ang = DaAngle(fx, fy, dx, dy) + d2 / range;                       // empate: o mais perto
+        if (ang >= zBest || !DaClear(*s, at)) return;
+        zBest = ang; zE = ent; zAt = at;
+    };
+    ForEachPed([&](char* p) {
+        if (p == me || Rd<float>(p, 0x540) <= 0.f || (Rd<BYTE>(p, 0x46D) & 1)) return;
+        int t = Rd<int>(p, 0x598);
+        if (t <= 1 || (t == 6 && !wanted) || RcIsRecruit(p) || InPlayerGroup(p) || VgOurs(p)) return;
+        V3 at = EntityPos(p); at.z += 0.3f;
+        considerZ(p, at);
+    });
+    char* pool = *(char**)0xB74494;
+    if (pool) {
+        int size = Rd<int>(pool, 8);
+        for (int i = 0; i < size; i++) {
+            if (Rd<BYTE*>(pool, 4)[i] & 0x80) continue;
+            char* v = Rd<char*>(pool, 0) + i * 0xA18;
+            if (v == myCar || Rd<float>(v, 0x4C0) <= 0.f) continue;
+            char* drv = Rd<char*>(v, 0x460);
+            if (drv && Rd<int>(drv, 0x598) == 6 && !wanted) continue;
+            considerZ(v, EntityPos(v));
+        }
+    }
+    if (!zE || f2 < 1e-3f) return;
+    float dx = zAt.x - s->x, dy = zAt.y - s->y;
+    float t = f2 / sqrtf(dx * dx + dy * dy);
+    e->z = s->z + (zAt.z - s->z) * t;
+}
+// CTaskSimpleGangDriveBy::FireGun chama CWeapon::Fire (0x742300) em 0x628328 com o alvo que tirou da camera; para o CJ,
+// o alvo passa por DaAim (alcance da arma, nao os 20 m da camera)
+typedef bool (__thiscall* WeaponFire_t)(void*, void*, V3*, V3*, void*, V3*, V3*);
+static bool __fastcall DbFire(void* w, void*, char* by, V3* start, V3* barrel, void* tEnt, V3* tPos, V3* alt) {
+    if (g_daOn && by && by == PlayerPed() && tPos && (start || barrel)) {
+        V3 src = start ? *start : *barrel, end = *tPos;
+        int type = Rd<int>(w, 0);
+        const char* info = GetWeaponInfo(type, GetWeaponSkill(by, type) & 0xFF);
+        float range = info ? Rd<float>(info, 8) : 45.f;
+        if (range < 20.f) range = 20.f;
+        DaAim(&src, &end, range);
+        *tPos = end;
+    }
+    return ((WeaponFire_t)0x742300)(w, by, start, barrel, tEnt, tPos, alt);
+}
+static void InstallDriveByAim() {
+    PatchCallSite(0x628328, 0x742300, (void*)&DbFire, "mira do drive-by (CTaskSimpleGangDriveBy::FireGun)");
+}
+
+// ---- armas no veiculo e tiro para a frente ([ArmasNoVeiculo], 3.44)
+typedef char* (__thiscall* FindTask_t)(void*, int);                          // CTaskManager::FindActiveTaskByType 0x681740
+// Trocar arma: no veiculo o jogo nao deixa (CPlayerPedData m_bInVehicleDontAllowWeaponChange) e, ao entrar, poe a SMG na
+// mao (CPed::RemoveWeaponWhenEnteringVehicle). Os comandos 10 e 11 do overlay (deslizar no Trocar arma do carro) passam
+// pelos slots 0 (sem arma), 2 pistola, 3 escopeta, 4 SMG, 5 fuzil e 6 (so o rifle de caca) com CPed::SetCurrentWeapon
+// (0x5E61F0). Ao sair, o jogo volta a arma de antes de entrar.
+// Drive-by: CTaskSimpleCarDrive::ProcessPed so cria o CTaskSimpleGangDriveBy se houver SMG no slot 4 com municao
+// (motorista 0x6446C3, passageiro 0x644A27: [ped+0x610] e [ped+0x61C]). As duas checagens viram uma chamada que olha a
+// arma na mao; o FireGun atira a arma na mao ([ped+0x718]). Os bandidos da IA ja fazem drive-by com fuzil e escopeta.
+// Tiro para a frente (carro e monster truck; a moto ja tem): Atirar sem Olhar para os lados e sem drive-by ativo atira
+// do para-brisa para a frente (sem animacao), com a mira do drive-by (DaAim). CWeapon::Fire (0x742300) faz som,
+// municao, recarga e ritmo; o FireInstantHit so atira para um alvo com o bit 0 de CPedIK (ped+0x50C+0x1C, "arma
+// apontada") ligado, como o FireGun faz, entao o bit liga so durante a chamada. O tiro ignora o proprio carro, entao o
+// para-brisa quebra por DAMAGE_CAR_PANEL (0730, painel 4): trinca no 1o tiro e quebra no 4o.
+static const char* CwName(int t) {
+    if (t <= 1) return "Sem arma";
+    for (auto& it : g_armItems) if (it.type == t) return it.name;
+    return "arma";
+}
+static void CwCycle(int dir) {
+    char* me = PlayerPed(); char* v = PlayerVehicle();
+    if (!g_cwOn || !me || !v) return;
+    static const int kSlots[6] = { 0, 2, 3, 4, 5, 6 };
+    int cur = Rd<BYTE>(me, 0x718), ci = 0;
+    for (int i = 0; i < 6; i++) if (kSlots[i] == cur) ci = i;
+    for (int k = 1; k <= 6; k++) {
+        int i = ((ci + dir * k) % 6 + 6) % 6, sl = kSlots[i];
+        int t = WeaponType(me, sl);
+        if (sl != 0 && !(CwAllowed(t) && WeaponAmmo(me, sl) > 0)) continue;
+        if (sl != 0) {
+            const char* wi = GetWeaponInfo(t, 1);
+            int mid = wi ? Rd<int>(wi, 0xC) : -1;
+            if (mid > 0 && !ModelLoaded(mid)) { RequestModel(mid, 2); LoadAllRequestedModels(false); }
+        }
+        ((void(__thiscall*)(char*, int))0x5E61F0)(me, sl);                      // CPed::SetCurrentWeapon(slot)
+        GarHelp("%s", sl == 0 ? "Sem arma" : CwName(t));
+        Log("veiculo: arma trocada para %s (slot %d)", sl == 0 ? "nenhuma" : CwName(t), sl);
+        return;
+    }
+}
+static int __cdecl CwDriveByOk(char* ped) {
+    bool orig = Rd<int>(ped, 0x610) != 0 && Rd<int>(ped, 0x61C) > 0;           // como o jogo: SMG no slot 4
+    if (!g_cwOn || ped != PlayerPed()) return orig;
+    int sl = Rd<BYTE>(ped, 0x718), t = WeaponType(ped, sl);
+    return CwAllowed(t) && WeaponAmmo(ped, sl) > 0;
+}
+static void CwPatchSite(DWORD site, int len, DWORD jeTarget, const BYTE* expect, BYTE* stub) {
+    BYTE rep[32]; memset(rep, 0x90, sizeof rep);
+    rep[0] = 0xE8; *(DWORD*)(rep + 1) = (DWORD)stub - (site + 5);
+    rep[5] = 0x85; rep[6] = 0xC0;
+    rep[7] = 0x0F; rep[8] = 0x84; *(DWORD*)(rep + 9) = jeTarget - (site + 13);
+    PatchBytes(site, expect, len, rep, len, "armas no veiculo: drive-by com a arma na mao");
+}
+static void InstallCarWeapons() {
+    if (!g_cwOn) return;
+    BYTE* stub = (BYTE*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!stub) { Log("armas no veiculo: sem memoria para o desvio"); return; }
+    BYTE code[] = { 0x51, 0x52, 0x56, 0xE8, 0, 0, 0, 0, 0x83, 0xC4, 0x04, 0x5A, 0x59, 0xC3 };   // push ecx/edx/esi; call; add esp,4; pop edx/ecx; ret
+    *(DWORD*)(code + 4) = (DWORD)&CwDriveByOk - ((DWORD)stub + 8);
+    memcpy(stub, code, sizeof code);
+    static const BYTE a[24] = { 0x8B,0x86,0x10,0x06,0x00,0x00, 0x85,0xC0, 0x0F,0x84,0x86,0x00,0x00,0x00,
+                                0x8B,0x86,0x1C,0x06,0x00,0x00, 0x85,0xC0, 0x7E,0x7C };
+    static const BYTE b[28] = { 0x8B,0x86,0x10,0x06,0x00,0x00, 0x85,0xC0, 0x0F,0x84,0xC2,0x00,0x00,0x00,
+                                0x8B,0x86,0x1C,0x06,0x00,0x00, 0x85,0xC0, 0x0F,0x8E,0xB4,0x00,0x00,0x00 };
+    CwPatchSite(0x6446C3, 24, 0x644757, a, stub);                                // motorista
+    CwPatchSite(0x644A27, 28, 0x644AF7, b, stub);                                // passageiro
+}
+static void FwTick() {
+    static DWORD tNext = 0; static char* glassCar = nullptr; static int glassShots = 0; static bool noted = false;
+    char* me = PlayerPed(); char* v = PlayerVehicle();
+    if (!g_fwOn || !me || !v || Rd<char*>(v, 0x460) != me || !NewButtonsAlive()) return;
+    int sub = Rd<int>(v, 0x594);
+    if (sub != 0 && sub != 1) return;                                           // carro e monster truck
+    if (!(g_host.buttons & 0x2000) || g_host.lt > 40 || g_host.rt > 40) return;   // Atirar (B), sem Olhar
+    if (MenuActive() || g_menuOpen || g_shopOpen) return;
+    char* intel = Rd<char*>(me, 0x47C);
+    if (intel && ((FindTask_t)0x681740)(intel + 4, 1022)) return;             // drive-by de lado em andamento
+    int sl = Rd<BYTE>(me, 0x718), t = WeaponType(me, sl);
+    if (!CwAllowed(t) || WeaponAmmo(me, sl) <= 0) return;
+    char* w = me + 0x5A0 + sl * 0x1C;
+    int st = Rd<int>(w, 4);
+    if (st != 0 && st != 1) return;                                             // pronta ou atirando (nao recarregando)
+    DWORD now = GetTickCount();
+    if ((int)(now - tNext) < 0) return;
+    const char* info = GetWeaponInfo(t, GetWeaponSkill(me, t) & 0xFF);
+    float range = info ? Rd<float>(info, 8) : 45.f;
+    if (range < 20.f) range = 20.f;
+    float loop = info ? Rd<float>(info, 0x44) - Rd<float>(info, 0x40) : 0.3f;
+    DWORD iv = (DWORD)(loop * 1000.f); if (iv < 80) iv = 80;
+    const float* m = Rd<const float*>(v, 0x14);
+    if (!m) return;
+    V3 vp = EntityPos(v);
+    V3 fw = { m[4], m[5], m[6] }, up = { m[8], m[9], m[10] };
+    V3 start = { vp.x + fw.x * 1.3f + up.x * 0.6f, vp.y + fw.y * 1.3f + up.y * 0.6f, vp.z + fw.z * 1.3f + up.z * 0.6f };
+    V3 end = { start.x + fw.x * range, start.y + fw.y * range, start.z + fw.z * range };
+    if (g_daOn) DaAim(&start, &end, range);
+    DWORD* ik = (DWORD*)(me + 0x50C + 0x1C);
+    DWORD oldIk = *ik; *ik |= 1;
+    bool ok = ((WeaponFire_t)0x742300)(w, me, &start, &start, nullptr, &end, nullptr);
+    *ik = oldIk;
+    if (!ok) return;
+    tNext = now + iv;
+    if (!noted) { noted = true; Log("veiculo: tiro para a frente com %s (a cada %u ms, alcance %d m)", CwName(t), (unsigned)iv, (int)range); }
+    if (g_fwGlass && (sub == 0 || sub == 1)) {
+        if (glassCar != v) { glassCar = v; glassShots = 0; }
+        glassShots++;
+        if (glassShots == 1 || glassShots == 4) { int r = VehRef(v); if (r >= 0) { Cmd c(0x0730); c.I(r).I(4); RunCmd(c); } }
+    }
+}
+
+// ---- mira a pe (3.43)
+// 1) Prioridade: no Vigilante, quando a mira trava (o alvo era nenhum), se ela pegou alguem que nao e suspeito nem
+//    agressor, troca para o suspeito mais perto da direcao da camera, a pe ou no carro (trava no suspeito de dentro
+//    do carro; o tiro pega no carro). Fora disso, so para agressor.
+// 2) Hitman: com a arma no nivel hitman (pistolas, SMGs, escopetas, fuzis), quando o alvo travado morre, a mira vai
+//    sozinha para o proximo agressor visivel (atacando voce, o seu carro ou os recrutas; suspeito do Vigilante;
+//    alvos de 60 s). Policial so com Policiais=1. Sem outro, fica no morto, como no jogo.
+// Agressor: tarefa de matar (TASK_COMPLEX_KILL_PED_ON_FOOT 1000 / 1028, alvo em +0x10; melee 1001 e armado 1002,
+// +0xC; drive-by 1022, +0x34) com o alvo sendo o CJ, o carro dele ou alguem do grupo. A mira e CPed+0x71C
+// (CleanUpOldReference 0x571A00 / RegisterReference 0x571B70, como em FindNextWeaponLockOnTarget).
+static int g_apOn = 1, g_htOn = 1, g_htCops = 0, g_htDelay = 200;
+static char* AimTaskTarget(char* p, int type, int off) {
+    char* intel = Rd<char*>(p, 0x47C);
+    if (!intel) return nullptr;
+    char* t = ((FindTask_t)0x681740)(intel + 4, type);                          // CTaskManager::FindActiveTaskByType
+    return t ? Rd<char*>(t, off) : nullptr;
+}
+static bool AimMineOrGroup(char* e, char* me) {
+    if (!e) return false;
+    if (e == me || e == PlayerVehicle()) return true;
+    if ((Rd<BYTE>(e, 0x36) & 7) == 3) return InPlayerGroup(e) || RcIsRecruit(e);
+    return false;
+}
+static bool AimAggressor(char* p, char* me) {
+    if (!p || p == me || Rd<float>(p, 0x540) < 1.f) return false;
+    int t = Rd<int>(p, 0x598);
+    if (t <= 1 || RcIsRecruit(p) || InPlayerGroup(p) || VgOurs(p)) return false;
+    if (t == 6 && !g_htCops) return false;
+    if (VigActiveNow() && VgSuspect(p)) return true;
+    int r = PedRef(p);
+    for (int i = 0; i < g_nTg; i++) if (g_tg[i].ref == r && g_tg[i].attacker) return true;
+    static const int kT[6] = { 1000, 1028, 1001, 1002, 1022, 0 }, kO[6] = { 0x10, 0x10, 0xC, 0xC, 0x34, 0 };
+    for (int i = 0; kT[i]; i++) if (AimMineOrGroup(AimTaskTarget(p, kT[i], kO[i]), me)) return true;
+    return false;
+}
+static void AimSetLock(char* me, char* e) {
+    char** field = (char**)(me + 0x71C);
+    char* old = *field;
+    if (old == e) return;
+    if (old) ((void(__thiscall*)(char*, char**))0x571A00)(old, field);
+    *field = e;
+    if (e) ((void(__thiscall*)(char*, char**))0x571B70)(e, field);
+}
+static bool AimOnScreen(char* e) { return ((bool(__thiscall*)(char*))0x534540)(e); }  // CEntity::GetIsOnScreen
+// o melhor alvo: suspeito/agressor visivel, no alcance, mais perto da direcao (ref: frente da camera ou o morto)
+static char* AimBest(char* me, char* skip, float range, float fx, float fy, bool inCars) {
+    V3 mp = EntityPos(me); V3 head = mp; head.z += 0.6f;
+    char* best = nullptr; float bs = 1e9f;
+    ForEachPed([&](char* p) {
+        if (p == skip) return;
+        char* car = VgCarOf(p);
+        if (car && !inCars) return;
+        if (!AimAggressor(p, me)) return;
+        V3 q = car ? EntityPos(car) : EntityPos(p);
+        if (!car) q.z += 0.3f;
+        float dx = q.x - mp.x, dy = q.y - mp.y, dz = q.z - mp.z;
+        float d = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (d > range || d < 1.f) return;
+        float ang = DaAngle(fx, fy, dx, dy);
+        float sc = ang / 90.f + 0.5f * d / range;
+        if (sc >= bs || !AimOnScreen(car ? car : p) || !DaClear(head, q)) return;
+        bs = sc; best = p;
+    });
+    return best;
+}
+static void AimTick(DWORD now) {
+    static char* last = nullptr; static char* deadT = nullptr; static DWORD tDead = 0, tTry = 0, tLog = 0;
+    char* me = PlayerPed();
+    if (!me || PlayerVehicle()) { last = nullptr; deadT = nullptr; return; }
+    char* t = Rd<char*>(me, 0x71C);
+    int slot = Rd<BYTE>(me, 0x718), type = WeaponType(me, slot);
+    const char* info = (type >= 22 && type <= 38) ? GetWeaponInfo(type, GetWeaponSkill(me, type) & 0xFF) : nullptr;
+    float range = info ? Rd<float>(info, 4) : 0.f;
+    if (range < 10.f) range = 10.f;
+    // 1) mira acabou de travar em alguem que nao interessa: vai para o suspeito
+    if (g_apOn && t && !last && info && VigActiveNow() && (Rd<BYTE>(t, 0x36) & 7) == 3 && !AimAggressor(t, me)) {
+        int ci = *(volatile BYTE*)0xB6F081;
+        const float* fr = (const float*)(0xB6F19C + ci * 0x238 + 0x190);          // CCam::Front da camera ativa
+        char* b = AimBest(me, t, range, fr[0], fr[1], true);
+        if (b) {
+            AimSetLock(me, b);
+            if (now - tLog > 3000 || now < tLog) { tLog = now; Log("mira: no suspeito/agressor (pedestre %d%s) em vez do pedestre %d", Rd<short>(b, 0x22), VgCarOf(b) ? ", no carro" : "", Rd<short>(t, 0x22)); }
+            t = b;
+        }
+    }
+    last = t;
+    // 2) hitman: o alvo travado morreu
+    if (!g_htOn || !t || (Rd<BYTE>(t, 0x36) & 7) != 3 || Rd<float>(t, 0x540) >= 1.f) { deadT = nullptr; return; }
+    if (!info || type < 22 || type > 32 || (GetWeaponSkill(me, type) & 0xFF) != 2) return;
+    if (deadT != t) { deadT = t; tDead = now; tTry = 0; return; }
+    if (now - tDead < (DWORD)g_htDelay || (tTry && now - tTry < 300)) return;
+    tTry = now;
+    V3 mp = EntityPos(me), dp = EntityPos(t);
+    char* b = AimBest(me, t, range, dp.x - mp.x, dp.y - mp.y, false);
+    if (!b) return;
+    AimSetLock(me, b); deadT = nullptr; last = b;
+    Log("mira hitman: proximo agressor (pedestre %d, %d m)", Rd<short>(b, 0x22), (int)Dist2(EntityPos(b), mp));
+}
+
+// ---- pistola silenciada (3.43): no intermediario atira no ritmo da pistola, no hitman 1,5x; pente de 12 (.45 ACP)
+// CWeaponInfo (0x70): +0x20 pente (short), +0x38 precisao (maior = mais certeira; o espalhamento e dividido por ela e
+// cresce com o toque rapido no Atirar), +0x40/+0x44/+0x48 inicio/fim/tiro do laco da animacao (s), +0x4C.. o laco
+// agachado. Fim do laco como o jogo calcula: inicio + floor(0,1 + quadros/30 x 50)/50 - 0,006.
+static int g_psOn = 1, g_psClip = 12, g_psStdFr = 9, g_psProFr = 6;
+static float g_psStdAcc = 1.35f, g_psProAcc = 1.6f;
+static void PsLoop(char* info, int frames) {
+    for (int k = 0; k < 2; k++) {
+        float* st = (float*)(info + 0x40 + k * 12);
+        float start = st[0];
+        st[1] = start + floorf(0.1f + (frames / 30.f) * 50.f) / 50.f - 0.006f;
+        st[2] = start;                                                          // o tiro sai no comeco do laco
+    }
+}
+static void PsApply() {
+    if (!g_psOn) return;
+    for (int sk = 0; sk < 3; sk++) {
+        char* info = GetWeaponInfo(23, sk);
+        if (!info) continue;
+        if (g_psClip > 0) *(short*)(info + 0x20) = (short)g_psClip;
+        if (sk == 1) { if (g_psStdFr > 0) PsLoop(info, g_psStdFr); *(float*)(info + 0x38) = g_psStdAcc; }
+        if (sk == 2) { if (g_psProFr > 0) PsLoop(info, g_psProFr); *(float*)(info + 0x38) = g_psProAcc; }
+    }
+    static bool noted = false;
+    if (!noted) { noted = true; Log("pistola silenciada: pente %d, intermediario %d quadros por tiro (precisao %.2f), hitman %d (precisao %.2f)",
+                  g_psClip, g_psStdFr, g_psStdAcc, g_psProFr, g_psProAcc); }
+}
+
+// ---- policiais recrutados (nivel 12: 1, nivel 21: ate 3)
+struct Recruit { int ref, weap, lastTgt; bool hates, vigHate; DWORD tDB, tKill; };
+static Recruit g_rc[4];
+static int     g_nRc = 0, g_rcCand = -1;
+static WORD    g_rcYnWas = 0;
+static const int kRcHate[] = { 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 20 };     // gangues (menos a Grove, 8), traficantes, criminosos
+static bool RcIsRecruit(const char* p) {
+    if (!p) return false;
+    int r = PedRef(p);
+    for (int i = 0; i < g_nRc; i++) if (g_rc[i].ref == r) return true;
+    return false;
+}
+static int RcCount() { return g_nRc; }
+static int RcMax() { int L = VigLevel(); return L >= 21 ? g_rcMax21 : L >= 12 ? g_rcMax12 : 0; }
+static int PlayerGroupRef() { int g = -1; Cmd c(0x07AF); c.I(0).Out(0); RunCmd(c, &g, 1); return g; }
+static void RcHates(Recruit& r, bool on) {
+    if (r.hates == on) return;
+    for (int t : kRcHate) { Cmd c(on ? 0x077A : 0x077B); c.I(r.ref).I(4).I(t); RunCmd(c); }
+    r.hates = on;
+}
+static void RcVigHate(Recruit& r, bool on) {
+    if (r.vigHate == on) return;
+    { Cmd c(on ? 0x077A : 0x077B); c.I(r.ref).I(4).I(24); RunCmd(c); }      // suspeitos do Vigilante (MISSION1)
+    r.vigHate = on;
+}
+static void RcRelease(int i, const char* why) {
+    char* p = PedByRef(g_rc[i].ref);
+    if (p) {
+        RcHates(g_rc[i], false); RcVigHate(g_rc[i], false);
+        { Cmd c(0x06C9); c.I(g_rc[i].ref); RunCmd(c); }
+        { Cmd c(0x0568); c.I(g_rc[i].ref).I(0); RunCmd(c); }
+        { Cmd c(0x01C2); c.I(g_rc[i].ref); RunCmd(c); }
+    }
+    g_rc[i] = g_rc[--g_nRc];
+    Log("recrutas: um policial %s (%s); %d com voce", p ? "foi embora" : "se perdeu", why, g_nRc);
+}
+static void RcReleaseAll(const char* why) { while (g_nRc) RcRelease(g_nRc - 1, why); }
+static bool RcCandidate(char* p) {
+    return p && (Rd<BYTE>(p, 0x36) & 7) == 3 && Rd<int>(p, 0x598) == 6 && Rd<float>(p, 0x540) > 0.f && Rd<BYTE>(p, 0x484) == 1
+        && !(Rd<BYTE>(p, 0x46D) & 1) && !VgOurs(p) && !RcIsRecruit(p);
+}
+// o policial travado na mira ou, sem mira (no Vigilante a mira nao trava em policial), o mais perto ate 6 m na frente
+static char* RcPick(char* me) {
+    char* t = Rd<char*>(me, 0x71C);
+    if (t && RcCandidate(t)) return t;
+    V3 mp = EntityPos(me);
+    const float* m = Rd<const float*>(me, 0x14);
+    float fx = m ? m[4] : 0.f, fy = m ? m[5] : 1.f;                            // frente do CJ
+    char* best = nullptr; float bd = 6.f;
+    ForEachPed([&](char* p) {
+        if (!RcCandidate(p)) return;
+        V3 q = EntityPos(p);
+        float dx = q.x - mp.x, dy = q.y - mp.y, d = sqrtf(dx * dx + dy * dy);
+        if (d >= bd || fabsf(q.z - mp.z) > 2.f) return;
+        if (d > 1.f && (dx * fx + dy * fy) / d < 0.5f) return;                  // ate 60 graus para cada lado
+        bd = d; best = p;
+    });
+    return best;
+}
+static void RcRecruit(char* p) {
+    int ref = PedRef(p), grp = PlayerGroupRef();
+    if (ref < 0 || grp < 0) { GarHelp("Nao deu para recrutar agora."); return; }
+    static const int w12[2] = { 22, 25 }, w21[3] = { 24, 27, 31 };             // pistola, escopeta / Desert Eagle, doze de combate, M4
+    int w = VigLevel() >= 21 ? w21[rand() % 3] : w12[rand() % 2];
+    int wm = w == 22 ? 346 : w == 25 ? 349 : w == 24 ? 348 : w == 27 ? 351 : 356;
+    RequestModel(wm, 2); LoadAllRequestedModels(false);
+    *(BYTE*)(p + 0x484) = 2;                                                   // como personagem de script: o jogo nao apaga
+    { Cmd c(0x0687); c.I(ref); RunCmd(c); }
+    { Cmd c(0x0631); c.I(grp).I(ref); RunCmd(c); }
+    bool member = false; { Cmd c(0x06EE); c.I(ref).I(grp); member = RunCmd(c); }
+    if (!member) { *(BYTE*)(p + 0x484) = 1; { Cmd c(0x0249); c.I(wm); RunCmd(c); } GarHelp("O seu grupo esta cheio."); return; }
+    { Cmd c(0x01B2); c.I(ref).I(w).I(9999); RunCmd(c); }
+    { Cmd c(0x01B9); c.I(ref).I(w); RunCmd(c); }
+    { Cmd c(0x08AF); c.I(ref).I(g_vgHealth); RunCmd(c); }
+    { Cmd c(0x0223); c.I(ref).I(g_vgHealth); RunCmd(c); }
+    if (g_vgArmour > 0) { Cmd c(0x035F); c.I(ref).I(g_vgArmour); RunCmd(c); }
+    { Cmd c(0x0446); c.I(ref).I(0); RunCmd(c); }                               // sem morte de um tiro so na cabeca
+    { Cmd c(0x0568); c.I(ref).I(1); RunCmd(c); }                               // a mira do CJ nao trava nele
+    { Cmd c(0x0249); c.I(wm); RunCmd(c); }
+    Recruit& r = g_rc[g_nRc++];
+    memset(&r, 0, sizeof r); r.ref = ref; r.weap = w; r.lastTgt = -1;
+    RcHates(r, true);
+    static const char* wn[] = { "pistola", "escopeta", "Desert Eagle", "doze de combate", "M4" };
+    const char* nm = w == 22 ? wn[0] : w == 25 ? wn[1] : w == 24 ? wn[2] : w == 27 ? wn[3] : wn[4];
+    GarHelp("Policial recrutado (%s). %d de %d com voce.", nm, g_nRc, RcMax());
+    Log("recrutas: policial modelo %d recrutado com %s; %d de %d", Rd<short>(p, 0x22), nm, g_nRc, RcMax());
+}
+static int RcSeat(const char* car, const char* p) {
+    for (int s = 0; s < 8; s++) if (Rd<const char*>(car, 0x464 + s * 4) == p) return s;
+    return -1;
+}
+static volatile bool g_rcCanRecruit = false;                                // mira num policial recrutavel (botao)
+static void RcTick(DWORD now) {
+    g_rcYN = false; g_rcCanRecruit = false;
+    char* me = PlayerPed();
+    if (!me || !g_rcOn) return;
+    static DWORD tM = 0;
+    if (now - tM >= 500 || now < tM) {
+        tM = now;
+        int grp = g_nRc ? PlayerGroupRef() : -1;
+        for (int i = g_nRc - 1; i >= 0; i--) {
+            char* p = PedByRef(g_rc[i].ref);
+            if (!p || Rd<float>(p, 0x540) <= 0.f) { RcRelease(i, "caiu"); continue; }
+            bool member = false; if (grp >= 0) { Cmd c(0x06EE); c.I(g_rc[i].ref).I(grp); member = RunCmd(c); }
+            if (!member) RcRelease(i, "saiu do grupo");
+        }
+        if (g_nRc && WantedNow() > 0) { RcReleaseAll("voce ficou procurado"); GarHelp("Voce esta procurado: os policiais recrutados foram embora."); }
+        while (g_nRc > RcMax()) RcRelease(g_nRc - 1, "nivel menor");
+        char* myCar = PlayerVehicle();
+        bool vig = g_vg.active;
+        for (int i = 0; i < g_nRc; i++) {
+            Recruit& r = g_rc[i];
+            char* p = PedByRef(r.ref);
+            if (!p) continue;
+            char* car = VgCarOf(p);
+            bool inMyCar = car && car == myCar;
+            RcVigHate(r, vig);
+            RcHates(r, vig || !inMyCar);                                       // no seu carro, fora do Vigilante: quietos
+            V3 rp = EntityPos(p);
+            if (inMyCar) {
+                int seat = RcSeat(car, p);
+                if (seat < 0 || now - r.tDB < 3000) continue;
+                char* t = vig ? VgNearestSuspect(rp, 60.f) : nullptr;
+                if (!t) t = TgNearest(rp, 60.f, true);                         // fora do Vigilante: so quem atacou
+                if (!t) continue;
+                r.tDB = now;
+                VgArm(r.ref, r.weap);
+                Cmd x(0x0713); x.I(r.ref).I(PedRef(t)).I(-1).F(0.f).F(0.f).F(0.f).F(60.f).I(8).I(seat == 1 ? 0 : 1).I(60); RunCmd(x);
+            } else if (!car) {
+                char* t = TgNearest(rp, 45.f, false);
+                if (!t && vig) t = VgNearestSuspect(rp, 45.f);
+                if (!t) continue;
+                int tr = PedRef(t);
+                if (tr == r.lastTgt && now - r.tKill < 6000) continue;
+                r.lastTgt = tr; r.tKill = now;
+                VgKill(r.ref, tr, r.weap);
+            }
+        }
+    }
+    // mira travada num policial da rua, sem estar procurado: Sim recruta
+    int L = VigLevel();
+    char* t = (L >= 12 && !PlayerVehicle()) ? RcPick(me) : nullptr;
+    if (!t || WantedNow() > 0 || MenuActive() || g_menuOpen || g_shopOpen) { g_rcCand = -1; return; }
+    int ref = PedRef(t);
+    if (g_nRc >= RcMax()) {
+        if (g_rcCand != ref) { g_rcCand = ref; GarHelp("Voce ja tem %d policial(is) com voce. Dispense pelo telefone para recrutar outro.", g_nRc); }
+        return;
+    }
+    if (NewButtons()) {                                                       // overlay 3.7: botao Recrutar policial
+        g_rcCanRecruit = true;
+        if (g_rcCand != ref) { g_rcCand = ref; GarHelp("Recrutar policial: chama este policial para o seu grupo (%d de %d).", g_nRc + 1, RcMax()); }
+        return;
+    }
+    g_rcYN = true;
+    WORD raw = g_vigRaw;
+    if (g_rcCand != ref) {
+        g_rcCand = ref; g_rcYnWas = raw;
+        GarHelp("Sim: recrutar este policial (%d de %d).", g_nRc + 1, RcMax());
+        return;
+    }
+    WORD pressed = raw & ~g_rcYnWas;
+    g_rcYnWas = raw;
+    if (pressed & DPAD_RIGHT) { RcRecruit(t); g_rcCand = -1; }
+}
+
+static void RcCmdRecruit() {
+    char* me = PlayerPed();
+    if (!me || !g_rcOn || VigLevel() < 12 || PlayerVehicle()) return;
+    char* t = RcPick(me);
+    if (!t || WantedNow() > 0) return;
+    if (g_nRc >= RcMax()) { GarHelp("Voce ja tem %d policial(is) com voce. Dispense pelo telefone para recrutar outro.", g_nRc); return; }
+    RcRecruit(t); g_rcCand = -1; g_rcCanRecruit = false;
+}
+// ---- nivel 64: policiais da rua vao atras dos seus alvos; Vigilante a qualquer hora
+static bool Vig64CanStart(const char** why) {
+    *why = nullptr;
+    if (VigLevel() < 64) return false;
+    if (OnMission()) { *why = "Termine a missao atual antes."; return false; }
+    { Cmd c(0x0256); c.I(0); if (!RunCmd(c)) { *why = "Agora nao."; return false; } }
+    { Cmd c(0x09BE); if (RunCmd(c)) { *why = "Agora nao."; return false; } }
+    if ((*(volatile int*)(0xA49960 + 390 * 4) >> 1) & 1) { *why = "Agora nao."; return false; }
+    return true;
+}
+static void Vig64Start(const char* how) {
+    { Cmd c(0x00BA); c.Key("COP_M").I(6000).I(5); RunCmd(c); }
+    { Cmd c(0x0417); c.I(124); RunCmd(c); }
+    Log("vigilante: comecou %s (nivel %d)", how, VigLevel());
+}
+static void Vig64Stop(const char* how) {
+    if (!g_vg.active) return;
+    *(volatile int*)(0xA48960 + 58 * 4) = 1;                                    // 58@ = 1: a missao termina sem falhar
+    GarHelp("Vigilante encerrado.");
+    Log("vigilante: encerrado %s", how);
+}
+static void Vig64Stop() { Vig64Stop("pelo telefone"); }
+static volatile bool g_vg64Can = false;                                       // da para comecar agora (botao Vigilante)
+static void Vig64Toggle(const char* how) {
+    if (VigLevel() < 64) return;
+    if (g_vg.active) { Vig64Stop(how); return; }
+    const char* why = nullptr;
+    if (Vig64CanStart(&why)) Vig64Start(how);
+    else if (why) GarHelp("%s", why);
+}
+static void Vig64Tick(DWORD now) {
+    if (VigLevel() < 64) { g_vg64Can = false; return; }
+    static DWORD tCan = 0;
+    if (now - tCan >= 500 || now < tCan) { tCan = now; const char* why; g_vg64Can = !g_vg.active && Vig64CanStart(&why); }
+    // botao de submissao em veiculo que nao tem submissao propria (os outros ficam como no jogo); no overlay 3.7 e o
+    // botao Vigilante
+    char* v = PlayerVehicle();
+    static bool was = false;
+    if (v && !g_vg.active && !MenuActive() && !NewButtons()) {
+        int mode = *(volatile int*)(0xA49960 + 13 * 4);
+        bool down = false; { Cmd c(0x00E1); c.I(0).I(mode == 3 ? 14 : 19); down = RunCmd(c); }
+        bool edge = down && !was; was = down;
+        if (edge) {
+            int m = Rd<short>(v, 0x22), pr = PlayerRef();
+            bool own = m == 416 || m == 407 || m == 425 || m == 609;
+            if (!own && pr >= 0) { Cmd c(0x0602); c.I(pr); own = RunCmd(c); }   // taxi
+            if (!own && pr >= 0) { Cmd c(0x056C); c.I(pr); own = RunCmd(c); }   // policia: o jogo comeca
+            const char* why = nullptr;
+            if (!own && Vig64CanStart(&why)) Vig64Start("pelo botao de submissao");
+            else if (!own && why) GarHelp("%s", why);
+        }
+    } else was = false;
+    if (g_vg64Help && !g_vg.active && g_nTg > 0) {
+        static DWORD tH = 0;
+        if (now - tH >= 1000 || now < tH) { tH = now; VgStreetCops(now, true); }
+    }
+}
+
+// botoes do overlay 3.7 (ComputeInfo, a cada quadro)
+static DWORD VigButtonState() {
+    DWORD st = 0;
+    if (!NewButtons()) return 0;
+    if (g_vg.active) {
+        DWORD now = GameMs();
+        VgOneClockFix(now);
+        st |= S_VIG;
+        if (VgBackupReady(now)) st |= S_VIGBACKUP;
+        if (VgCarReady(now)) st |= S_VIGCAR;
+    }
+    if (g_rcCanRecruit) st |= S_RECRUITCOP;
+    if (VigLevel() >= 64 && (g_vg.active || g_vg64Can)) st |= S_VIG64;
+    return st;
+}
+
+// ---- policiais femininas (SA-MP 0.3.7: wfyclpd, vbfycpd, wfycllv)
+// O SA 1.0 guarda os modelos de pedestre num CStore de 278 (0xB478F8; o jogo usa 276). Com Female=1 o mod troca
+// esse CStore por um de PedLimit, antes de o jogo ler os IDE (8 referencias em CModelInfo, 0x4C6518 a 0x4C6859).
+// As linhas Ped1..Ped8 do INI entram como linhas do peds.ide (CFileLoader::LoadPedObject 0x5B7420), no fim do
+// peds.ide. Os .dff e .txd vao no modloader. Sem os arquivos o modelo existe mas nao carrega: o mod nao usa.
+// Rotacao na rua: CStreaming::ms_aDefaultCopModel (0x8A5AA0: interior, LS, SF, LV, moto) recebe a policial da
+// regiao atual em FemaleChance% dos sorteios (a cada 45 s), so com o modelo ja carregado.
+static int   g_fcOn = 1, g_fcChance = 40, g_fcStreet = 1, g_fcNPed = 0, g_fcMax = 350;
+static char  g_fcName[4][24] = { "wfycllv", "wfyclpd", "vbfycpd", "wfycllv" };   // interior, LS, SF, LV
+static char  g_fcPed[8][160];
+static int   g_fcModel[4] = { 0, 0, 0, 0 };
+static struct PedStore { int count; BYTE items[400][0x44]; } g_pedStore;
+static volatile int* g_pedCount = (volatile int*)0xB478F8;
+static bool  g_fcRegistered = false;
+static bool FemUsable(int m) {
+    return m > 0 && m < 20000 && ((char**)0xA9B0C8)[m] && *(volatile DWORD*)(0x8E4CC0 + m * 0x14 + 0xC) != 0;   // CdSize
+}
+static int FemCopModel(int level) {
+    if (!g_fcOn || level < 0 || level > 3) return -1;
+    if (g_fcModel[level] <= 0) { int m = ModelByName(g_fcName[level]); if (m > 0) g_fcModel[level] = m; }
+    return FemUsable(g_fcModel[level]) ? g_fcModel[level] : -1;
+}
+static void MovePedStore() {
+    if (*(volatile int*)0xB478F8 != 0) { Log("policiais: o jogo ja tinha modelos de pedestre; o limite ficou em 278"); return; }
+    if (g_fcMax > 400) g_fcMax = 400;
+    if (g_fcMax <= 278) return;
+    DWORD cnt = (DWORD)&g_pedStore.count, items = (DWORD)&g_pedStore.items[0][0];
+    struct { DWORD at, orig, repl; } p[] = {
+        { 0x4C6518, 0xB478F8, cnt }, { 0x4C6523, 0xB478FC, items }, { 0x4C652F, 0xB478F8, cnt }, { 0x4C660A, 0xB478F8, cnt },
+        { 0x4C67A1, 0xB478F8, cnt }, { 0x4C67AD, 0xB478FC, items }, { 0x4C67B3, 0xB478F8, cnt }, { 0x4C6859, 0xB478F8, cnt } };
+    for (auto& x : p) if (*(DWORD*)x.at != x.orig) { Log("policiais: codigo em 0x%X nao e o original; o limite de pedestres ficou em 278", x.at); return; }
+    for (int i = 0; i < g_fcMax; i++) ((void(__thiscall*)(void*))0x4C57A0)(g_pedStore.items[i]);   // CPedModelInfo::CPedModelInfo
+    g_pedStore.count = 0;
+    for (auto& x : p) {
+        DWORD old; VirtualProtect((void*)x.at, 4, PAGE_EXECUTE_READWRITE, &old);
+        *(DWORD*)x.at = x.repl;
+        VirtualProtect((void*)x.at, 4, old, &old);
+    }
+    FlushInstructionCache(GetCurrentProcess(), (void*)0x4C6500, 0x400);
+    g_pedCount = &g_pedStore.count;
+    Log("policiais: limite de modelos de pedestre de 278 para %d", g_fcMax);
+}
+static int PedLimit() { return g_pedCount == (volatile int*)0xB478F8 ? 278 : g_fcMax; }
+static void FcRegister(const char* when) {
+    if (g_fcRegistered) return;
+    g_fcRegistered = true;
+    int ok = 0;
+    for (int i = 0; i < g_fcNPed; i++) {
+        char line[160]; strncpy(line, g_fcPed[i], sizeof line - 1); line[sizeof line - 1] = 0;
+        for (char* c = line; *c; c++) if (*c == ',' || *c == '\t') *c = ' ';
+        int id = atoi(line);
+        if (id <= 0 || id >= 20000) continue;
+        if (((char**)0xA9B0C8)[id]) { Log("policiais: o modelo %d ja existe; a linha Ped%d fica de fora", id, i + 1); continue; }
+        if (*g_pedCount >= PedLimit()) { Log("policiais: sem espaco para mais pedestres (%d de %d)", *g_pedCount, PedLimit()); break; }
+        ((int(__cdecl*)(const char*))0x5B7420)(line);                          // CFileLoader::LoadPedObject
+        ok++;
+    }
+    Log("policiais: %d modelos de policial registrados (%s); pedestres: %d de %d", ok, when, *g_pedCount, PedLimit());
+}
+typedef void (__cdecl* LoadObjTypes_t)(const char*);
+static LoadObjTypes_t g_origLoadObjTypes = nullptr;
+static bool StrHas(const char* s, const char* sub) {
+    for (; s && *s; s++) { int i = 0; while (sub[i] && tolower((unsigned char)s[i]) == sub[i]) i++; if (!sub[i]) return true; }
+    return false;
+}
+static void __cdecl LoadObjTypesDetour(const char* file) {
+    if (!g_fcRegistered && file && StrHas(file, "\\maps\\")) FcRegister("antes dos mapas");
+    g_origLoadObjTypes(file);
+    if (!g_fcRegistered && file && StrHas(file, "peds.ide")) FcRegister("depois do peds.ide");
+}
+static void ApplyFemaleCops() {
+    if (!g_fcOn || !g_fcNPed) return;
+    MovePedStore();
+    if (MH_CreateHook((void*)0x5B8400, (void*)&LoadObjTypesDetour, (void**)&g_origLoadObjTypes) == MH_OK && MH_EnableHook((void*)0x5B8400) == MH_OK)
+        Log("policiais: gancho no carregamento dos IDE (CFileLoader::LoadObjectTypes 0x5B8400)");
+    else Log("policiais: falha no gancho dos IDE; as policiais femininas ficam de fora");
+}
+static int   g_fcOrig[4] = { 283, 280, 281, 282 };
+static bool  g_fcOrigRead = false;
+static int   g_fcWant[4] = { 0, 0, 0, 0 };
+static DWORD g_fcRollT = 0;
+static void CopRotTick(DWORD now) {
+    if (!g_fcOn || !g_fcStreet) return;
+    static DWORD tT = 0;
+    if (now - tT < 1000 && now >= tT) return;
+    tT = now;
+    volatile int* arr = (volatile int*)0x8A5AA0;                              // CStreaming::ms_aDefaultCopModel
+    if (!g_fcOrigRead) {
+        g_fcOrigRead = true;
+        for (int l = 0; l < 4; l++) if (arr[l] > 0 && arr[l] < 20000) g_fcOrig[l] = arr[l];
+        int n = 0; for (int l = 0; l < 4; l++) if (FemCopModel(l) > 0) n++;
+        Log("policiais: policial feminina na rua em %d de 4 regioes (%s/%s/%s/%s)", n,
+            FemCopModel(0) > 0 ? "interior" : "-", FemCopModel(1) > 0 ? "LS" : "-", FemCopModel(2) > 0 ? "SF" : "-", FemCopModel(3) > 0 ? "LV" : "-");
+    }
+    if (!g_fcRollT || now - g_fcRollT > 45000 || now < g_fcRollT) {
+        g_fcRollT = now;
+        for (int l = 0; l < 4; l++) g_fcWant[l] = (rand() % 100) < g_fcChance;
+    }
+    int cur = *(volatile int*)0xBA6718;                                       // CTheZones::m_CurrLevel
+    for (int l = 0; l < 4; l++) {
+        int fem = FemCopModel(l);
+        int want = (l == cur && g_fcWant[l] && fem > 0) ? fem : g_fcOrig[l];
+        if (arr[l] == want) continue;
+        if (l == cur && !ModelLoaded(want)) { RequestModel(want, 2); continue; }   // so troca com o modelo ja carregado
+        arr[l] = want;
+        static DWORD tLog = 0;
+        if (GetTickCount() - tLog > 60000) { tLog = GetTickCount(); Log("policiais: na rua agora %s (regiao %d)", want == fem ? "policiais femininas" : "o policial de sempre", l); }
+    }
+}
+// motorista da garagem no nivel 64: policial feminina da regiao (ou o policial da regiao)
+static int GarageCopDriver(V3 at, int* pedType) {
+    if (VigLevel() < 64) return -1;
+    int level = 1;
+    { Cmd c(0x07EF); c.F(at.x).F(at.y).F(at.z).Out(0); RunCmd(c, &level, 1); }
+    if (level < 0 || level > 3) level = 1;
+    int fem = FemCopModel(level);
+    if (fem > 0) { *pedType = 5; return fem; }
+    static const int kPed[4] = { 283, 280, 281, 282 };
+    *pedType = 4;
+    return kPed[level];
+}
+
+static void PsApply();
+static void RewardsOnLoad() {                                                // jogo carregado: os pedestres sao outros
+    PsApply();
+    g_nRc = 0; g_nTg = 0; g_rcCand = -1; g_tgMeHp = -1.f; g_tgCar = nullptr;
+    memset(g_tgId, 0xFF, sizeof g_tgId);
+}
+// ---- tique das recompensas (depois do Vigilante)
+static void RewardsTick() {
+    DWORD now = GameMs();
+    if (!PlayerPed()) return;
+    TgTick(now);
+    RcTick(now);
+    Vig64Tick(now);
+    CopRotTick(now);
+    AimTick(GetTickCount());
+    FwTick();
+    static bool psDone = false;
+    if (!psDone) { psDone = true; PsApply(); }
+}
+
+// Trip Skip: o jogo desenha a caixa (CHud::Draw 0x58FC6A -> 0x58A160); enquanto ela aparece, o Sim fica na tela
+static void __cdecl TripSkipDraw() { g_tripSkipTick = GetTickCount(); ((void(__cdecl*)())0x58A160)(); }
+static void ApplyVigilante() {
+    PatchCallSite(0x58FC6A, 0x58A160, (void*)&TripSkipDraw, "trip skip: Sim na tela enquanto a caixa aparece");
+}
+
+// ---- transito: nenhum carro surge logo a frente do seu carro (3.33) ----
+// O jogo cria carro aleatorio em dois aneis em volta da camera: no anel de longe so se o ponto estiver na tela, no de
+// perto so se estiver FORA da tela (CCarCtrl::GenerateCarCreationCoors2, 0x424210, teste do anel de perto em 0x42498E).
+// Olhando para tras, a frente fica fora da tela e o jogo enche a pista de carros a poucos metros. Aqui, nesse teste,
+// um ponto na faixa a frente do seu carro conta como "na tela": o jogo nao cria carro ali e cria em outro lugar.
+// A faixa vai ate a distancia que o carro percorre em Seconds (entre MinDistance e MaxDistance) e abre com a distancia.
+static int   g_trOn = 1;
+static float g_trSecs = 4.f, g_trMin = 40.f, g_trMax = 160.f, g_trWidth = 12.f;
+static DWORD g_trCount = 0, g_trLogAt = 0;
+typedef bool (__thiscall* SphereVis_t)(void* cam, const float* pos, float r);
+static bool __thiscall TrSpawnVisible(void* cam, const float* pos, float r) {
+    bool vis = ((SphereVis_t)0x420D40)(cam, pos, r);                        // CCamera::IsSphereVisible
+    if (vis || !g_trOn || !pos) return vis;
+    char* v = PlayerVehicle();
+    if (!v) return false;
+    const float* mv = (const float*)(v + 0x44);                               // m_vecMoveSpeed (x50 = m/s)
+    float sx = mv[0] * 50.f, sy = mv[1] * 50.f, sp = sqrtf(sx * sx + sy * sy);
+    float fx, fy;
+    if (sp > 2.f) { fx = sx / sp; fy = sy / sp; }                             // para onde o carro anda
+    else {
+        const float* m = Rd<const float*>(v, 0x14);                           // parado: para onde ele aponta
+        if (!m) return false;
+        fx = m[4]; fy = m[5];
+        float l = sqrtf(fx * fx + fy * fy);
+        if (l < 0.01f) return false;
+        fx /= l; fy /= l;
+    }
+    V3 c = EntityPos(v);
+    float dx = pos[0] - c.x, dy = pos[1] - c.y;
+    float ahead = dx * fx + dy * fy, side = fabsf(dy * fx - dx * fy);
+    float reach = sp * g_trSecs;
+    if (reach < g_trMin) reach = g_trMin;
+    if (reach > g_trMax) reach = g_trMax;
+    if (ahead < -5.f || ahead > reach || side > g_trWidth + ahead * 0.35f) return false;
+    g_trCount++;
+    DWORD now = GetTickCount();
+    if (now - g_trLogAt > 60000) {
+        Log("transito: %u carros deixaram de surgir a sua frente (o ultimo a %.0f m, a %.0f km/h)", g_trCount, ahead, sp * 3.6f);
+        g_trLogAt = now; g_trCount = 0;
+    }
+    return true;
+}
+static void ApplyTraffic() {
+    PatchCallSite(0x42498E, 0x420D40, (void*)&TrSpawnVisible, "transito: sem carro surgindo logo a frente");
+}
 static void ApplyProtect() {
     int ok = 0;
     ok += PatchCallSite(0x47D335, 0x5E6080, (void*)&PmGive,     "armas: GIVE_WEAPON_TO_CHAR (01B2)");
@@ -4521,6 +6617,63 @@ static void CamTick(const GyroBlock* b) {                                     //
         }
     }
 }
+// ---------------------------------------------------------------- trocar de alvo na mira automatica ([Gyro])
+// Com um alvo travado (CPed +0x71C, a mira automatica do controle), girar o iPhone TargetSwitchDegrees graus para um
+// lado, ou dar um toque no analogico direito para o lado, troca para o proximo alvo daquele lado: a mesma chamada que
+// o jogo faz com L2/R2 (CPlayerPed::FindNextWeaponLockOnTarget 0x60E530, chamada em 0x686A86 e 0x686C8D).
+typedef bool (__thiscall* FindNextLock_t)(void* ped, void* target, bool left);
+static float g_tsAcc = 0.f; static void* g_tsTarget = nullptr; static DWORD g_tsLast = 0; static bool g_tsStickArmed = true;
+static void TargetSwitch(bool left, const char* how) {
+    char* me = PlayerPed();
+    void* t = me ? Rd<void*>(me, 0x71C) : nullptr;
+    if (!t) return;
+    bool ok = ((FindNextLock_t)0x60E530)(me, t, left);
+    g_tsLast = GetTickCount(); g_tsAcc = 0.f; g_tsTarget = me ? Rd<void*>(me, 0x71C) : nullptr;
+    static int logged = 0;
+    if (logged < 6) { logged++; Log("mira: troca de alvo para a %s (%s)%s", left ? "esquerda" : "direita", how, ok ? "" : ", nao ha outro alvo desse lado"); }
+}
+static bool TargetLocked() {
+    char* me = PlayerPed();
+    return me && !PlayerVehicle() && Rd<void*>(me, 0x71C) && !MenuActive();
+}
+static void TargetGyro(int dyMicro) {                                         // giro do iPhone (microrradianos, + = direita)
+    if (g_tsDeg <= 0 || !TargetLocked()) { g_tsAcc = 0.f; g_tsTarget = nullptr; return; }
+    void* t = Rd<void*>(PlayerPed(), 0x71C);
+    if (t != g_tsTarget) { g_tsTarget = t; g_tsAcc = 0.f; }
+    if (GetTickCount() - g_tsLast < 250) { g_tsAcc = 0.f; return; }
+    g_tsAcc += dyMicro * 1e-6f;
+    float thr = g_tsDeg * 0.017453293f;
+    if (g_tsAcc >= thr) TargetSwitch(false, "giroscopio");
+    else if (g_tsAcc <= -thr) TargetSwitch(true, "giroscopio");
+}
+static void TargetStickTick() {                                               // toque no analogico direito
+    if (!g_tsStick) return;
+    int rx = g_touchRX;
+    if (!TargetLocked()) { g_tsStickArmed = rx > -9000 && rx < 9000; return; }
+    if (rx > -9000 && rx < 9000) { g_tsStickArmed = true; return; }
+    if (!g_tsStickArmed || (rx > -20000 && rx < 20000)) return;
+    g_tsStickArmed = false;
+    TargetSwitch(rx < 0, "analogico");
+}
+// Volante sem o "mouse": com o controle do jogo em Mouse + Teclado (CCamera::m_bUseMouse3rdPerson) e "Volante com o
+// mouse" ligado, o carro (0x6AD7AC), a moto (0x6BE39C), 0x6CE03D, o barco (0x6F0AFA) e os aviao/helicoptero ("Voar com
+// o mouse", 0x6C4880 e 0x6CAE07) vao ate o lado das setas aos poucos, como se fosse mouse (atraso no volante). Aqui
+// essas leituras passam a ler um byte nosso que vale sempre 0 (mov al,[x] -> mov al,[g_noMouseFlag]): o veiculo sempre
+// usa o controle direto. O menu nao muda. O endereco continua sendo um ponteiro valido: o SilentPatch le o operando de
+// 0x6AD7AC (o ponteiro da opcao) para usar depois; com "xor al,al" ele lia 0x909090C0 e o jogo fechava dirigindo (3.29).
+static volatile BYTE g_noMouseFlag = 0;
+static void ApplyNoMouseSteer() {
+    static const DWORD site[6] = { 0x6AD7AC, 0x6BE39C, 0x6CE03D, 0x6F0AFA, 0x6C4880, 0x6CAE07 };
+    static const DWORD flag[6] = { 0xC1CC02, 0xC1CC02, 0xC1CC02, 0xC1CC02, 0xC1CC03, 0xC1CC03 };
+    int ok = 0;
+    for (int i = 0; i < 6; i++) {
+        BYTE exp[5] = { 0xA0 }; *(DWORD*)(exp + 1) = flag[i];
+        BYTE rep[5] = { 0xA0 }; *(DWORD*)(rep + 1) = (DWORD)&g_noMouseFlag;
+        char what[64]; snprintf(what, sizeof what, "volante sem mouse (%s)", i < 4 ? "dirigir" : "voar");
+        ok += PatchBytes(site[i], exp, 5, rep, 5, what);
+    }
+    if (ok < 6) Log("volante sem mouse: %d de 6 pontos aplicados", ok);
+}
 static void GyroTick() {
     if (!g_gyroOn || !g_touchOn) { CamTick(nullptr); return; }
     GyroBlock b;
@@ -4537,6 +6690,7 @@ static void GyroTick() {
     if (!g_gyHave) { g_gyPrevYaw = b.yaw; g_gyPrevPitch = b.pitch; g_gyHave = true; return; }
     int dy = (int)(b.yaw - g_gyPrevYaw), dp = (int)(b.pitch - g_gyPrevPitch);
     g_gyPrevYaw = b.yaw; g_gyPrevPitch = b.pitch;
+    if (dy > -600000 && dy < 600000) TargetGyro(dy);
     if (!dy && !dp) return;
     if (dy > 600000 || dy < -600000 || dp > 600000 || dp < -600000) return;   // salto (overlay reiniciou)
     if (!PlayerPed() || *(volatile signed char*)0xB5F851) return;             // sem CJ / cutscene
@@ -4805,6 +6959,9 @@ static DWORD WINAPI StartupThread(LPVOID) {
     HookGame(0x588BE0, (void*)&SetHelpDetour, (void**)&g_origSetHelp, "do texto de ajuda");
     HookGame(0x588E30, (void*)&SetHelpNumDetour, (void**)&g_origSetHelpNum, "do texto de ajuda com numero");
     if (g_garOn || g_armOn) InstallGarage();                                  // depois do MH_Initialize
+    InstallCrimeHooks();
+    if (g_daOn) InstallDriveByAim();
+    InstallCarWeapons();
     InstallXInputHooks();
     if (g_audioHash) { HANDLE t = CreateThread(nullptr, 0, AudioHashThread, nullptr, 0, nullptr); if (t) CloseHandle(t); }
     return 0;
@@ -4822,6 +6979,9 @@ static void LoadConfig(HMODULE self) {
     g_steerOn   = GetPrivateProfileIntA("Steer", "Enabled",   1,   ini);
     g_rampMs    = GetPrivateProfileIntA("Steer", "RampMs",    150, ini);
     g_releaseMs = GetPrivateProfileIntA("Steer", "ReleaseMs", 60,  ini);
+    g_noMouseSteer = GetPrivateProfileIntA("Steer", "NoMouseSteering", 1, ini);
+    g_tsDeg     = GetPrivateProfileIntA("Gyro", "TargetSwitchDegrees", 10, ini);
+    g_tsStick   = GetPrivateProfileIntA("Gyro", "TargetSwitchStick",    1, ini);
     g_touchOn   = GetPrivateProfileIntA("Touch", "Enabled",   1,   ini);
     g_log       = GetPrivateProfileIntA("Debug", "Log",       1,   ini);
     g_traceTouch   = GetPrivateProfileIntA("Debug", "TouchTrace",   0, ini);
@@ -4835,6 +6995,95 @@ static void LoadConfig(HMODULE self) {
     g_skinOn       = GetPrivateProfileIntA("Skins", "Menu",         1, ini);
     g_skinAnims    = GetPrivateProfileIntA("Skins", "Anims",        1, ini);
     g_skinVoice    = GetPrivateProfileIntA("Skins", "Voice",        1, ini);
+    {
+        char fb[32];
+        g_trOn = GetPrivateProfileIntA("Transito", "Enabled", 1, ini);
+        GetPrivateProfileStringA("Transito", "Seconds", "4", fb, sizeof fb, ini);     g_trSecs  = (float)atof(fb);
+        GetPrivateProfileStringA("Transito", "MinDistance", "40", fb, sizeof fb, ini); g_trMin  = (float)atof(fb);
+        GetPrivateProfileStringA("Transito", "MaxDistance", "160", fb, sizeof fb, ini); g_trMax = (float)atof(fb);
+        GetPrivateProfileStringA("Transito", "Width", "12", fb, sizeof fb, ini);        g_trWidth = (float)atof(fb);
+        if (g_trMax < g_trMin) g_trMax = g_trMin;
+    }
+    {
+        char fb[96];
+        g_vgOn      = GetPrivateProfileIntA("Vigilante", "Enabled", 1, ini);
+        g_vgNoChase = GetPrivateProfileIntA("Vigilante", "PoliceIgnore", 1, ini);
+        g_vgOutSec  = GetPrivateProfileIntA("Vigilante", "OutOfCarSeconds", 120, ini);
+        g_vgHelpOn  = GetPrivateProfileIntA("Vigilante", "StreetCopsHelp", 1, ini);
+        GetPrivateProfileStringA("Vigilante", "HelpRadius", "100", fb, sizeof fb, ini);     g_vgHelpR = (float)atof(fb);
+        GetPrivateProfileStringA("Vigilante", "BackupCooldown", "60", fb, sizeof fb, ini);  g_vgCool = (float)atof(fb);
+        GetPrivateProfileStringA("Vigilante", "SingleCooldown", "60", fb, sizeof fb, ini);  g_vgOneCool = (float)atof(fb);
+        GetPrivateProfileStringA("Vigilante", "SpawnMin", "30", fb, sizeof fb, ini);        g_vgSpawnMin = (float)atof(fb);
+        GetPrivateProfileStringA("Vigilante", "SpawnMax", "70", fb, sizeof fb, ini);        g_vgSpawnMax = (float)atof(fb);
+        GetPrivateProfileStringA("Vigilante", "Models", "dsher,csher", g_vgModels, sizeof g_vgModels, ini);
+        g_vgPerk     = GetPrivateProfileIntA("Vigilante", "Level12Wanted", 1, ini);
+        g_vgMaxStars = GetPrivateProfileIntA("Vigilante", "MaxStars", 4, ini);
+        GetPrivateProfileStringA("Vigilante", "StarSeconds", "65", fb, sizeof fb, ini);     g_vgStarSec = (float)atof(fb);
+        GetPrivateProfileStringA("Vigilante", "CopRadius", "60", fb, sizeof fb, ini);       g_vgCopR = (float)atof(fb);
+        g_vgHealth     = GetPrivateProfileIntA("Vigilante", "CopHealth", 300, ini);
+        g_vgArmour     = GetPrivateProfileIntA("Vigilante", "CopArmour", 100, ini);
+        g_vgNoAim      = GetPrivateProfileIntA("Vigilante", "NoAutoAimOnCops", 1, ini);
+        g_vgBonusEvery = GetPrivateProfileIntA("Vigilante", "DoubleBonusEvery", 3, ini);
+        g_vgTestLevel  = GetPrivateProfileIntA("Vigilante", "TestLevel", 0, ini);
+        g_rcOn         = GetPrivateProfileIntA("Vigilante", "Recruit", 1, ini);
+        g_rcMax12      = GetPrivateProfileIntA("Vigilante", "RecruitMax12", 1, ini);
+        g_rcMax21      = GetPrivateProfileIntA("Vigilante", "RecruitMax21", 3, ini);
+        g_vg64Help     = GetPrivateProfileIntA("Vigilante", "Level64CopsHelp", 1, ini);
+        if (g_rcMax12 < 0) g_rcMax12 = 0;
+        if (g_rcMax21 < 0) g_rcMax21 = 0;
+        if (g_rcMax12 > 4) g_rcMax12 = 4;
+        if (g_rcMax21 > 4) g_rcMax21 = 4;
+        {
+            char fb[32];
+            GetPrivateProfileStringA("Vigilante", "StarSeconds64", "32", fb, sizeof fb, ini); g_vgStar64 = (float)atof(fb);
+            if (g_vgStar64 < 5.f) g_vgStar64 = 5.f;
+        }
+        g_fcOn     = GetPrivateProfileIntA("PoliciaisFemininas", "Enabled", 1, ini);
+        g_fcStreet = GetPrivateProfileIntA("PoliciaisFemininas", "Street", 1, ini);
+        g_fcChance = GetPrivateProfileIntA("PoliciaisFemininas", "Chance", 40, ini);
+        g_fcMax    = GetPrivateProfileIntA("PoliciaisFemininas", "PedLimit", 350, ini);
+        if (g_fcChance < 0) g_fcChance = 0;
+        if (g_fcChance > 100) g_fcChance = 100;
+        g_fcChanceV = g_fcChance;
+        GetPrivateProfileStringA("PoliciaisFemininas", "Country", "wfycllv", g_fcName[0], sizeof g_fcName[0], ini);
+        GetPrivateProfileStringA("PoliciaisFemininas", "LS", "wfyclpd", g_fcName[1], sizeof g_fcName[1], ini);
+        GetPrivateProfileStringA("PoliciaisFemininas", "SF", "vbfycpd", g_fcName[2], sizeof g_fcName[2], ini);
+        GetPrivateProfileStringA("PoliciaisFemininas", "LV", "wfycllv", g_fcName[3], sizeof g_fcName[3], ini);
+        {
+            static const char* def[3] = {
+                "265, wfyclpd, wfyclpd, COP, STAT_COP, woman, 1FFF, 0, null, 9, 9, PED_TYPE_GEN, VOICE_GEN_WFYBU, VOICE_GEN_WFYBU",
+                "266, vbfycpd, vbfycpd, COP, STAT_COP, woman, 1FFF, 0, null, 9, 9, PED_TYPE_GEN, VOICE_GEN_BFYBU, VOICE_GEN_BFYBU",
+                "267, wfycllv, wfycllv, COP, STAT_COP, woman, 1FFF, 0, null, 9, 9, PED_TYPE_GEN, VOICE_GEN_WFYST, VOICE_GEN_WFYST" };
+            g_fcNPed = 0;
+            for (int i = 0; i < 8; i++) {
+                char key[8]; snprintf(key, sizeof key, "Ped%d", i + 1);
+                GetPrivateProfileStringA("PoliciaisFemininas", key, i < 3 ? def[i] : "", g_fcPed[g_fcNPed], sizeof g_fcPed[0], ini);
+                if (g_fcPed[g_fcNPed][0]) g_fcNPed++;
+            }
+        }
+        if (g_vgHealth < 1) g_vgHealth = 100;
+        if (g_vgSpawnMax < g_vgSpawnMin + 10.f) g_vgSpawnMax = g_vgSpawnMin + 10.f;
+        if (g_vgOutSec > 600) g_vgOutSec = 600;
+    }
+    g_daOn   = GetPrivateProfileIntA("MiraDriveBy", "Enabled", 1, ini);
+    g_daCars = GetPrivateProfileIntA("MiraDriveBy", "Carros", 1, ini);
+    g_daCone = (float)GetPrivateProfileIntA("MiraDriveBy", "Cone", 35, ini);
+    g_daConeZ = (float)GetPrivateProfileIntA("MiraDriveBy", "ConeAltura", 12, ini);
+    g_cwOn   = GetPrivateProfileIntA("ArmasNoVeiculo", "Enabled", 1, ini);
+    g_fwOn   = GetPrivateProfileIntA("ArmasNoVeiculo", "TiroFrente", 1, ini);
+    g_fwGlass = GetPrivateProfileIntA("ArmasNoVeiculo", "Parabrisa", 1, ini);
+    g_apOn   = GetPrivateProfileIntA("MiraAPe", "PrioridadeSuspeito", 1, ini);
+    g_htOn   = GetPrivateProfileIntA("MiraAPe", "HitmanProximoAlvo", 1, ini);
+    g_htCops = GetPrivateProfileIntA("MiraAPe", "Policiais", 0, ini);
+    g_htDelay = GetPrivateProfileIntA("MiraAPe", "Atraso", 200, ini);
+    g_psOn   = GetPrivateProfileIntA("PistolaSilenciada", "Enabled", 1, ini);
+    g_psClip = GetPrivateProfileIntA("PistolaSilenciada", "Pente", 12, ini);
+    g_psStdFr = GetPrivateProfileIntA("PistolaSilenciada", "QuadrosIntermediario", 9, ini);
+    g_psProFr = GetPrivateProfileIntA("PistolaSilenciada", "QuadrosHitman", 6, ini);
+    g_psStdAcc = GetPrivateProfileIntA("PistolaSilenciada", "PrecisaoIntermediario", 135, ini) / 100.f;
+    g_psProAcc = GetPrivateProfileIntA("PistolaSilenciada", "PrecisaoHitman", 160, ini) / 100.f;
+    if (g_daCone > 90.f) g_daCone = 90.f;
+    if (g_daConeZ > 45.f) g_daConeZ = 45.f;
     g_skinClothes  = GetPrivateProfileIntA("Skins", "KeepSkin",     1, ini);
     g_garOn        = GetPrivateProfileIntA("Garage", "Enabled",     1, ini);
     g_garPrice     = GetPrivateProfileIntA("Garage", "Price",    1250, ini);
@@ -4871,6 +7120,12 @@ static void LoadConfig(HMODULE self) {
     g_armLockBoxes = GetPrivateProfileIntA("Traficante", "LockedBoxesPerDay", 2, ini);
     g_armCooldown  = GetPrivateProfileIntA("Traficante", "CooldownMinutes", 1440, ini);
     g_armLeave     = GetPrivateProfileIntA("Traficante", "LeaveDistance",    40, ini);
+    g_armCopSee    = GetPrivateProfileIntA("Traficante", "CopSeeDistance",   25, ini);
+    g_armCopAngle  = GetPrivateProfileIntA("Traficante", "CopSeeAngle",      60, ini);
+    g_armDoorDist  = GetPrivateProfileIntA("Traficante", "DoorOpenDistance",  7, ini);
+    if (g_armCopSee < 5) g_armCopSee = 5;
+    if (g_armCopAngle < 10 || g_armCopAngle > 180) g_armCopAngle = 60;
+    if (g_armDoorDist < 2) g_armDoorDist = 2;
     if (g_armDiscount < 0 || g_armDiscount > 90) g_armDiscount = 15;
     if (g_armLockMult < 1) g_armLockMult = 1;
     if (g_armLockBoxes < 0) g_armLockBoxes = 0;
@@ -4924,8 +7179,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     InitializeCriticalSection(&g_hookCs);
     LoadConfig(inst);
     QueryPerformanceFrequency(&g_qpf);
-    Log("GTMTouchSA 3.24 carregado (direcao=%d rampa=%d retorno=%d toque=%d sim/nao por script=%d diag toque=%d ragdoll=%d contagem=%d audio=%d x87=%d pular abertura=%d radar no alto=%d protecao da arma=%d menu de skins=%d andar da skin=%d voz da skin=%d skin nas roupas de missao=%d garagem=%d giroscopio=%d traficante=%d dar arma=%d armas em missao=%d)",
-        g_steerOn, g_rampMs, g_releaseMs, g_touchOn, g_ynScripts, g_traceTouch, g_traceRagdoll, g_countRagdoll, g_audioHash, g_fixX87, g_skipIntro, g_radarTop, g_weaponGuard, g_skinOn, g_skinAnims, g_skinVoice, g_skinClothes, g_garOn, g_gyroOn, g_armOn, g_giveOn, g_pmOn);
+    Log("GTMTouchSA 3.44 carregado (vigilante=%d transito=%d direcao=%d rampa=%d retorno=%d toque=%d sim/nao por script=%d diag toque=%d ragdoll=%d contagem=%d audio=%d x87=%d pular abertura=%d radar no alto=%d protecao da arma=%d menu de skins=%d andar da skin=%d voz da skin=%d skin nas roupas de missao=%d garagem=%d giroscopio=%d traficante=%d dar arma=%d armas em missao=%d mira do drive-by=%d)",
+        g_vgOn, g_trOn, g_steerOn, g_rampMs, g_releaseMs, g_touchOn, g_ynScripts, g_traceTouch, g_traceRagdoll, g_countRagdoll, g_audioHash, g_fixX87, g_skipIntro, g_radarTop, g_weaponGuard, g_skinOn, g_skinAnims, g_skinVoice, g_skinClothes, g_garOn, g_gyroOn, g_armOn, g_giveOn, g_pmOn, g_daOn);
     if (g_armOn) Log("traficante: ligacao $%d, %d%% abaixo da AmmuNation, fora de epoca %dx e %d caixas por arma por dia, sem atender %d min do jogo, vai embora a %d m",
         g_armCall, g_armDiscount, g_armLockMult, g_armLockBoxes, g_armCooldown, g_armLeave);
     if (GetModuleHandleA("GTMSteerSA.asi")) Log("AVISO: GTMSteerSA.asi tambem esta carregado; apague ele da pasta scripts");
@@ -4940,8 +7195,15 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     if (g_skinClothes) ApplySkinClothes();
     if (g_gyroOn) ApplyGyroCam();
     if (g_pmOn) ApplyProtect();
+    if (g_noMouseSteer) ApplyNoMouseSteer();
+    if (g_skinVoice) ApplyConvSay();
+    if (g_trOn) ApplyTraffic();
+    ApplyVigilante();
+    if (g_garOn) PatchCallSite(0x44B125, 0x4C8500, (void*)&PnsColour, "garagem: Pay 'n' Spray sem trocar a cor do carro seu");
+    ApplyCrimePatches();
     g_mhReady = (MH_Initialize() == MH_OK);
     if (!g_mhReady) { Log("MinHook nao iniciou"); return TRUE; }
+    ApplyFemaleCops();                                                        // antes de o jogo ler os IDE
     HANDLE t = CreateThread(nullptr, 0, StartupThread, nullptr, 0, nullptr);
     if (t) CloseHandle(t); else Log("nao criou a thread de inicio (erro %lu)", GetLastError());
     return TRUE;
