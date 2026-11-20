@@ -26,13 +26,15 @@ Overlay de toque contextual para o GTA San Andreas (PC 1.0 US) rodando no Madeir
   pelo Sim/Não e recompensas por nível (12: mirar em policial não dá estrela, recrutar policial como parceiro de
   gangue, armeiro da polícia no Vigilante e o procurado caindo mais rápido; 21: roubo de carro e batida em viatura
   sem estrela e até 3 recrutas; 32: Vigilante sem timer; 64: Vigilante a qualquer hora, a pé ou em qualquer veículo,
-  a polícia ignorando seus crimes e indo atrás dos seus alvos), as policiais femininas do SA-MP 0.3.7 na rua e no
+  a polícia ignorando seus crimes e indo atrás dos seus alvos; salvar no Vigilante como checkpoint: o save volta no
+  mesmo nível, com as kills e o reforço), as policiais femininas do SA-MP 0.3.7 na rua e no
   reforço (o limite de 278 modelos de pedestre do jogo sobe para 350), a mira do drive-by (de moto ou de carro, o
   tiro vai no suspeito do Vigilante, no veículo dele ou em quem atacou você; sem alvo, só a altura do tiro é acertada
   no pedestre ou veículo à frente), a mira a pé que prefere o suspeito (até dentro do carro) e, no nível hitman, passa
   sozinha para o próximo agressor, a pistola silenciada .45 mais rápida, botões próprios do Vigilante no overlay
   (Reforço, Viatura, Recrutar policial, Vigilante), trocar de arma no veículo e fazer drive-by com pistola, SMG,
-  fuzil ou escopeta, atirar para a frente no carro quebrando o para-brisa, e a garagem pelo telefone
+  fuzil ou escopeta (recarregando pelo toque no ícone da arma, como a pé), atirar para a frente no carro quebrando
+  o para-brisa, recrutas que ficam no seu veículo atirando da janela e voltam para você quando chamados, e a garagem pelo telefone
   (Status + Pular: os carros das garagens das casas viram seus; um membro da Grove entrega, busca e leva
   para a garagem; venda no mercado negro; os amassados do LocalDent vao junto, com o LocalDent modificado que
   exporta o estado de cada carro; cada garagem guarda quantos carros couberem nela e o carro que nao cabe fica

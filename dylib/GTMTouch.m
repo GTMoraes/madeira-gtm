@@ -1,4 +1,4 @@
-// GTMTouch.dylib 3.8 - overlay de toque contextual para o GTA San Andreas no Madeira.
+// GTMTouch.dylib 3.9 - overlay de toque contextual para o GTA San Andreas no Madeira.
 //
 // Injetado no IPA oficial do Madeira. Desenha os controles por cima do jogo e troca o
 // conjunto de botoes sozinho conforme o contexto que o GTMTouchSA.asi escreve em
@@ -100,6 +100,7 @@ enum {
 // 3.7 (protocolo 6): botoes do Vigilante no lugar do Sim/Nao: Reforco e Viatura (na missao, acesos quando
 // podem vir), Recrutar policial (policial perto ou na mira) e Vigilante (nivel 64: comecar/encerrar).
 // 3.8: Trocar arma tambem no veiculo (deslizar; o .asi troca pelos comandos 10 e 11, porque LT/RT ali e Olhar).
+// 3.9: no veiculo, um toque no Trocar arma recarrega (comando 4) quando o GTMTouchSA 3.46 diz que da (S_RELOAD).
 // estado do jogo (igual ao .asi) + S_CANSAVE, que e local
 enum {
     S_YESNO = 1u << 0, S_WEAPONS = 1u << 1, S_AIM = 1u << 2, S_DETONATE = 1u << 3, S_MORESATCHEL = 1u << 4,
@@ -945,7 +946,7 @@ static UIResponder *GTMCurrentFirstResponder(void) {
                     _pulseUntil = CACurrentMediaTime() + 0.12;
                 }
                 [_haptic impactOccurred];
-            } else if (!inCar && (_state & S_RELOAD)) {             // so quando o jogo diz que da; senao nada (nem vibra)
+            } else if (_state & S_RELOAD) {                        // a pe e no veiculo (3.9); so quando o jogo diz que da
                 _cmdSeq++; _hostCmd = CMD_RELOAD;
                 [_haptic impactOccurred];
             }
@@ -1435,7 +1436,7 @@ enum { GYT_ON = 101, GYT_ALWAYS, GYT_H, GYT_V, GYT_AIM, GYT_INVERT, GYT_ZOOM, GY
     self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(frame:)];
     self.link.preferredFrameRateRange = CAFrameRateRangeMake(30, 60, 60);
     [self.link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
-    NSLog(@"[GTMTouch] overlay 3.8 ligado; arquivo %@", GTMSharedPath());
+    NSLog(@"[GTMTouch] overlay 3.9 ligado; arquivo %@", GTMSharedPath());
 }
 - (void)frame:(CADisplayLink *)l { [self.pad tick]; }
 - (void)sceneEvent:(NSNotification *)n { [self attachIfNeeded]; }
