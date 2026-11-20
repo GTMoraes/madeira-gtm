@@ -33,7 +33,7 @@ Overlay de toque contextual para o GTA San Andreas (PC 1.0 US) rodando no Madeir
   no pedestre ou veículo à frente), a mira a pé que prefere o suspeito (até dentro do carro) e, no nível hitman, passa
   sozinha para o próximo agressor, a pistola silenciada .45 mais rápida, botões próprios do Vigilante no overlay
   (Reforço, Viatura, Recrutar policial, Vigilante), trocar de arma no veículo e fazer drive-by com pistola, SMG,
-  fuzil ou escopeta (recarregando pelo toque no ícone da arma, como a pé), atirar para a frente no carro quebrando
+  fuzil ou escopeta (na moto com a animação de drive-by do jogo; recarregando pelo toque no ícone da arma, como a pé), atirar para a frente no carro quebrando
   o para-brisa, recrutas que ficam no seu veículo atirando da janela e voltam para você quando chamados, e a garagem pelo telefone
   (Status + Pular: os carros das garagens das casas viram seus; um membro da Grove entrega, busca e leva
   para a garagem; venda no mercado negro; os amassados do LocalDent vao junto, com o LocalDent modificado que

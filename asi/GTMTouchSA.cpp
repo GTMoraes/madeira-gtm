@@ -504,7 +504,7 @@ static bool GangDriveBy(char* ped) {
     return false;
 }
 static DWORD VigButtonState();
-static int  g_cwOn = 1, g_fwOn = 1, g_fwGlass = 1;
+static int  g_cwOn = 1, g_fwOn = 1, g_fwGlass = 1, g_cwBikeAnim = 1;         // g_cwBikeAnim: [ArmasNoVeiculo] AnimacaoNaMoto (3.48)
 static int  g_vgNever = 1, g_vgBikeShoot = 1;                                // [Vigilante] NuncaProcurado, PolicialDeMotoAtira
 static bool CwAllowed(int t) { return t >= 22 && t <= 33; }                    // pistolas, escopetas, SMGs, fuzis, rifle de caca
 static bool CwHasAny(const char* ped) {
@@ -5959,8 +5959,89 @@ static int __cdecl CwDriveByOk(char* ped) {
     char* v = (Rd<BYTE>(ped, 0x46D) & 1) ? Rd<char*>(ped, 0x58C) : nullptr;
     int sub = v ? Rd<int>(v, 0x594) : 0;
     bool smg = t == 28 || t == 29 || t == 32;
-    if ((sub == 9 || sub == 10 || sub == 2) && !smg) return 0;                  // moto: o drive-by do jogo so anima SMG
+    if ((sub == 9 || sub == 10 || sub == 2) && !smg && !g_cwBikeAnim) return 0; // moto sem AnimacaoNaMoto: tiro pelo mod
     return CwAllowed(t) && WeaponAmmo(ped, sl) > 0;
+}
+// ---- drive-by do jogo na moto com qualquer arma ([ArmasNoVeiculo] AnimacaoNaMoto, 3.48)
+// O drive-by do CJ pilotando moto, bicicleta ou quadriciclo nao e a tarefa CTaskSimpleGangDriveBy (por isso o gancho
+// de 0x628328 nunca viu o tiro dele): e o CVehicle::DoDriveByShootings (0x741FD0), chamado pelo ProcessControl dos
+// veiculos so para o motorista jogador com m_bCanDoDriveBy (+0x153 do CPlayerData). Ele toca as animacoes de drive-by
+// do grupo de pilotagem da moto (0xCA, 0xCB, 0xCC: esquerda, direita, frente), atira por CWeapon::FireFromCar
+// (0x73FA20 -> FireInstantHitFromCar 0x73EC40 -> FireInstantHitFromCar2 0x73CBA0, que faz a linha do tiro) e, com o
+// Atirar solto, enche o pente na hora. A unica trava de arma e em 0x742051: slot da arma (CWeaponInfo+0x14) == 4, SMG.
+// O mod troca essa conferencia por CwDdbOk: em moto, bicicleta e quadriciclo, qualquer arma de CwAllowed.
+// Ritmo: depois do tiro o jogo poe o proximo em agora + 70 ms (0x742296), o da SMG; para as outras, CwDdbTick troca
+// pelo laco da animacao da arma (como o tiro do mod). Mira: gancho no FireInstantHitFromCar2 (DaAim no fim do tiro do
+// CJ), que tambem pega a SMG na moto (o tiro dela nao passava por CWeapon::Fire).
+static char*    g_ddbW = nullptr;
+static unsigned g_ddbT = 0;
+static int      g_ddbType = 0;
+static int __cdecl CwDdbOk(char* wi, char* w, char* veh) {
+    bool orig = wi && Rd<int>(wi, 0x14) == 4;
+    if (!g_cwOn || !g_cwBikeAnim || !veh || !w) return orig;
+    int sub = Rd<int>(veh, 0x594);
+    if (sub != 9 && sub != 10 && sub != 2) return orig;
+    if (orig) return 1;
+    int t = Rd<int>(w, 0);
+    bool ok = CwAllowed(t);
+    static bool noted[64] = {};
+    if (ok && t >= 0 && t < 64 && !noted[t]) { noted[t] = true; Log("moto: drive-by do jogo com %s (com animacao)", CwName(t)); }
+    return ok;
+}
+typedef void (__thiscall* Fihfc2_t)(void*, float, float, float, float, float, float, char*, char*);
+static Fihfc2_t g_fihfc2Orig = (Fihfc2_t)0x73CBA0;
+static void __fastcall Fihfc2Hook(void* w, void*, float sx, float sy, float sz, float ex, float ey, float ez, char* veh, char* owner) {
+    char* me = PlayerPed();
+    if (me && owner == me && w) {
+        int t = Rd<int>(w, 0);
+        static int noted = 0;
+        if (noted < 4) { noted++; Log("drive-by do veiculo: tiro do CJ com %s (FireInstantHitFromCar2, chamado de 0x%X)", CwName(t), (unsigned)(DWORD)__builtin_return_address(0)); }
+        if (g_daOn) {
+            V3 s3 = { sx, sy, sz }, e3 = { ex, ey, ez };
+            const char* info = GetWeaponInfo(t, GetWeaponSkill(me, t) & 0xFF);
+            float range = info ? Rd<float>(info, 8) : 45.f;
+            if (range < 20.f) range = 20.f;
+            DaAim(&s3, &e3, range);
+            ex = e3.x; ey = e3.y; ez = e3.z;
+        }
+        if (t != 28 && t != 29 && t != 32) { g_ddbW = (char*)w; g_ddbT = *TimeMs; g_ddbType = t; }
+    }
+    g_fihfc2Orig(w, sx, sy, sz, ex, ey, ez, veh, owner);
+}
+static void CwDdbTick() {
+    if (!g_ddbW) return;
+    char* w = g_ddbW; g_ddbW = nullptr;
+    char* me = PlayerPed();
+    if (!me || Rd<int>(w, 0) != g_ddbType) return;
+    if (Rd<unsigned>(w, 0x10) != g_ddbT + 70) return;                       // so o ritmo que o DoDriveByShootings acabou de por
+    const char* info = GetWeaponInfo(g_ddbType, GetWeaponSkill(me, g_ddbType) & 0xFF);
+    float loop = info ? Rd<float>(info, 0x44) - Rd<float>(info, 0x40) : 0.3f;
+    unsigned iv = (unsigned)(loop * 1000.f);
+    if (iv < 80) iv = 80;
+    *(unsigned*)(w + 0x10) = g_ddbT + iv;
+    static int noted = 0;
+    if (noted < 3) { noted++; Log("moto: ritmo de %s no drive-by: %u ms", CwName(g_ddbType), iv); }
+}
+static void InstallBikeDriveBy() {
+    if (!g_cwOn || !g_cwBikeAnim) return;
+    BYTE* st = (BYTE*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!st) { Log("moto: sem memoria para o desvio do drive-by"); return; }
+    // add esp,8 | push edi (veiculo) | push ebx (CWeapon) | push eax (CWeaponInfo) | call CwDdbOk | add esp,0xC
+    // | test eax,eax | je 0x7422F6 (sem drive-by) | jmp 0x742060 (segue)
+    BYTE code[27] = { 0x83, 0xC4, 0x08, 0x57, 0x53, 0x50, 0xE8, 0, 0, 0, 0, 0x83, 0xC4, 0x0C, 0x85, 0xC0,
+                      0x0F, 0x84, 0, 0, 0, 0, 0xE9, 0, 0, 0, 0 };
+    *(DWORD*)(code + 7)  = (DWORD)&CwDdbOk - ((DWORD)st + 11);
+    *(DWORD*)(code + 18) = 0x7422F6 - ((DWORD)st + 22);
+    *(DWORD*)(code + 23) = 0x742060 - ((DWORD)st + 27);
+    memcpy(st, code, sizeof code);
+    static const BYTE expect[15] = { 0x8B, 0x48, 0x14, 0x83, 0xC4, 0x08, 0x83, 0xF9, 0x04, 0x0F, 0x85, 0x96, 0x02, 0x00, 0x00 };
+    BYTE repl[15]; memset(repl, 0x90, sizeof repl);
+    repl[0] = 0xE9; *(DWORD*)(repl + 1) = (DWORD)st - (0x742051 + 5);
+    PatchBytes(0x742051, expect, 15, repl, 15, "moto: drive-by do jogo com qualquer arma (CVehicle::DoDriveByShootings)");
+}
+
+static void InstallFihfc2() {
+    HookGame(0x73CBA0, (void*)&Fihfc2Hook, (void**)&g_fihfc2Orig, "da mira do drive-by do veiculo (CWeapon::FireInstantHitFromCar2)");
 }
 static void CwPatchSite(DWORD site, int len, DWORD jeTarget, const BYTE* expect, BYTE* stub) {
     BYTE rep[32]; memset(rep, 0x90, sizeof rep);
@@ -5992,7 +6073,7 @@ static void FwTick() {
     if (sub != 0 && sub != 1 && !bike) return;                                  // carro e monster truck: so para a frente
     bool lookL = g_host.lt > 40, lookR = g_host.rt > 40;
     if (!(g_host.buttons & 0x2000) || (!bike && (lookL || lookR)) || (lookL && lookR)) return;   // Atirar (B)
-    { int at = WeaponType(me, Rd<BYTE>(me, 0x718)); if (bike && (at == 28 || at == 29 || at == 32)) return; }   // SMG: o jogo
+    { int at = WeaponType(me, Rd<BYTE>(me, 0x718)); if (bike && (g_cwBikeAnim || at == 28 || at == 29 || at == 32)) return; }   // o jogo
     if (MenuActive() || g_menuOpen || g_shopOpen) return;
     char* intel = Rd<char*>(me, 0x47C);
     if (intel && ((FindTask_t)0x681740)(intel + 4, 1022)) return;             // drive-by de lado em andamento
@@ -6753,6 +6834,7 @@ static void RewardsTick() {
     AimTick(GetTickCount());
     FwTick();
     CwReloadTick();
+    CwDdbTick();
     static bool psDone = false;
     if (!psDone) { psDone = true; PsApply(); }
 }
@@ -7296,6 +7378,8 @@ static DWORD WINAPI StartupThread(LPVOID) {
     InstallCrimeHooks();
     if (g_daOn) InstallDriveByAim();
     InstallCarWeapons();
+    InstallBikeDriveBy();
+    if (g_daOn || (g_cwOn && g_cwBikeAnim)) InstallFihfc2();
     InstallXInputHooks();
     if (g_audioHash) { HANDLE t = CreateThread(nullptr, 0, AudioHashThread, nullptr, 0, nullptr); if (t) CloseHandle(t); }
     return 0;
@@ -7416,6 +7500,7 @@ static void LoadConfig(HMODULE self) {
     g_vgSaveOn = GetPrivateProfileIntA("Vigilante", "SalvarNaMissao", 1, ini);
     g_fwOn   = GetPrivateProfileIntA("ArmasNoVeiculo", "TiroFrente", 1, ini);
     g_fwGlass = GetPrivateProfileIntA("ArmasNoVeiculo", "Parabrisa", 1, ini);
+    g_cwBikeAnim = GetPrivateProfileIntA("ArmasNoVeiculo", "AnimacaoNaMoto", 1, ini);
     g_apOn   = GetPrivateProfileIntA("MiraAPe", "PrioridadeSuspeito", 1, ini);
     g_htOn   = GetPrivateProfileIntA("MiraAPe", "HitmanProximoAlvo", 1, ini);
     g_htCops = GetPrivateProfileIntA("MiraAPe", "Policiais", 0, ini);
@@ -7523,7 +7608,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     InitializeCriticalSection(&g_hookCs);
     LoadConfig(inst);
     QueryPerformanceFrequency(&g_qpf);
-    Log("GTMTouchSA 3.47 carregado (vigilante=%d transito=%d direcao=%d rampa=%d retorno=%d toque=%d sim/nao por script=%d diag toque=%d ragdoll=%d contagem=%d audio=%d x87=%d pular abertura=%d radar no alto=%d protecao da arma=%d menu de skins=%d andar da skin=%d voz da skin=%d skin nas roupas de missao=%d garagem=%d giroscopio=%d traficante=%d dar arma=%d armas em missao=%d mira do drive-by=%d)",
+    Log("GTMTouchSA 3.48 carregado (vigilante=%d transito=%d direcao=%d rampa=%d retorno=%d toque=%d sim/nao por script=%d diag toque=%d ragdoll=%d contagem=%d audio=%d x87=%d pular abertura=%d radar no alto=%d protecao da arma=%d menu de skins=%d andar da skin=%d voz da skin=%d skin nas roupas de missao=%d garagem=%d giroscopio=%d traficante=%d dar arma=%d armas em missao=%d mira do drive-by=%d)",
         g_vgOn, g_trOn, g_steerOn, g_rampMs, g_releaseMs, g_touchOn, g_ynScripts, g_traceTouch, g_traceRagdoll, g_countRagdoll, g_audioHash, g_fixX87, g_skipIntro, g_radarTop, g_weaponGuard, g_skinOn, g_skinAnims, g_skinVoice, g_skinClothes, g_garOn, g_gyroOn, g_armOn, g_giveOn, g_pmOn, g_daOn);
     if (g_armOn) Log("traficante: ligacao $%d, %d%% abaixo da AmmuNation, fora de epoca %dx e %d caixas por arma por dia, sem atender %d min do jogo, vai embora a %d m",
         g_armCall, g_armDiscount, g_armLockMult, g_armLockBoxes, g_armCooldown, g_armLeave);
