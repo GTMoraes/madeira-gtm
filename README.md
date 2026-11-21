@@ -14,7 +14,8 @@ Overlay de toque contextual para o GTA San Andreas (PC 1.0 US) rodando no Madeir
   texto (placa dos carros da garagem). Giroscópio: gira só a câmera do jogo, sempre na mira e, se quiser,
   também a pé e dirigindo (aí a câmera vira e fica, como o mouse; "Olhar atrás" no veículo e "Centralizar" a pé
   voltam ela para trás), com sensibilidade horizontal, vertical e na mira no painel do editor (lápis > Giroscópio).
-  Depois do teclado, o foco do teclado volta para o Madeira.
+  Depois do teclado, o foco do teclado volta para o Madeira. Botão Sirene dirigindo veículo com sirene (aceso com
+  ela ligada).
 - `asi/GTMTouchSA.cpp`: plugin do jogo (vai em `GTA San Andreas/scripts`). Escreve contexto e
   estado e recebe os toques por `C:\gtmtouch.bin` (`Documents/wine/drive_c/gtmtouch.bin` no
   iPhone), entregando ao GInput como um controle. Inclui a direção pelas setas, salvar na hora,
@@ -22,7 +23,8 @@ Overlay de toque contextual para o GTA San Andreas (PC 1.0 US) rodando no Madeir
   radar no canto de cima a esquerda, proteção da arma fora da memória (sem ícone, mãos vazias, travar ao mirar),
   recarregar pelo toque no ícone da arma, save dentro do carro e o Skin Selector: menu com Status + Atirar,
   skin gravada junto com o save e o jeito de andar e a voz do personagem da skin (também nas respostas a pedestres,
-  nas ordens aos recrutados e nas respostas à namorada), o trânsito sem carro surgindo logo à frente quando você olha para trás, o Vigilante com reforço da polícia
+  nas ordens aos recrutados e nas respostas à namorada), o trânsito sem carro surgindo logo à frente quando você olha para trás, o fim do freio
+  escondido de 29 trechos do mapa (retas de LS, a Strip, ruas e pontes de SF), o Vigilante com reforço da polícia
   pelo Sim/Não e recompensas por nível (12: mirar em policial não dá estrela, recrutar policial como parceiro de
   gangue, armeiro da polícia no Vigilante e o procurado caindo mais rápido; 21: roubo de carro e batida em viatura
   sem estrela e até 3 recrutas; 32: Vigilante sem timer; 64: Vigilante a qualquer hora, a pé ou em qualquer veículo,
@@ -31,10 +33,14 @@ Overlay de toque contextual para o GTA San Andreas (PC 1.0 US) rodando no Madeir
   reforço (o limite de 278 modelos de pedestre do jogo sobe para 350), a mira do drive-by (de moto ou de carro, o
   tiro vai no suspeito do Vigilante, no veículo dele ou em quem atacou você; sem alvo, só a altura do tiro é acertada
   no pedestre ou veículo à frente), a mira a pé que prefere o suspeito (até dentro do carro) e, no nível hitman, passa
-  sozinha para o próximo agressor, a pistola silenciada .45 mais rápida, botões próprios do Vigilante no overlay
+  sozinha para o próximo agressor, a pistola silenciada .45 mais rápida, a escopeta de combate com 15 chumbos de 10, botões próprios do Vigilante no overlay
   (Reforço, Viatura, Recrutar policial, Vigilante), trocar de arma no veículo e fazer drive-by com pistola, SMG,
-  fuzil ou escopeta (na moto com a animação de drive-by do jogo; recarregando pelo toque no ícone da arma, como a pé), atirar para a frente no carro quebrando
-  o para-brisa, recrutas que ficam no seu veículo atirando da janela e voltam para você quando chamados, e a garagem pelo telefone
+  fuzil ou escopeta (na moto com a animação de drive-by do jogo e escopetas com todos os chumbos; recarregando pelo toque no ícone da arma, como a pé), atirar para a frente no carro quebrando
+  o para-brisa, recrutas que sobem no seu veículo (até na garupa da moto), ficam atirando da janela e voltam para você quando chamados,
+  o fim dos "mortos" do Ragdoll que o jogo não registrava (não soltavam a arma nem contavam no Vigilante), sirenes
+  novas (botão Sirene liga e desliga; a Buzina é buzina normal e, com a sirene ligada, um toque troca o tom entre
+  Wail, Yelp, Priority, Hi-Lo e Piercer e segurar toca o air horn; as viaturas da IA sorteiam os tons e usam o air
+  horn; tons gerados pelo plugin ou trocados por WAV), e a garagem pelo telefone
   (Status + Pular: os carros das garagens das casas viram seus; um membro da Grove entrega, busca e leva
   para a garagem; venda no mercado negro; os amassados do LocalDent vao junto, com o LocalDent modificado que
   exporta o estado de cada carro; cada garagem guarda quantos carros couberem nela e o carro que nao cabe fica

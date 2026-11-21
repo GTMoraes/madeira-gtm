@@ -1,4 +1,4 @@
-// GTMTouch.dylib 3.9 - overlay de toque contextual para o GTA San Andreas no Madeira.
+// GTMTouch.dylib 3.10 - overlay de toque contextual para o GTA San Andreas no Madeira.
 //
 // Injetado no IPA oficial do Madeira. Desenha os controles por cima do jogo e troca o
 // conjunto de botoes sozinho conforme o contexto que o GTMTouchSA.asi escreve em
@@ -101,6 +101,9 @@ enum {
 // podem vir), Recrutar policial (policial perto ou na mira) e Vigilante (nivel 64: comecar/encerrar).
 // 3.8: Trocar arma tambem no veiculo (deslizar; o .asi troca pelos comandos 10 e 11, porque LT/RT ali e Olhar).
 // 3.9: no veiculo, um toque no Trocar arma recarrega (comando 4) quando o GTMTouchSA 3.46 diz que da (S_RELOAD).
+// 3.10 (protocolo 7): botao Sirene (comando 12) dirigindo veiculo com sirene (S_SIREN), aceso com ela ligada
+// (S_SIRENON). Com o GTMTouchSA 3.56, a Buzina e buzina normal; com a sirene ligada, toque troca o tom e segurar
+// toca o air horn.
 // estado do jogo (igual ao .asi) + S_CANSAVE, que e local
 enum {
     S_YESNO = 1u << 0, S_WEAPONS = 1u << 1, S_AIM = 1u << 2, S_DETONATE = 1u << 3, S_MORESATCHEL = 1u << 4,
@@ -109,7 +112,7 @@ enum {
     S_REMOTE = 1u << 14, S_GROUPMEMBERS = 1u << 15, S_DRIVEBY = 1u << 16,
     S_ACTPHONE = 1u << 17, S_ACTWEAPON = 1u << 18, S_ACTOTHER = 1u << 19, S_RELOAD = 1u << 20,
     S_VIG = 1u << 21, S_VIGBACKUP = 1u << 22, S_VIGCAR = 1u << 23, S_RECRUITCOP = 1u << 24, S_VIG64 = 1u << 25,
-    S_CARWEAPONS = 1u << 26,
+    S_CARWEAPONS = 1u << 26, S_SIREN = 1u << 27, S_SIRENON = 1u << 28,
 };
 #define S_CANSAVE 0x80000000u
 #define S_GYROFREE 0x40000000u                          // local: giroscopio ligado tambem fora da mira
@@ -124,7 +127,8 @@ enum {
     B_STKUP = 0x100000, B_STKDN = 0x200000      // analogico esquerdo para cima/baixo, com rampa (cruz das aeronaves)
 };
 enum { CMD_NONE = 0, CMD_SAVE = 1, CMD_DETONATE = 2, CMD_SATCHEL = 3, CMD_RELOAD = 4, CMD_RECENTER = 5,
-       CMD_BACKUP = 6, CMD_COPCAR = 7, CMD_RECRUITCOP = 8, CMD_VIGTOGGLE = 9, CMD_WEAPPREV = 10, CMD_WEAPNEXT = 11 };
+       CMD_BACKUP = 6, CMD_COPCAR = 7, CMD_RECRUITCOP = 8, CMD_VIGTOGGLE = 9, CMD_WEAPPREV = 10, CMD_WEAPNEXT = 11,
+       CMD_SIREN = 12 };
 enum { DYN_NONE = 0, DYN_WEAPON, DYN_VEHICLE, DYN_GROUP, DYN_ACTION };
 
 // ------------------------------------------------------------------ layouts padrao
@@ -169,6 +173,7 @@ static const double kRefW = 874.0, kRefH = 402.0;
     {.key = "left",  .label = "◀", .icon = "hud_left",  .bits = B_LEFT,  .x = 130, .y = 315, .d = 83}, \
     {.key = "right", .label = "▶", .icon = "hud_right", .bits = B_RIGHT, .x = 245, .y = 315, .d = 83}, \
     {.key = "horn",  .label = "Buzina", .icon = "horn", .bits = B_L3, .x = 187, .y = 225, .d = 58}, \
+    {.key = "siren", .label = "Sirene", .cmd = CMD_SIREN, .need = S_SIREN, .lit = S_SIRENON, .x = 100, .y = 240, .d = 50}, \
     VEHICLE_COMMON
 // cruz das aeronaves: ◀ ▶ inclinam as asas (viram direcao no .asi); ▲ ▼ mexem o analogico na vertical
 #define AIR_CROSS(upLabel, upBits, downLabel, downBits) \
@@ -1358,7 +1363,7 @@ enum { GYT_ON = 101, GYT_ALWAYS, GYT_H, GYT_V, GYT_AIM, GYT_INVERT, GYT_ZOOM, GY
     GTMHostBlock h = {0};
     h.magic = kHostMagic;
     h.seq = ++_hostSeq;
-    h.version = 6;
+    h.version = 7;
     h.cmdSeq = _cmdSeq; h.cmd = _hostCmd;
     if (!_editing) {
         uint32_t bits = 0;
@@ -1436,7 +1441,7 @@ enum { GYT_ON = 101, GYT_ALWAYS, GYT_H, GYT_V, GYT_AIM, GYT_INVERT, GYT_ZOOM, GY
     self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(frame:)];
     self.link.preferredFrameRateRange = CAFrameRateRangeMake(30, 60, 60);
     [self.link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
-    NSLog(@"[GTMTouch] overlay 3.9 ligado; arquivo %@", GTMSharedPath());
+    NSLog(@"[GTMTouch] overlay 3.10 ligado; arquivo %@", GTMSharedPath());
 }
 - (void)frame:(CADisplayLink *)l { [self.pad tick]; }
 - (void)sceneEvent:(NSNotification *)n { [self attachIfNeeded]; }
