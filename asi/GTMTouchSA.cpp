@@ -177,9 +177,10 @@ enum State : DWORD {
     S_CARWEAPONS   = 1u << 26,  // no veiculo com arma para trocar (deslizar Trocar arma, comandos 10 e 11)
     S_SIREN        = 1u << 27,  // dirigindo veiculo com sirene: botao Sirene (overlay 3.10, protocolo 7, comando 12)
     S_SIRENON      = 1u << 28,  // a sirene esta ligada (botao aceso)
+    S_ESP          = 1u << 29,  // 3.75: dirigindo carro com ESP: botao ESP (overlay 3.11, protocolo 8, comando 13); modo em espMode
 };
 
-struct Info { int ctx; DWORD state; BYTE weapon, nearVeh; };
+struct Info { int ctx; DWORD state; BYTE weapon, nearVeh, espMode; };
 static Info g_info = {};                                // calculado no quadro (thread do jogo)
 static volatile int g_ctxCache = CTX_NONE;              // copia para a thread do XInput
 
@@ -196,7 +197,8 @@ struct GameBlock {
     DWORD state;        // S_*
     BYTE  weapon;       // tipo da arma na mao (eWeaponType)
     BYTE  nearVeh;      // classe do veiculo perto + 1 (0 = nenhum)
-    BYTE  pad1[2];
+    BYTE  espMode;      // 3.75: 0 sem ESP, 1 normal, 2 sport, 3 desligado (overlay 3.11)
+    BYTE  pad1;
     BYTE  pad[20];
 };
 struct HostBlock {
@@ -243,7 +245,7 @@ static void WriteGame(const Info& in, WORD flags) {
     EnterCriticalSection(&g_io);
     GameBlock g = g_saveInfo;
     g.magic = GAME_MAGIC; g.version = 3; g.flags = flags; g.seq = ++g_gameSeq; g.context = (DWORD)in.ctx;
-    g.state = in.state; g.weapon = in.weapon; g.nearVeh = in.nearVeh;
+    g.state = in.state; g.weapon = in.weapon; g.nearVeh = in.nearVeh; g.espMode = in.espMode;
     OVERLAPPED o = {}; DWORD n;
     WriteFile(g_file, &g, sizeof g, &n, &o);
     LeaveCriticalSection(&g_io);
@@ -342,6 +344,35 @@ static int  g_nLoggedTab = 0;
 static char g_skinScripts[128] = ",skin_o,skin_c,skin_n,";             // [Skins] Scripts
 static volatile DWORD g_skinTick = 0;                                   // um Skin Selector leu o TAB
 static char* volatile g_skinScript = nullptr;                          // CRunningScript do Skin Selector
+// 3.66: o Skin Selector (o, c e n) trava gordura (stat 21) e musculo (stat 23) com uma skin: a cada volta do script,
+// "062A: change_float_stat 21 to 14@" e "23 to 15@" voltam os dois ao valor de quando a skin entrou, entao malhar,
+// comer e correr nao mudavam nada (pedido 03 do Gabriel). No codigo do script ja carregado (m_pBaseIP, +0x10) as duas
+// instrucoes viram "0653: 14@ = float_stat 21" e "23 -> 15@" (mesmos parametros na mesma ordem): o script passa a
+// acompanhar os valores de verdade. A edicao pelo menu dele (062A com 20@) fica
+static int g_skinStatsFree = 1;
+static void SkinStatsUnlock(char* sc) {
+    static char* done[4] = {};
+    if (!g_skinStatsFree || !sc) return;
+    for (char* d : done) if (d == sc) return;
+    for (auto& d : done) if (!d) { d = sc; break; }
+    BYTE* base = *(BYTE**)(sc + 0x10);
+    if (!base) return;
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (!VirtualQuery(base, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return;
+    size_t avail = (size_t)((BYTE*)mbi.BaseAddress + mbi.RegionSize - base);
+    if (avail > 0x8000) avail = 0x8000;
+    static const BYTE kPat[2][7] = { { 0x2A, 0x06, 0x04, 0x15, 0x03, 0x0E, 0x00 }, { 0x2A, 0x06, 0x04, 0x17, 0x03, 0x0F, 0x00 } };
+    int n = 0;
+    for (size_t i = 0; i + 7 <= avail; i++)
+        for (int k = 0; k < 2; k++)
+            if (!memcmp(base + i, kPat[k], 7)) {
+                DWORD op; VirtualProtect(base + i, 2, PAGE_EXECUTE_READWRITE, &op);
+                base[i] = 0x53;                                                // 062A -> 0653
+                VirtualProtect(base + i, 2, op, &op);
+                n++;
+            }
+    Log("skins: gordura e musculo %s com a skin (%d de 2 trechos do Skin Selector trocados)", n == 2 ? "livres" : "podem continuar travados", n);
+}
 static char g_skinScriptName[9] = "";
 static void NoteScriptTab(const char* script) {
     char name[9] = "";
@@ -353,6 +384,7 @@ static void NoteScriptTab(const char* script) {
             if (!g_skinTick) Log("skins: Skin Selector ativo (script '%s'); segure o Status e toque no Atirar para abrir o menu dele", name);
             g_skinTick = GetTickCount();
             g_skinScript = (char*)script; memcpy(g_skinScriptName, name, sizeof name);
+            SkinStatsUnlock((char*)script);
             return;                                                     // le o TAB o tempo todo: nao e pedido de acao
         }
         if (strstr(g_ignoreTabScripts, key)) return;
@@ -362,9 +394,16 @@ static void NoteScriptTab(const char* script) {
     if (g_nLoggedTab < 32) { strcpy(g_loggedTab[g_nLoggedTab++], name); Log("script '%s' le o TAB (acao)", name); }
 }
 
+static char* g_cmScript;
+static volatile int g_cmEat;
+static volatile int g_cmReal[2];
 static int __fastcall GetPadStateDetour(void* self, void* /*edx*/, int pad, int button) {
     int r = g_origGetPadState(self, pad, button);
     int b = button & 0xFFFF;
+    if (g_cmEat && self == g_cmScript && (pad & 0xFFFF) == 0 && (b == 15 || b == 16)) {   // 3.70: Oficina GTM na oficina
+        g_cmReal[b - 15] = r;
+        if (b == 16 || g_cmEat == 2) return 0;
+    } else if (self == g_cmScript && (pad & 0xFFFF) == 0 && (b == 15 || b == 16)) g_cmReal[b - 15] = r;
     if (g_ynScripts && (pad & 0xFFFF) == 0 && (b == 10 || b == 11)) NoteScriptYesNo((const char*)self);
     if ((pad & 0xFFFF) == 0 && b == 4) NoteScriptTab((const char*)self);
     return r;
@@ -523,6 +562,8 @@ static bool SirCapable(char* v);
 static bool SirFlag(const char* v);
 static void SirCmdToggle();
 static void SirTick();
+static int  AeEspMode(const char* v);
+static void AeCmdCycle();
 static void ComputeInfo(Info& in) {
     in = {};
     if (MenuActive()) { in.ctx = CTX_MENU; return; }
@@ -559,6 +600,10 @@ static void ComputeInfo(Info& in) {
     if (veh && !remote && g_sirOn && Rd<char*>(veh, 0x460) == ped && SirCapable(veh)) {   // 3.56: botao Sirene
         in.state |= S_SIREN;
         if (SirFlag(veh)) in.state |= S_SIRENON;
+    }
+    if (veh && !remote && Rd<char*>(veh, 0x460) == ped) {                    // 3.75: botao ESP
+        int em = AeEspMode(veh);
+        if (em) { in.state |= S_ESP; in.espMode = (BYTE)em; }
     }
     if (veh && !remote && g_cwOn && CwAllowed(active) && CanReload(ped, nullptr)) in.state |= S_RELOAD;   // 3.46: toque recarrega
     if (veh) {
@@ -869,6 +914,8 @@ struct VehicleSave {            // GTASAsfN.b.gtmveh
     short upgrades[15];
     int   remap;
     int   vehClass;
+    signed char extras[2];      // 3.75 (versao 2): variacao do modelo (CVehicle +0x438/+0x439, -1 = nenhuma)
+    BYTE  pad2[2];
 };
 #pragma pack(pop)
 static const DWORD VEH_MAGIC = 0x564D5447;
@@ -912,6 +959,7 @@ static void VgCkWrite(unsigned timeMs);
 static void VgCkDelete();
 static void VgCkLoad();
 static void VgResumeTick();
+static void VgLevelTuneTick();
 static void GarHelp(const char* fmt, ...);
 
 static bool CanSaveNow(const char** why, bool manual = false) {
@@ -944,7 +992,8 @@ static void WriteVehicleSidecar(unsigned timeMs) {
     char* veh = (g_keepVehicle && g_info.ctx != CTX_PASSENGER) ? PlayerVehicle() : nullptr;
     if (!veh) { DeleteFileA(path); return; }
     VehicleSave v = {};
-    v.magic = VEH_MAGIC; v.version = 1; v.timeMs = timeMs;
+    v.magic = VEH_MAGIC; v.version = 2; v.timeMs = timeMs;
+    v.extras[0] = *(signed char*)(veh + 0x438); v.extras[1] = *(signed char*)(veh + 0x439);
     v.model = *(short*)(veh + 0x22);
     float* m = *(float**)(veh + 0x14);                 // CMatrix*: up(frente) em +0x10, pos em +0x30
     if (m) { v.x = m[12]; v.y = m[13]; v.z = m[14]; v.heading = atan2f(-m[4], m[5]); }
@@ -1094,8 +1143,9 @@ static void RestoreVehicle() {
     FILE* f = fopen(path, "rb");
     if (!f) return;
     VehicleSave v = {};
-    size_t n = fread(&v, sizeof v, 1, f); fclose(f);
-    if (n != 1 || v.magic != VEH_MAGIC) return;
+    size_t got = fread(&v, 1, sizeof v, f); fclose(f);
+    if (got < offsetof(VehicleSave, extras) || v.magic != VEH_MAGIC) return;
+    if (v.version < 2 || got < sizeof v) { v.extras[0] = v.extras[1] = (signed char)0xFE; }   // versao 1: o jogo sorteia
     if (v.timeMs != g_loadedTimeMs) { Log("save carregado nao e o do slot %d com veiculo (t=%u, arquivo t=%u)", g_saveSlot, g_loadedTimeMs, v.timeMs); return; }
     char* ped = PlayerPed();
     if (!ped || PlayerVehicle()) return;
@@ -1109,7 +1159,9 @@ static void RestoreVehicle() {
     bool air = (v.vehClass == 3 || v.vehClass == 4 || v.vehClass == 7 || v.vehClass == 8);
     V3 pos = { v.x, v.y, v.z };
     if (v.vehClass != 5 && found && (air || fabsf(gz - v.z) < 4.f)) pos.z = gz;   // barco fica onde estava
+    *(signed char*)0x8A6458 = v.extras[0]; *(signed char*)0x8A6459 = v.extras[1];   // 3.75: CVehicleModelInfo::ms_compsToUse
     char* veh = CreateCarForScript(v.model, pos, 0);
+    *(signed char*)0x8A6458 = (signed char)0xFE; *(signed char*)0x8A6459 = (signed char)0xFE;   // de volta ao sorteio
     if (!veh) { Log("nao consegui recriar o veiculo %d", v.model); return; }
     SetHeading(veh, v.heading);
     memcpy(veh + 0x434, v.colors, 4);
@@ -1123,7 +1175,7 @@ static void RestoreVehicle() {
     bool airOrBoat = (v.vehClass == 3 || v.vehClass == 4 || v.vehClass == 5 || v.vehClass == 7 || v.vehClass == 8);
     g_vehHand.veh = veh;
     g_vehHand.due = GetTickCount() + (airOrBoat || g_autoDriveSec <= 0.f ? 0 : (DWORD)(g_autoDriveSec * 1000.f));
-    Log("veiculo restaurado: modelo %d", v.model);
+    Log("veiculo restaurado: modelo %d (variacao %d/%d)", v.model, *(signed char*)(veh + 0x438), *(signed char*)(veh + 0x439));
 }
 
 typedef void (__cdecl* AfterLoad_t)();
@@ -1145,6 +1197,13 @@ static void __cdecl AfterLoadDetour() {
 static void VehHandoverTick();
 static void VgCmdBackup();
 static void VgCmdCar();
+static int  ModelByName(const char* name);
+static void CdTick();
+static void PriceTick();
+static void CmTick();
+static void AeFrame();
+static int  g_ofPhone = 0;                                                   // 3.70: Oficina GTM tambem no telefone
+static void VgCarListPick(int row);
 static void RcCmdRecruit();
 static void Vig64Toggle(const char* how);
 static void CwCycle(int dir);
@@ -1175,6 +1234,7 @@ static void SaveTick() {
                 case 10: CwCycle(-1); break;                                 // trocar arma no veiculo (overlay 3.8)
                 case 11: CwCycle(1); break;
                 case 12: SirCmdToggle(); break;                              // Sirene (overlay 3.10)
+                case 13: AeCmdCycle(); break;                                // ESP normal, sport, desligado (overlay 3.11)
                 default: break;
             }
         }
@@ -1537,6 +1597,10 @@ static void __cdecl FrameTick() {
     TargetStickTick();
     GyroTick();
     SirTick();
+    VgLevelTuneTick();
+    PriceTick();
+    CmTick();
+    AeFrame();                                                                // 3.74: ABS e ESP
     if (g_info.ctx != g_lastCtx) { Log("contexto: %s", g_info.ctx >= 0 && g_info.ctx <= CTX_CUTSCENE ? kCtxName[g_info.ctx] : "?"); g_lastCtx = g_info.ctx; }
     bool yn = (g_info.state & S_YESNO) != 0;
     if (yn != g_lastYN) {
@@ -1997,6 +2061,76 @@ static const DWORD kProofMask = (1u << 18) | (1u << 19) | (1u << 20) | (1u << 21
 enum { GS_NONE = 0, GS_LIVE, GS_AWAY, GS_DEAD, GS_DELIVER, GS_TOGARAGE, GS_PICKUP };
 static const char* kGarState[] = { "-", "na rua", "longe", "destruido", "a caminho", "indo p/ garagem", "sendo levado" };
 enum { ER_NONE = 0, ER_DELIVER, ER_TOGARAGE, ER_SOLD, ER_REPAIR, ER_REPAIRWAIT };   // ER_REPAIR: buscando para consertar                      // servico em andamento (um por vez)
+// ---- 3.75: variacoes do modelo (os "extras" do DFF: santo-antonio, capota, capa maritima...). CVehicleModelInfo
+// (0xA9B0C8[modelo]) +0x5C = m_pVehicleStruct: atomos dos extras em +0x2F4 (6 x RpAtomic*), quantos em +0x30C (int8);
+// regras do vehicles.ide em +0x54. CVehicleModelInfo::CreateInstance (0x4C9680) sorteia (ChooseComponent 0x4C8040 e
+// ChooseSecondComponent 0x4C8120, a nao ser que ms_compsToUse 0x8A6458/0x8A6459 != -2), clona o atomo escolhido
+// (RpAtomicClone 0x749E60), cria um frame com a matriz do original (RwFrameCreate 0x7F0410, RwFrameTransform
+// 0x7F0F70), poe no carro (RpAtomicSetFrame 0x74BF20, RpClumpAddAtomic 0x74A490) e pendura no frame 1 do clump
+// (GetFrameFromId 0x4C53C0; barco e trem: no frame do clump) com RwFrameAddChild 0x7F0B00; no fim passa 0x4C9410 em
+// todos os atomos. O carro guarda os escolhidos em +0x438/+0x439 (-1 = nenhum); o CStoredCar copia para +0x37/+0x38 e
+// o RestoreCar devolve em ms_compsToUse, por isso os carros da garagem ja voltavam iguais; o que voltava sorteado era o
+// carro em que o CJ estava no save (.gtmveh, CreateCarForScript). Trocar num carro vivo: o extra antigo fica escondido
+// (tira o rpATOMICRENDER, bit 2 do flags do RwObject em +2) e o novo entra do mesmo jeito que o jogo faz
+typedef void* (__cdecl* RwAtomCB)(void*, void*);
+static int VarCount(int model) {
+    if (model < 400 || model > 611) return 0;
+    const char* mi = ((char**)0xA9B0C8)[model];
+    const char* vs = mi ? Rd<char*>(mi, 0x5C) : nullptr;
+    int n = vs ? (int)*(const signed char*)(vs + 0x30C) : 0;
+    return n < 0 ? 0 : n > 6 ? 6 : n;
+}
+static bool VarSecond(int model) {                                            // o modelo usa duas variacoes juntas
+    if (VarCount(model) < 2) return false;
+    const char* mi = ((char**)0xA9B0C8)[model];
+    return Rd<DWORD>(mi, 0x54) != 0;
+}
+struct VarList { int n; void* a[64]; };
+static void* __cdecl VarCollect(void* a, void* d) { VarList* l = (VarList*)d; if (l->n < 64) l->a[l->n++] = a; return a; }
+static bool VarApply(char* v, int e1, int e2) {
+    int model = Rd<short>(v, 0x22), n = VarCount(model);
+    const char* mi = n ? ((char**)0xA9B0C8)[model] : nullptr;
+    char* vs = mi ? Rd<char*>(mi, 0x5C) : nullptr;
+    char* clump = Rd<char*>(v, 0x18);
+    if (!vs || !clump || *(BYTE*)clump != 2) return false;                   // rpCLUMP
+    if (e1 >= n) e1 = -1;
+    if (e2 >= n || e2 == e1) e2 = -1;
+    VarList l = {};
+    ((void* (__cdecl*)(void*, RwAtomCB, void*))0x749B70)(clump, &VarCollect, &l);   // RpClumpForAllAtomics
+    void* frame = nullptr;
+    int vt = Rd<int>(mi, 0x3C);
+    if (vt == 9 || vt == 10 || vt < 5) frame = ((void* (__cdecl*)(void*, int))0x4C53C0)(clump, 1);
+    if (!frame) frame = Rd<void*>(clump, 4);
+    int added = 0, hidden = 0;
+    for (int k = 0; k < n; k++) {
+        char* ex = Rd<char*>(vs, 0x2F4 + k * 4);
+        if (!ex) continue;
+        void* geo = Rd<void*>(ex, 0x18);
+        bool want = (k == e1 || k == e2), shown = false;
+        for (int i = 0; i < l.n; i++) {
+            if (Rd<void*>(l.a[i], 0x18) != geo) continue;
+            BYTE* fl = (BYTE*)l.a[i] + 2;
+            if (want && !shown) { *fl |= 4; shown = true; }
+            else if (*fl & 4) { *fl &= (BYTE)~4; hidden++; }
+        }
+        if (want && !shown) {
+            void* at = ((void* (__cdecl*)(void*))0x749E60)(ex);                  // RpAtomicClone
+            void* fr = at ? ((void* (__cdecl*)())0x7F0410)() : nullptr;          // RwFrameCreate
+            if (!at || !fr) continue;
+            ((void* (__cdecl*)(void*, void*, int))0x7F0F70)(fr, Rd<char*>(ex, 4) + 0x10, 0);   // RwFrameTransform(REPLACE)
+            ((void* (__cdecl*)(void*, void*))0x74BF20)(at, fr);                // RpAtomicSetFrame
+            ((void* (__cdecl*)(void*, void*))0x74A490)(clump, at);             // RpClumpAddAtomic
+            ((void* (__cdecl*)(void*, void*))0x7F0B00)(frame, fr);             // RwFrameAddChild
+            ((void* (__cdecl*)(void*, void*))0x4C9410)(at, nullptr);           // o mesmo do fim do CreateInstance
+            *((BYTE*)at + 2) |= 4;
+            added++;
+        }
+    }
+    *(signed char*)(v + 0x438) = (signed char)e1; *(signed char*)(v + 0x439) = (signed char)e2;
+    static int nl = 0;
+    if (nl < 30) { nl++; Log("variacao: modelo %d agora %d/%d (%d extras, %d atomos, %d novos, %d escondidos)", model, e1, e2, n, l.n, added, hidden); }
+    return true;
+}
 struct GarCar {
     BYTE  state, house, slot, inGarage, playerCar, hasDmg, pad[2];
     int   veh;                     // handle do veiculo vivo
@@ -2010,6 +2144,7 @@ struct GarCar {
     BYTE* dent; int dentLen, dentCap;                                        // estado do LocalDent (amassados)
     char  plate[9];                // placa escolhida ("" = a sorteada pelo jogo)
     BYTE  noSpot, waitLogged;      // sem vaga na garagem dele; aviso de espera ja no log
+    BYTE  mods[2];                 // 3.69: oficina (bits 0 turbo, 1 blindagem, 2 pneus; tracao 0/'F'/'R'/'4')
 };
 static GarCar g_gar[80];
 static int    g_nGar = 0;
@@ -2082,6 +2217,9 @@ typedef void  (__thiscall* PlateDestroy_t)(void* veh);
 static const SetPlateText_t SetPlateText = (SetPlateText_t)0x4C8980;          // CVehicleModelInfo::SetCustomCarPlateText
 static const CreatePlate_t  CreatePlate  = (CreatePlate_t)0x6FDEA0;           // CCustomCarPlateMgr::CreatePlateTexture
 static const PlateDestroy_t PlateDestroy = (PlateDestroy_t)0x6D1150;          // CVehicle::CustomCarPlate_TextureDestroy
+static BYTE g_slotMods[20][4][2];                                              // 3.69: oficina de cada vaga
+static void TbApply(char* v, const BYTE* m);
+static const BYTE* TbModsOf(const char* v);
 static char g_slotPlate[20][4][9];                                            // placa de cada vaga das garagens
 static bool PlateCapable(int m) { char* mi = ModelInfo(m); int t = mi ? Rd<int>(mi, 0x3C) : -1; return t == 0 || t == 9; }   // carro, moto
 static void CleanPlate(const char* in, char* out) {                           // maiusculas, A-Z 0-9 e espaco, ate 8
@@ -2245,6 +2383,7 @@ static char* SpawnCar(GarCar& g, const BYTE* blob) {
     if (g.health > 0.f) *(float*)(v + 0x4C0) = g.health;
     if (g.hasDmg && IsAutomobile(v)) { memcpy(v + 0x5A0, g.dmg, sizeof g.dmg); SetupDamageAfterLoad(v); }
     if (g.dentLen && g_ldImport) g_ldImport(v, g.dent, g.dentLen);           // o LocalDent reaplica no proximo quadro
+    if (g.mods[0] || g.mods[1]) TbApply(v, g.mods);                          // 3.69: oficina
     Cmd c(0x0249); c.I(BlobModel(b)); RunCmd(c);                              // o carro segura o modelo; o pedido sai
     return v;
 }
@@ -2285,7 +2424,12 @@ static char* __fastcall RestoreCarDetour(void* stored, void*) {
     if (slot && v) {
         NoteDims(v);
         g_slotPlate[h][s][0] = 0;
-        if (!IsImpoundHouse(h)) if (GarCar* g = NewGar(h, s, before)) { g->state = GS_LIVE; g->veh = VehRef(v); g->inGarage = 1; memcpy(g->plate, plate, 9); }
+        if (!IsImpoundHouse(h)) if (GarCar* g = NewGar(h, s, before)) {
+            g->state = GS_LIVE; g->veh = VehRef(v); g->inGarage = 1; memcpy(g->plate, plate, 9);
+            memcpy(g->mods, g_slotMods[h][s], 2);
+            if (g->mods[0] || g->mods[1]) TbApply(v, g->mods);
+        }
+        memset(g_slotMods[h][s], 0, 2);
     }
     return v;
 }
@@ -2306,6 +2450,7 @@ static void __fastcall StoreCarDetour(void* stored, void*, void* v) {
         return;
     }
     g_slotPlate[h][s][0] = 0;
+    { const BYTE* m = TbModsOf((char*)v); if (m) memcpy(g_slotMods[h][s], m, 2); else if (i >= 0) memcpy(g_slotMods[h][s], g_gar[i].mods, 2); else memset(g_slotMods[h][s], 0, 2); }
     if (i >= 0) { memcpy(g_slotPlate[h][s], g_gar[i].plate, 9); RemoveGar(i); return; }   // um meu voltou para a garagem
     // carro novo na garagem: os seus que estao fora continuam seus (se faltar espaco, ficam "sem vaga")
     Log("garagem: %s guardado na casa %d vaga %d", CarName(Rd<short>(v, 0x22)), h, s + 1);
@@ -2354,13 +2499,23 @@ static int SellPrice(int model, float health) {
 
 // ---------------------------------------------------------------- lista (menu do jogo)
 struct GarItem { int kind; int house, slot, gi, model; };                    // kind 0 vaga da garagem, 1 registro
-enum { AC_CALL = 1, AC_TOGARAGE, AC_SELL, AC_REPOR, AC_YES, AC_NO, AC_PLATE, AC_ROOT_GAR, AC_ROOT_ARM, AC_REPAIR, AC_ROOT_VIG, AC_ROOT_RC };
+enum { AC_CALL = 1, AC_TOGARAGE, AC_SELL, AC_REPOR, AC_YES, AC_NO, AC_PLATE, AC_ROOT_GAR, AC_ROOT_ARM, AC_REPAIR, AC_ROOT_VIG, AC_ROOT_RC, AC_ROOT_CD, AC_ROOT_OF };
 static GarItem g_items[90], g_sel;
 static int g_nItems = 0, g_page = 0, g_menu = -1, g_level = 0, g_acts[12], g_nActs = 0, g_price = 0;
 static bool g_menuOpen = false;
 static volatile bool g_garReq = false, g_garSel = false, g_garCancel = false;
 static DWORD g_phoneOffAt = 0, g_menuOpenAt = 0;
 // traficante de armas (mais abaixo, depois da garagem)
+static int  g_cdOn = 1, g_cdMultPct = 125;                                    // 3.65: vendedor de carros
+static void CdShowCats();
+static void OfOpen();
+static void OfPick(int row);
+static void OfBack();
+static char* OfCarNear();
+static void OfPatchCarmod();
+static void TbTick();
+static void CdPick(int row);
+static void CdBack();
 static int  g_armOn = 1, g_armCall = 250, g_armDiscount = 15, g_armLockMult = 10, g_armLockBoxes = 2;
 static int  g_armCooldown = 1440, g_armLeave = 40, g_armCopSee = 25, g_armCopAngle = 60, g_armDoorDist = 7;
 static bool g_shopOpen = false;
@@ -2371,6 +2526,7 @@ static void VigTick();
 static void WantedPerkTick();
 static void ArmSave();
 static void ArmOnLoad();
+static void TbReset();
 
 static int PlayerRef() { char* p = PlayerPed(); return p ? PedRef(p) : -1; }
 static void Phone(bool on) { int pr = PlayerRef(); if (pr >= 0) { Cmd c(0x0729); c.I(pr).I(on ? 1 : 0); RunCmd(c); } }
@@ -2378,6 +2534,9 @@ static void PlayerControl(bool on) { Cmd c(0x01B4); c.I(0).I(on ? 1 : 0); RunCmd
 static void SetText(const char* key, const char* text) { Cmd c(0x0ADF); c.Str(key).Str(text); RunCmd(c); }
 static void AddMoney(int v) { Cmd c(0x0109); c.I(0).I(v); RunCmd(c); }
 
+// 3.66: do nivel 64 do Vigilante em diante quem leva e traz os carros e a policia (GarageCopDriver), nao a Grove
+static const char* CrewWho() { return VigLevel() >= 64 ? "A policia" : "Um membro da Grove"; }
+static const char* CrewBusy() { return VigLevel() >= 64 ? "A policia" : "A Grove"; }
 static BYTE* SlotPtr(int h, int s) { return (BYTE*)SafeCars + h * 0x100 + s * 0x40; }
 
 // ---- espaco nas garagens: carros guardados nas vagas + carros do mundo dentro dela (porta aberta)
@@ -2560,15 +2719,17 @@ static bool g_garHooked = false;
 static void ShowRoot() {
     g_level = 3; g_nActs = 0;
     static char arm[64], rc[48];
-    const char* rows[4]; int n = 0;
+    const char* rows[7]; int n = 0;
     if (g_garOn) { g_acts[g_nActs++] = AC_ROOT_GAR; rows[n++] = "Carro da garagem"; }
+    if (g_garOn && g_cdOn) { g_acts[g_nActs++] = AC_ROOT_CD; rows[n++] = "Vendedor de carros"; }   // 3.65 (pedido 09)
+    if (g_garOn && g_ofPhone && OfCarNear()) { g_acts[g_nActs++] = AC_ROOT_OF; rows[n++] = "Oficina GTM"; }   // 3.69 (3.70: opcional)
     if (g_armOn) { g_acts[g_nActs++] = AC_ROOT_ARM; DealerRootLabel(arm, sizeof arm); rows[n++] = arm; }
     if (VigLevel() >= 64) { g_acts[g_nActs++] = AC_ROOT_VIG; rows[n++] = VigActiveNow() ? "Encerrar o Vigilante" : "Comecar o Vigilante"; }
     if (RcCount() > 0) { g_acts[g_nActs++] = AC_ROOT_RC; snprintf(rc, sizeof rc, "Dispensar os policiais (%d)", RcCount()); rows[n++] = rc; }
     ShowRows("Telefone", "Ligar para", rows, n);
 }
 static void OpenMenu() {
-    if (!g_garOn && !g_armOn && VigLevel() < 64 && !RcCount()) return;
+    if (!g_garOn && !g_armOn && VigLevel() < 64 && !RcCount()) return;   // (o vendedor depende da garagem)
     g_page = 0; g_menuOpen = true; g_menuOpenAt = GetTickCount(); g_garSel = g_garCancel = false;
     if (!ModelLoaded(330)) { RequestModel(330, 2); LoadAllRequestedModels(false); }   // celular
     PlayerControl(false);
@@ -2809,7 +2970,7 @@ static bool CanUseNow(const GarItem& it, char** liveVeh) {
     return true;
 }
 static void DoCall() {
-    if (g_errand >= 0) { GarHelp("A Grove ja esta ocupada com outro carro seu."); return; }
+    if (g_errand >= 0) { GarHelp("%s ja esta ocupada com outro carro seu.", CrewBusy()); return; }
     if (*(volatile int*)0xB72914 != 0) { GarHelp("Chame o carro ao ar livre."); return; }
     char* v; if (!CanUseNow(g_sel, &v)) return;
     V3 pp = EntityPos(PlayerPed());
@@ -2836,8 +2997,8 @@ static void DoToGarage() {
     char* v; if (!CanUseNow(g_sel, &v)) return;
     GarCar& g = g_gar[g_sel.gi];
     if (g.state == GS_LIVE && v && Dist2(EntityPos(v), EntityPos(PlayerPed())) < 70.f) {
-        if (g_errand >= 0) { GarHelp("A Grove ja esta ocupada com outro carro seu."); return; }
-        if (StartPickup(g_sel.gi, false)) GarHelp("Um membro da Grove vem buscar o %s.", CarName(g_sel.model));
+        if (g_errand >= 0) { GarHelp("%s ja esta ocupada com outro carro seu.", CrewBusy()); return; }
+        if (StartPickup(g_sel.gi, false)) GarHelp("%s vem buscar o %s.", CrewWho(), CarName(g_sel.model));
         return;
     }
     if (g.state == GS_LIVE && v) { CaptureCar(g, v); Cmd c(0x00A6); c.I(g.veh); RunCmd(c); }
@@ -2847,7 +3008,7 @@ static void DoToGarage() {
     else GarHelp("%s vai para a garagem.", CarName(g_sel.model));
 }
 static void DoRepair() {
-    if (g_errand >= 0) { GarHelp("A Grove ja esta ocupada com outro carro seu."); return; }
+    if (g_errand >= 0) { GarHelp("%s ja esta ocupada com outro carro seu.", CrewBusy()); return; }
     if (*(volatile int*)0xB72914 != 0) { GarHelp("Peca o conserto ao ar livre."); return; }
     char* v; if (!CanUseNow(g_sel, &v)) return;
     GarCar& g = g_gar[g_sel.gi];
@@ -2855,8 +3016,8 @@ static void DoRepair() {
     if (g.state == GS_LIVE && v && Dist2(EntityPos(v), EntityPos(PlayerPed())) < 70.f) {
         if (StartPickup(g_sel.gi, false)) {
             g_errandKind = ER_REPAIR;
-            Log("garagem: %s vai para o conserto; um membro da Grove vem buscar", name);
-            GarHelp("Um membro da Grove vem buscar o %s para consertar.", name);
+            Log("garagem: %s vai para o conserto; %s vem buscar", name, CrewWho());
+            GarHelp("%s vem buscar o %s para consertar.", CrewWho(), name);
         }
         return;
     }
@@ -2876,7 +3037,7 @@ static void DoSell() {
     } else {
         GarCar& g = g_gar[g_sel.gi];
         if (g.state == GS_LIVE && v && Dist2(EntityPos(v), EntityPos(PlayerPed())) < 70.f) {
-            if (g_errand >= 0) { GarHelp("O comprador so pode vir depois do servico da Grove em andamento."); return; }
+            if (g_errand >= 0) { GarHelp("O comprador so pode vir depois do servico em andamento."); return; }
             if (!StartPickup(g_sel.gi, true)) return;
             AddMoney(price);
             Log("garagem: %s vendido por $%d; o comprador vem buscar", CarName(g_sel.model), price);
@@ -3025,10 +3186,225 @@ static void PlateTick() {
         GarHelp("Placa do %s: %s_  (Enter salva, Esc cancela)", CarName(g_kbItem.model), g_kbBuf);
     }
 }
+
+// ---------------------------------------------------------------- 3.65: vendedor de carros (pedido 09)
+// Telefone > Vendedor de carros > categoria > carro (preco = valor do carro no jogo x Multiplicador%) > Tem certeza?
+// Pago, um membro da Grove (ou a policial da regiao, no nivel 64) traz o carro como na entrega da garagem; ele vira
+// seu (Meus carros) com a casa mais perto entre as que ja guardam carros seus.
+struct CdCat { const char* name; const short* m; int n; };
+static const short kCdSport[] = { 411, 415, 451, 541, 506, 429, 480, 477, 559, 562, 558, 560, 565, 587, 602, 533, 555, 580, 434, 496, 589, 494, 502, 503 };
+static const short kCdMuscle[] = { 402, 475, 439, 603, 536, 518, 412, 567, 535, 534, 549, 542, 545, 474, 491, 576, 517, 575, 527 };
+static const short kCdSedan[] = { 445, 507, 426, 405, 421, 551, 546, 547, 529, 561, 550, 540, 516, 585, 492, 458, 479, 410, 401, 436, 404, 526, 566, 409, 580, 589, 496 };
+static const short kCdSuv[] = { 400, 489, 500, 470, 495, 554, 422, 478, 579, 600, 543 };
+static const short kCdLow[] = { 536, 575, 534, 567, 535, 566, 576, 412 };
+static const short kCdClassic[] = { 466, 467, 419, 474, 545, 439, 475, 412, 536, 576, 567, 518, 534, 542, 549, 575, 603, 491, 517, 410, 401, 479, 404, 527 };
+static const short kCdWork[] = { 413, 482, 440, 418, 483, 508, 498, 609, 414, 456, 499, 455, 403, 515, 514, 524, 408, 525, 552, 428, 582, 588, 423, 459, 420, 438, 431, 437, 443, 578, 406, 486, 531, 532, 530, 583, 485, 574 };
+static const short kCdMoto[] = { 461, 521, 522, 581, 463, 586, 468, 462, 448, 471, 509, 481, 510 };
+static const short kCdMisc[] = { 457, 571, 572, 424, 568, 444, 556, 557, 573, 494, 502, 503, 471 };
+#define CDCAT(n, a) { n, a, (int)(sizeof a / sizeof a[0]) }
+static const CdCat kCdCats[] = {
+    CDCAT("Esportivos", kCdSport), CDCAT("Muscle", kCdMuscle), CDCAT("Sedas e compactos", kCdSedan), CDCAT("SUVs e picapes", kCdSuv),
+    CDCAT("Lowriders", kCdLow), CDCAT("Classicos", kCdClassic), CDCAT("Utilitarios e caminhoes", kCdWork),
+    CDCAT("Motos e bicicletas", kCdMoto), CDCAT("Diversos", kCdMisc),
+};
+static const int kCdNCats = (int)(sizeof kCdCats / sizeof kCdCats[0]);
+static int g_cdCat = 0, g_cdPage = 0, g_cdModel = 0, g_cdPrice = 0;
+static int CdPrice(int model) {
+    int v = CarValue(model);
+    if (v <= 0) return 0;
+    long long p = (long long)v * g_cdMultPct / 100;
+    p = (p + 50) / 100 * 100;
+    return p < 100 ? 100 : (int)p;
+}
+static void CdMoney(char* out, int n, int v) {                                // 123456 -> $123.456
+    char d[16]; snprintf(d, sizeof d, "%d", v);
+    int L = (int)strlen(d), o = 0;
+    if (o < n - 1) out[o++] = '$';
+    for (int i = 0; i < L && o < n - 1; i++) { if (i && (L - i) % 3 == 0 && o < n - 1) out[o++] = '.'; if (o < n - 1) out[o++] = d[i]; }
+    out[o] = 0;
+}
+static void CdShowCats() {
+    g_level = 5; g_nActs = 0;
+    const char* rows[12]; int n = 0;
+    for (int i = 0; i < kCdNCats && n < 12; i++) rows[n++] = kCdCats[i].name;
+    ShowRows("Vendedor", "Categoria", rows, n);
+}
+static void CdShowCars() {
+    g_level = 6;
+    const CdCat& c = kCdCats[g_cdCat];
+    int first = g_cdPage * 11, n = c.n - first; if (n > 11) n = 11;
+    static char text[12][64];
+    const char* rows[12];
+    for (int r = 0; r < n; r++) {
+        char m[24]; CdMoney(m, sizeof m, CdPrice(c.m[first + r]));
+        snprintf(text[r], 64, "%s - %s", CarName(c.m[first + r]), m);
+        rows[r] = text[r];
+    }
+    int total = n;
+    if (c.n > 11) rows[total++] = c.n > first + 11 ? "Mais..." : "Voltar ao inicio";
+    ShowRows(c.name, g_cdPage ? "Carro (mais)" : "Carro", rows, total);
+}
+static void CdShowConfirm() {
+    g_level = 7;
+    static char yes[64]; char m[24]; CdMoney(m, sizeof m, g_cdPrice);
+    snprintf(yes, sizeof yes, "Sim, comprar por %s", m);
+    const char* rows[2] = { yes, "Nao" };
+    ShowRows("Tem certeza?", CarName(g_cdModel), rows, 2);
+}
+static void CdBack() {
+    if (g_level == 7) CdShowCars();
+    else if (g_level == 6) CdShowCats();
+    else ShowRoot();
+}
+// casa do carro novo: a mais perto entre as que ja tem carro seu (vaga ou registro); sem nenhuma, a garagem de
+// casa mais perto de voce
+static int CdHomeHouse(V3 pp, char** grOut) {
+    int best = -1; float bd = 1e9f; char* bg = nullptr;
+    for (int h = 0; h < 20; h++) {
+        if (IsImpoundHouse(h)) continue;
+        bool mine = false;
+        for (int k = 0; k < 4 && !mine; k++) if (BlobModel(SlotPtr(h, k))) mine = true;
+        for (int i = 0; i < g_nGar && !mine; i++) if (g_gar[i].house == h) mine = true;
+        if (!mine) continue;
+        char* gr = GarageOfHouse(h, pp);
+        if (!gr) continue;
+        float d = Dist2(*(V3*)gr, pp);
+        if (d < bd) { bd = d; best = h; bg = gr; }
+    }
+    if (best < 0) {
+        int n = *(int*)0x96C024;
+        for (int i = 0; i < n && i < 50; i++) {
+            char* gr = (char*)0x96C048 + i * 0xD8; int t = Rd<BYTE>(gr, 0x4C);
+            if (!IsHideoutType(t)) continue;
+            int h = SafeHouseIndex(t);
+            if (h < 0 || h >= 20 || IsImpoundHouse(h)) continue;
+            float d = Dist2(*(V3*)gr, pp);
+            if (d < bd) { bd = d; best = h; bg = gr; }
+        }
+    }
+    *grOut = bg;
+    return best;
+}
+static bool CdBuy(int model, int price) {
+    char* me = PlayerPed();
+    if (!me) return false;
+    if (g_errand >= 0) { GarHelp("%s esta ocupada com outro carro seu. Compre depois.", CrewBusy()); return false; }
+    if (*(volatile int*)0xB72914 != 0) { GarHelp("Compre o carro ao ar livre."); return false; }
+    int money = *(volatile int*)0xB7CE50;                                    // CWorld::Players[0].m_nMoney
+    if (money < price) { char m[24]; CdMoney(m, sizeof m, price); GarHelp("Dinheiro insuficiente: o %s custa %s.", CarName(model), m); return false; }
+    if (g_nGar >= 80) { GarHelp("Voce ja tem carros demais fora da garagem."); return false; }
+    V3 pp = EntityPos(me), node; float hd = 0.f;
+    char* gr = nullptr;
+    int house = CdHomeHouse(pp, &gr);
+    if (house < 0 || !gr) { GarHelp("Nao achei uma garagem sua para registrar o carro."); return false; }
+    if (!FindSpawnNode(pp, Rd<const float*>(me, 0x14), &node, &hd)) { GarHelp("Nao achei uma rua para o carro vir. Tente de outro lugar."); return false; }
+    static const int kFam[3] = { 105, 106, 107 };
+    int fam = kFam[GetTickCount() % 3], ptype = 8;
+    { int pt = 8, cop = GarageCopDriver(pp, &pt); if (cop > 0) { fam = cop; ptype = pt; } }
+    RequestModel(model, 2);
+    if (!LoadModelsNow(nullptr, fam) || !ModelLoaded(model)) { GarHelp("O carro nao carregou. Tente de novo."); return false; }
+    int cr = -1;
+    { Cmd c(0x00A5); c.I(model).F(node.x).F(node.y).F(node.z + 0.5f).Out(0); RunCmd(c, &cr, 1); }
+    { Cmd c(0x0249); c.I(model); RunCmd(c); }
+    char* v = VehByRef(cr);
+    if (!v) { GarHelp("O carro nao pode ser criado agora. Tente de novo."); return false; }
+    { Cmd c(0x0175); c.I(cr).F(hd); RunCmd(c); }
+    NoteDims(v);
+    BYTE blank[0x40] = {};
+    GarCar* gp = NewGar(house, 0, blank);
+    if (!gp) { Cmd c(0x00A6); c.I(cr); RunCmd(c); return false; }
+    GarCar& g = *gp;
+    CaptureCar(g, v);
+    {                                                                         // casa: o meio da garagem, entrando ao longo do eixo B
+        const float* o = (const float*)gr;
+        float Ax = Rd<float>(gr, 0xC), Ay = Rd<float>(gr, 0x10), Bx = Rd<float>(gr, 0x14), By = Rd<float>(gr, 0x18);
+        float W = Rd<float>(gr, 0x20), D = Rd<float>(gr, 0x24);
+        g.home[0] = o[0] + Ax * W * 0.5f + Bx * D * 0.5f; g.home[1] = o[1] + Ay * W * 0.5f + By * D * 0.5f; g.home[2] = o[2];
+        g.homeDir[0] = (signed char)(int)floorf(Bx * 100.f + .5f); g.homeDir[1] = (signed char)(int)floorf(By * 100.f + .5f); g.homeDir[2] = 0;
+    }
+    *(float*)(v + 0x4B0) = 0.f;                                               // vem lavado
+    *(BYTE*)(v + 0x4A4) = 2;                                                  // MISSION_VEHICLE: nao some
+    g.veh = cr;
+    g.flags40 = Rd<DWORD>(v, 0x40); g.b42B = Rd<BYTE>(v, 0x42B);
+    *(DWORD*)(v + 0x40) |= kProofMask;
+    *(BYTE*)(v + 0x42B) |= 0x80;
+    int o = -1;
+    { Cmd c(0x0129); c.I(g.veh).I(ptype).I(fam).Out(0); RunCmd(c, &o, 1); }
+    g.ped = o;
+    { Cmd c(0x0249); c.I(fam); RunCmd(c); }
+    { Cmd c(0x00AD); c.I(g.veh).F(22.f); RunCmd(c); }
+    { Cmd c(0x00AE); c.I(g.veh).I(2); RunCmd(c); }
+    { Cmd c(0x0186); c.I(g.veh).Out(0); RunCmd(c, &o, 1); g.blip = o; }
+    DriveTo(g, pp);
+    g.state = GS_DELIVER; g.phase = 0; g.t0 = g.tPhase = GetTickCount(); g.inGarage = 0;
+    g_errand = (int)(gp - g_gar); g_errandKind = ER_DELIVER;
+    AddMoney(-price);
+    char m[24]; CdMoney(m, sizeof m, price);
+    Log("vendedor: %s (modelo %d) comprado por %d; casa %d; sai de (%.0f, %.0f), %.0f m, motorista %d", CarName(model), model, price, house, node.x, node.y, Dist2(node, pp), fam);
+    GarHelp("%s comprado por %s. Ja esta a caminho.", CarName(model), m);
+    return true;
+}
+static void CdPick(int row) {
+    if (g_level == 5) {
+        if (row < 0 || row >= kCdNCats) return;
+        g_cdCat = row; g_cdPage = 0; CdShowCars();
+        return;
+    }
+    if (g_level == 6) {
+        const CdCat& c = kCdCats[g_cdCat];
+        int first = g_cdPage * 11, n = c.n - first; if (n > 11) n = 11;
+        if (row >= n) { if (c.n > 11) { g_cdPage = c.n > first + 11 ? g_cdPage + 1 : 0; CdShowCars(); } return; }
+        if (row < 0) return;
+        g_cdModel = c.m[first + row]; g_cdPrice = CdPrice(g_cdModel);
+        if (g_cdPrice <= 0) { GarHelp("Esse carro nao esta a venda."); return; }
+        CdShowConfirm();
+        return;
+    }
+    if (g_level == 7) {
+        if (row != 0) { CdShowCars(); return; }
+        CloseMenu(true);
+        CdBuy(g_cdModel, g_cdPrice);
+    }
+}
+
+// ---------------------------------------------------------------- 3.65: precos (pedido 10)
+// [Precos] do INI: nome do modelo = valor (m_nMonetaryValue do handling, +0xD8). Vale para o vendedor, o mercado
+// negro e tudo que o jogo calcula pelo valor (Import/Export, comentarios dos pedestres). Aplicado uma vez, com o
+// handling ja carregado. Modelo fora da lista fica com o valor do jogo.
+static char g_priceIni[MAX_PATH] = "";
+static int  g_priceOn = 1;
+static void PriceTick() {
+    static bool done = false;
+    if (done || !g_priceOn || !g_priceIni[0] || CarValue(400) <= 0) return;
+    done = true;
+    static char buf[16384];
+    DWORD len = GetPrivateProfileSectionA("Precos", buf, sizeof buf, g_priceIni);
+    int n = 0, bad = 0;
+    for (char* k = buf; k < buf + len && *k; k += strlen(k) + 1) {
+        char line[96]; strncpy(line, k, sizeof line - 1); line[sizeof line - 1] = 0;
+        char* eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = 0;
+        char* name = line; while (*name == ' ') name++;
+        if (*name == ';' || !_stricmp(name, "Aplicar")) continue;              // comentario
+        int val = atoi(eq + 1), m = ModelByName(name);
+        if (m < 400 || m > 611 || val <= 0) { bad++; continue; }
+        const char* mi = ((char**)0xA9B0C8)[m];
+        if (!mi) { bad++; continue; }
+        *(int*)(0xC2B9DC + Rd<BYTE>(mi, 0x4A) * 0xE0 + 0xD8) = val;
+        n++;
+    }
+    Log("precos: %d modelos com o preco do INI%s", n, bad ? " (alguns nomes nao existem; veja [Precos])" : "");
+}
 static void PickRow(int row) {
+    if (g_level == 4) { VgCarListPick(row); return; }                         // 3.64: lista de viaturas
+    if (g_level >= 5 && g_level <= 7) { CdPick(row); return; }                // 3.65: vendedor de carros
+    if (g_level >= 8 && g_level <= 12) { OfPick(row); return; }               // 3.69: oficina (3.75: 11 e 12 variacao)
     if (g_level == 3) {
         if (row < 0 || row >= g_nActs) return;
         if (g_acts[row] == AC_ROOT_GAR) OpenGarageList();
+        else if (g_acts[row] == AC_ROOT_CD) CdShowCats();
+        else if (g_acts[row] == AC_ROOT_OF) OfOpen();
         else if (g_acts[row] == AC_ROOT_ARM) { CloseMenu(true); DealerCall(); }
         else if (g_acts[row] == AC_ROOT_VIG) {
             CloseMenu(true);
@@ -3074,6 +3450,8 @@ static void MenuTick() {
         if (g_level == 2) ShowActions();
         else if (g_level == 1) { BuildItems(); if (!g_nItems) CloseMenu(false); else { if (g_page * 11 >= g_nItems) g_page = 0; ShowList(); } }
         else if (g_level == 0) ShowRoot();
+        else if (g_level >= 5 && g_level <= 7) CdBack();
+        else if (g_level >= 8 && g_level <= 12) OfBack();
         else { CloseMenu(false); Log("telefone: menu fechado"); }
         return;
     }
@@ -3091,6 +3469,8 @@ static void CarsTick() {
     DWORD now = GetTickCount();
     if (now - g_garTick < 500) return;
     g_garTick = now;
+    TbTick();                                                                 // 3.69: pecas da oficina
+    OfPatchCarmod();
     char* me = PlayerPed();
     if (!me) return;
     V3 pp = EntityPos(me);
@@ -3208,6 +3588,7 @@ static bool __cdecl GenericSaveDetour(int a) {
         r.playerCar = v && v == pv; r.hasDmg = g.hasDmg;
         memcpy(r.blob, g.blob, sizeof r.blob); memcpy(r.home, g.home, 12); memcpy(r.homeDir, g.homeDir, 3);
         r.health = g.health; memcpy(r.dmg, g.dmg, sizeof r.dmg);
+        { const BYTE* m = v ? TbModsOf(v) : nullptr; if (m) memcpy(g.mods, m, 2); r.pad[0] = g.mods[0]; r.pad[1] = g.mods[1]; }   // 3.69
         int dl = g.state == GS_DEAD ? 0 : g.dentLen;
         fwrite(&r, sizeof r, 1, f);
         fwrite(&dl, 4, 1, f);
@@ -3217,6 +3598,7 @@ static bool __cdecl GenericSaveDetour(int a) {
         if (t[0]) plates++;
         n++;
     }
+    { DWORD mg = 0x53444F4D; fwrite(&mg, 4, 1, f); fwrite(g_slotMods, sizeof g_slotMods, 1, f); }   // 3.69: 'MODS' + pecas das vagas no fim
     fseek(f, 12, SEEK_SET); fwrite(&n, 4, 1, f);
     fclose(f);
     Log("garagem: %d carros seus fora da garagem gravados junto do save (%d com amassados, %d placas)", n, dents, plates);
@@ -3234,6 +3616,8 @@ static void GarOnLoad() {                                                    // 
     g_nGar = 0; g_errand = -1; g_errandKind = ER_NONE; g_menuOpen = false; g_menu = -1; g_phoneOffAt = 0; g_level = 0;
     g_kbMode = 0;
     memset(g_slotPlate, 0, sizeof g_slotPlate);
+    memset(g_slotMods, 0, sizeof g_slotMods);
+    TbReset();
     free(g_garFile); g_garFile = nullptr; g_garFileLen = 0;
     g_garLoadPending = 0;
     if (!g_garOn) return;
@@ -3266,6 +3650,8 @@ static void GarOnLoad() {                                                    // 
         }
     }
     if (plates) Log("garagem: %d placas das vagas carregadas", plates);
+    if (g_garFileLen >= 16 + 4 + (long)sizeof g_slotMods && *(const DWORD*)(g_garFile + g_garFileLen - sizeof g_slotMods - 4) == 0x53444F4D)
+        memcpy(g_slotMods, g_garFile + g_garFileLen - sizeof g_slotMods, sizeof g_slotMods);   // 3.69: pecas das vagas
     g_garLoadPending = 3;
 }
 static void GarLoadTick() {
@@ -3291,6 +3677,7 @@ static void GarLoadTick() {
         g->state = r.state; g->hasDmg = r.hasDmg; g->health = r.health;
         memcpy(g->dmg, r.dmg, sizeof g->dmg); memcpy(g->home, r.home, 12); memcpy(g->homeDir, r.homeDir, 3);
         CleanPlate(t, g->plate);
+        g->mods[0] = r.pad[0]; g->mods[1] = r.pad[1];                         // 3.69: oficina
         if (dl && (g->dent = (BYTE*)malloc(dl)) != nullptr) { memcpy(g->dent, dentData, dl); g->dentLen = g->dentCap = dl; dents++; }
         if (r.playerCar) {                                                   // o CJ voltou dentro dele pelo .gtmveh
             char* pv = PlayerVehicle();
@@ -3299,6 +3686,13 @@ static void GarLoadTick() {
                 NoteDims(pv);
                 if (g->dentLen && g_ldImport) g_ldImport(pv, g->dent, g->dentLen);
                 if (g->plate[0]) ApplyPlateNow(pv, g->plate);
+                if (g->mods[0] || g->mods[1]) TbApply(pv, g->mods);
+                signed char b1 = (signed char)r.blob[0x37], b2 = (signed char)r.blob[0x38];   // 3.75: a variacao guardada
+                signed char c1 = *(signed char*)(pv + 0x438), c2 = *(signed char*)(pv + 0x439);
+                if (b1 >= -1 && b1 < 6 && b2 >= -1 && b2 < 6 && (b1 != c1 || b2 != c2)) {
+                    bool ok = VarApply(pv, b1, b2);
+                    Log("garagem: %s voltou com a variacao %d/%d, trocada para a guardada %d/%d (%s)", CarName(BlobModel(r.blob)), c1, c2, b1, b2, ok ? "ok" : "falhou");
+                }
             }
         }
     }
@@ -4898,6 +5292,7 @@ static void ApplyConvSay() {
 // estrela inteira leva StarSeconds s na cidade (no interior, metade, como no jogo). O jogo baixa 1 ponto de "caos"
 // por segundo (2 no interior); a faixa de cada estrela tem 130, 370, 650 e 1200 pontos (CWanted::UpdateWantedLevel).
 static int   g_vgOn = 1, g_vgNoChase = 1, g_vgOutSec = 120, g_vgHelpOn = 1, g_vgPerk = 1, g_vgMaxStars = 4;
+static int   g_vgPickCar = 0, g_vgPickPed = 0, g_vgCarListLvl = 50;          // 3.64: viatura escolhida na lista
 static float g_vgHelpR = 100.f, g_vgCool = 60.f, g_vgOneCool = 60.f, g_vgStarSec = 65.f, g_vgCopR = 60.f, g_vgStar64 = 32.f;
 static float g_vgSpawnMin = 30.f, g_vgSpawnMax = 70.f;
 static int   g_vgHealth = 300, g_vgArmour = 100, g_vgBonusEvery = 3, g_vgNoAim = 1;
@@ -5040,6 +5435,7 @@ static bool VgBuild(VgUnit& u, V3 nearPt) {
     static const int kCar[4] = { 599, 596, 597, 598 }, kPed[4] = { 283, 280, 281, 282 };
     if (level < 0 || level > 3) level = 1;
     int carM = kCar[level], zoneCop = kPed[level];
+    if (u.single && g_vgPickCar > 0) carM = g_vgPickCar;                      // 3.64: viatura escolhida na lista
     RequestModel(carM, 2);
     for (int i = 0; i < u.n; i++) RequestModel(u.model[i], 2);
     RequestModel(zoneCop, 2);
@@ -5114,7 +5510,7 @@ static bool VgSpawn(VgUnit& u, int nCops, bool squad, bool single) {
     // pesado: todos de MP5. Normal: motorista de pistola, carona da frente de escopeta, os de tras sorteados
     static const int kRear[4] = { 29, 25, 22, 24 };                           // MP5, escopeta, pistola, Desert Eagle
     for (int i = 0; i < nCops; i++) {
-        u.model[i] = VgPickModel(zoneCop, fem);
+        u.model[i] = (single && g_vgPickPed > 0) ? g_vgPickPed : VgPickModel(zoneCop, fem);
         u.weap[i] = squad ? 29 : single ? 22 : i == 0 ? 22 : i == 1 ? 25 : kRear[rand() % 4];
     }
     if (!VgBuild(u, pp)) return false;
@@ -5491,11 +5887,53 @@ static void VgCallCar(DWORD now) {
     VgOneClockFix(now);
     if (g_vu[2].on) GarHelp("A sua viatura ja esta a caminho.");
     else if ((int)(now - g_vg.oneUntil) < 0 && g_vg.oneUntil) GarHelp("Viatura nova em %u s.", (unsigned)((g_vg.oneUntil - now + 999) / 1000));
-    else if (VgSpawn(g_vu[2], 1, false, true)) { g_vg.oneUntil = now + (DWORD)(g_vgOneCool * 1000.f); GarHelp("Uma viatura esta vindo para voce."); }
+    else if (VgSpawn(g_vu[2], 1, false, true)) {
+        g_vg.oneUntil = now + (DWORD)(g_vgOneCool * 1000.f);
+        if (g_vgPickCar > 0) GarHelp("%s esta vindo para voce.", CarName(g_vgPickCar)); else GarHelp("Uma viatura esta vindo para voce.");
+    }
     else GarHelp("Nao deu para mandar a viatura agora. Tente de novo.");
 }
 static void VgCmdBackup() { if (g_vg.active) VgCallBackup(GameMs()); }
-static void VgCmdCar() { if (g_vg.active) VgCallCar(GameMs()); }
+// 3.64 (pedido 08): do nivel 50 (ViaturaListaNivel) em diante, o botao Viatura abre a lista da central (a pe, com a
+// viatura disponivel). Fora isso, como antes: vem a viatura da regiao
+struct VgCarOpt { int car, ped; const char* name; };
+static const VgCarOpt kVgCars[] = {
+    { 0, 0, "Viatura da regiao" },
+    { 596, 280, "Police LS" }, { 597, 281, "Police SF" }, { 598, 282, "Police LV" }, { 599, 283, "Police Ranger" },
+    { 523, 284, "Moto da policia (HPV1000)" }, { 427, 285, "Enforcer" }, { 490, 286, "FBI Rancher" },
+    { 528, 286, "FBI Truck" }, { 601, 285, "S.W.A.T." },
+};
+static const int kVgCarsN = (int)(sizeof kVgCars / sizeof kVgCars[0]);
+static void VgOpenCarList() {
+    g_page = 0; g_menuOpen = true; g_menuOpenAt = GetTickCount(); g_garSel = g_garCancel = false;
+    if (!ModelLoaded(330)) { RequestModel(330, 2); LoadAllRequestedModels(false); }   // celular
+    PlayerControl(false);
+    Phone(true);
+    g_level = 4; g_nActs = 0;
+    const char* rows[12]; int n = 0;
+    for (int i = 0; i < kVgCarsN && n < 12; i++) rows[n++] = kVgCars[i].name;
+    ShowRows("Central", "Qual viatura?", rows, n);
+    Log("vigilante: lista de viaturas aberta");
+}
+static void VgCarListPick(int row) {
+    CloseMenu(true);
+    if (row < 0 || row >= kVgCarsN) return;
+    if (!g_vg.active) { GarHelp("O Vigilante acabou."); return; }
+    g_vgPickCar = kVgCars[row].car; g_vgPickPed = kVgCars[row].ped;
+    Log("vigilante: viatura escolhida na lista: %s", kVgCars[row].name);
+    VgCallCar(GameMs());
+    g_vgPickCar = 0; g_vgPickPed = 0;
+}
+static void VgCmdCar() {
+    if (!g_vg.active) return;
+    DWORD now = GameMs();
+    VgOneClockFix(now);
+    if (g_vgCarListLvl > 0 && VigLevel() >= g_vgCarListLvl && VgCarReady(now) && PlayerPed() && !PlayerVehicle() && !g_menuOpen && !g_shopOpen && !g_kbMode && !MenuActive()) {
+        VgOpenCarList();
+        return;
+    }
+    VgCallCar(now);
+}
 static void VigTick() {
     if (!g_vgOn) return;
     char* ms = MissionScript();
@@ -5702,7 +6140,7 @@ static void WantedPerkTick() {
 // filtro por tipo; e as chamadas de SetWantedLevelNoDrop que nao passam por eles (alarme 0x66B285/0x6AE0C3,
 // viatura roubada 0x66B2EE/0x4BB7D9, batida 0x6A7A54/0x6B90AD, tiro em viatura 0x6D82A4). Zona restrita
 // (CCullZones, Area 69) e estrela dada por script ficam como no jogo.
-static int   g_vgTestLevel = 0, g_rcOn = 1, g_rcMax12 = 1, g_rcMax21 = 3, g_vg64Help = 1;
+static int   g_vgTestLevel = 0, g_rcOn = 1, g_rcMax12 = 1, g_rcMax21 = 3, g_vg64Help = 1, g_vg64Tune = 1;
 static int VigLevel() {
     if (g_vgTestLevel > 0) return g_vgTestLevel;
     return *(volatile int*)(0xB79000 + (157 - 120) * 4);
@@ -6090,7 +6528,6 @@ static void CwCycle(int dir) {
             if (mid > 0 && !ModelLoaded(mid)) { RequestModel(mid, 2); LoadAllRequestedModels(false); }
         }
         ((void(__thiscall*)(char*, int))0x5E61F0)(me, sl);                      // CPed::SetCurrentWeapon(slot)
-        GarHelp("%s", sl == 0 ? "Sem arma" : CwName(t));
         Log("veiculo: arma trocada para %s (slot %d)", sl == 0 ? "nenhuma" : CwName(t), sl);
         g_cwPrefSlot = sl;
         return;
@@ -6570,7 +7007,7 @@ static void PsApply() {
 }
 
 // ---- policiais recrutados (nivel 12: 1, nivel 21: ate 3)
-struct Recruit { int ref, weap, lastTgt; bool hates, vigHate; DWORD tDB, tKill, tEnter, tBack, tMoved, tStuck, tFar, tCarStart, tRegroup; bool enterLogged; int nRgLog; V3 lastPos; };
+struct Recruit { int ref, weap, lastTgt; bool hates, vigHate; DWORD tDB, tKill, tEnter, tBack, tMoved, tStuck, tFar, tCarStart, tRegroup; bool enterLogged, outGrp; int nRgLog, nDbLog; V3 lastPos; };
 static Recruit g_rc[4];
 static int     g_nRc = 0, g_rcCand = -1;
 static WORD    g_rcYnWas = 0;
@@ -6841,28 +7278,67 @@ static void RcTick(DWORD now) {
         }
         was = b;
     }
-    if (g_nRc) {                                                               // 3.55: no seu veiculo, a tarefa do grupo volta na hora
-        char* mc = PlayerVehicle();                                            // (sem ela ele desceria quando o drive-by acaba)
+    // 3.60: sentado no seu veiculo, o recruta sai do grupo. Com o grupo, a resposta do grupo aos suspeitos e aos
+    // tiros tirava ele da garupa para correr atras deles (log da 3.59: desceu 3 vezes e nunca atirou). Fora do grupo,
+    // o 0687 num pedestre dentro de veiculo da a ele a tarefa de ficar sentado (CTaskSimpleCarDrive, 709); o drive-by
+    // e so o do mod (0713). Quando o CJ desce ou ele sai do veiculo, volta ao grupo (0631)
+    if (g_nRc) {
+        char* mc = PlayerVehicle();
         for (int i = 0; mc && i < g_nRc; i++) {
             char* p = PedByRef(g_rc[i].ref);
             if (!p || VgCarOf(p) != mc) continue;
+            Recruit& r = g_rc[i];
+            if (!r.outGrp) {
+                { Cmd c(0x06C9); c.I(r.ref); RunCmd(c); }                      // REMOVE_CHAR_FROM_GROUP
+                { Cmd c(0x0687); c.I(r.ref); RunCmd(c); }                      // fica sentado
+                r.outGrp = true; r.tRegroup = now; r.lastTgt = -1;
+                if (r.nRgLog < 12) { r.nRgLog++; Log("recrutas: recruta sentado no seu veiculo; fora do grupo enquanto voce dirige"); }
+                continue;
+            }
             int t3 = PedPrimaryType(p, 3);
-            if (t3 != 243 && t3 != 1022 && now - g_rc[i].tRegroup > 300) {
-                char tk[160]; PedTaskList(p, tk, sizeof tk);
-                RcRegroup(g_rc[i], false, tk);
+            if (t3 != 709 && t3 != 1022 && now - r.tRegroup > 300) {           // drive-by acabou (ou outra coisa): senta de novo
+                { Cmd c(0x0687); c.I(r.ref); RunCmd(c); }
+                r.tRegroup = now;
             }
         }
     }
     static DWORD tM = 0;
     if (now - tM >= 500 || now < tM) {
         tM = now;
-        if (g_nRc) RcGroupFollow(me, false, false);
+        // 3.59: o CJ entrou num interior (pizzaria etc.): o recruta nao entra junto; ele fica parado esperando la fora
+        // (o mod nao solta por distancia) e, quando o CJ sai, volta para perto dele e para o grupo
+        bool inside = *(volatile int*)0xB72914 != 0;                          // CGame::currArea
+        static bool wasInside = false;
+        if (inside != wasInside) {
+            wasInside = inside;
+            if (g_nRc && inside) {
+                for (int i = 0; i < g_nRc; i++) { Cmd c(0x0687); c.I(g_rc[i].ref); RunCmd(c); }
+                Log("recrutas: voce entrou num interior; %d esperando la fora", g_nRc);
+            } else if (g_nRc) {
+                V3 mp = EntityPos(me);
+                const float* m = Rd<const float*>(me, 0x14);
+                for (int i = 0; i < g_nRc; i++) {
+                    char* p = PedByRef(g_rc[i].ref);
+                    if (!p) continue;
+                    float d = Dist2(EntityPos(p), mp);
+                    if (d > 30.f && m) {                                       // saiu por outra porta: vem para perto
+                        float side = (i % 2) ? 1.2f : -1.2f;
+                        Cmd c(0x00A1); c.I(g_rc[i].ref).F(mp.x - m[4] * 2.f + m[0] * side).F(mp.y - m[5] * 2.f + m[1] * side).F(mp.z); RunCmd(c);
+                    }
+                    RcRegroup(g_rc[i], true, d > 30.f ? "voce saiu do interior; veio para perto" : "voce saiu do interior");
+                    g_rc[i].tFar = 0; g_rc[i].tMoved = now; g_rc[i].lastPos = EntityPos(p);
+                }
+                RcGroupFollow(me, true, false);
+            }
+        }
+        if (g_nRc && !inside) RcGroupFollow(me, false, false);
         int grp = g_nRc ? PlayerGroupRef() : -1;
         for (int i = g_nRc - 1; i >= 0; i--) {
             char* p = PedByRef(g_rc[i].ref);
             if (!p || Rd<float>(p, 0x540) <= 0.f) { RcRelease(i, "caiu"); continue; }
             bool member = false; if (grp >= 0) { Cmd c(0x06EE); c.I(g_rc[i].ref).I(grp); member = RunCmd(c); }
-            if (!member) { RcRelease(i, "saiu do grupo"); continue; }
+            if (!member && !g_rc[i].outGrp) { RcRelease(i, "saiu do grupo"); continue; }
+            if (inside) { g_rc[i].tFar = 0; continue; }                         // esperando la fora
             if (Dist2(EntityPos(p), EntityPos(me)) > 250.f) {                   // ficou para tras (o jogo nao tira mais)
                 if (!g_rc[i].tFar) g_rc[i].tFar = now;
                 else if (now - g_rc[i].tFar > 10000) { RcRelease(i, "ficou para tras"); continue; }
@@ -6870,6 +7346,7 @@ static void RcTick(DWORD now) {
         }
         if (g_nRc && WantedNow() > 0) { RcReleaseAll("voce ficou procurado"); GarHelp("Voce esta procurado: os policiais recrutados foram embora."); }
         while (g_nRc > RcMax()) RcRelease(g_nRc - 1, "nivel menor");
+        if (inside) return;                                                   // no interior: ninguem recebe ordem
         char* myCar = PlayerVehicle();
         bool vig = g_vg.active;
         V3 pp = EntityPos(me);
@@ -6891,7 +7368,14 @@ static void RcTick(DWORD now) {
             V3 rp = EntityPos(p);
             int t3 = PedPrimaryType(p, 3);
             bool ordered = t3 == 1000 || t3 == 1002 || t3 == 1022;             // ataque ou drive-by que o mod mandou
-            if (t3 != 243 && !ordered && now - r.tRegroup > 1500) {           // ordem acabou ou o 243 sumiu: volta ao grupo
+            if (r.outGrp && !inMyCar) {                                         // saiu do seu veiculo (ou voce desceu): grupo de novo
+                r.outGrp = false;
+                RcRegroup(r, true, "fora do seu veiculo");
+                RcGroupFollow(me, false, false);
+                r.lastPos = rp; r.tMoved = now;
+                continue;
+            }
+            if (!r.outGrp && t3 != 243 && !ordered && now - r.tRegroup > 1500) {           // ordem acabou ou o 243 sumiu: volta ao grupo
                 char tk[160]; PedTaskList(p, tk, sizeof tk);
                 RcRegroup(r, false, tk);
                 r.lastPos = rp; r.tMoved = now;
@@ -6920,12 +7404,19 @@ static void RcTick(DWORD now) {
                 if (!t) t = TgNearest(rp, 60.f, true);                         // fora do Vigilante: so quem atacou
                 if (!t) continue;
                 int tr = PedRef(t);
-                char* db = AimTaskTarget(p, 1022, 0x34);                       // drive-by em andamento: em quem?
-                if (db == t && tr == r.lastTgt && now - r.tDB < 8000) continue;
-                if (db != t && now - r.tDB < 1500) continue;
+                bool busy = PedPrimaryType(p, 3) == 1022;                       // drive-by em andamento
+                if (busy && tr == r.lastTgt && now - r.tDB < 8000) continue;
+                if (busy && now - r.tDB < 1500) continue;
                 r.tDB = now; r.lastTgt = tr;
                 VgArm(r.ref, r.weap);
-                Cmd x(0x0713); x.I(r.ref).I(tr).I(-1).F(0.f).F(0.f).F(0.f).F(60.f).I(8).I(seat == 1 ? 0 : 1).I(60); RunCmd(x);
+                char* tc = VgCarOf(t);                                          // suspeito no carro: mira no carro dele
+                int tcr = tc ? VehRef(tc) : -1;
+                Cmd x(0x0713); x.I(r.ref).I(tc ? -1 : tr).I(tcr).F(0.f).F(0.f).F(0.f).F(60.f).I(8).I(seat == 1 ? 0 : 1).I(60); RunCmd(x);   // 8 = Ai (todas as direcoes)
+                if (r.nDbLog < 6) {
+                    r.nDbLog++;
+                    char tk[160]; PedTaskList(p, tk, sizeof tk);
+                    Log("recrutas: drive-by do recruta (banco %d) no %s a %.0f m (tarefas antes: %s)", seat, tc ? "carro do suspeito" : "suspeito", Dist2(EntityPos(t), rp), tk);
+                }
             } else if (myCar) {                                                // voce no veiculo, ele fora: entra como passageiro
                 if (car) { r.tCarStart = 0; continue; }                        // noutro veiculo: o grupo resolve
                 if (ordered) RcRegroup(r, true, "voce num veiculo: larga a briga");    // o grupo leva ele para o seu banco
@@ -7139,6 +7630,18 @@ static void VgCkLoad() {
     g_vgRes.pending = true; g_vgRes.level = f.level; g_vgRes.kills = f.kills; g_vgRes.backup = f.backup < 0 ? 0 : f.backup > 2 ? 2 : f.backup;
     g_vgRes.timer = f.timer;
     Log("checkpoint do Vigilante encontrado: nivel %d, %d kills, %d viatura(s) de reforco", f.level + 1, f.kills, g_vgRes.backup);
+}
+// 3.60: ao chegar no nivel 64 jogando o Vigilante, toca a musica de missao concluida (0394). So na subida durante a
+// missao; carregar um save que ja esta no 64 nao toca
+static void VgLevelTuneTick() {
+    static int last = -1;
+    int L = *(volatile int*)(0xB79000 + (157 - 120) * 4);
+    if (L == last) return;
+    if (g_vg64Tune > 0 && last >= 1 && last < 64 && L >= 64 && OnMission() && PlayerPed()) {
+        Cmd c(0x0394); c.I(g_vg64Tune); RunCmd(c);                             // PLAY_MISSION_PASSED_TUNE
+        Log("vigilante: chegou no nivel %d; musica de missao concluida (%d)", L, g_vg64Tune);
+    }
+    last = L;
 }
 static void VgResumeTick() {
     if (!g_vgRes.pending) return;
@@ -7924,12 +8427,12 @@ static DWORD WINAPI AudioHashThread(LPVOID) {
 //   mais perto da camera usam o nosso som; as outras, com tom nosso, ficam no wail do jogo.
 // - CVehicle::ProcessSirenAndHorn (0x6E0950) so roda para o veiculo do jogador; com overlay antigo (protocolo < 7,
 //   sem o botao) fica tudo como no jogo (toque na buzina liga, segurar = yelp).
-static int   g_sirHoldMs = 220, g_sirShowName = 1, g_sirNpcAir = 1, g_sirVoices = 6, g_sirNpcMin = 6, g_sirNpcMax = 15;
+static int   g_sirHoldMs = 220, g_sirShowName = 0, g_sirNpcAir = 1, g_sirAirDual = 0, g_sirUnattended = 1, g_sirVoices = 6, g_sirNpcMin = 6, g_sirNpcMax = 15;
 static float g_sirVol = 0.f;                                                  // [Sirenes] Volume (dB, so os nossos sons)
-static int   g_sirTones[8] = { 1, 2, 3, 4, 5 }, g_sirNT = 5;                 // [Sirenes] Tons
-static int   g_sirNpcTones[8] = { 1, 2, 3, 4, 5 }, g_sirNN = 5;              // [Sirenes] TonsDaIA
-static const char* kSirName[7] = { "", "Wail", "Yelp", "Priority", "Hi-Lo", "Piercer", "Air horn" };
-enum { SIR_AIR = 6, SIR_N = 7 };
+static int   g_sirTones[8] = { 1, 2, 3 }, g_sirNT = 3;                 // [Sirenes] Tons
+static int   g_sirNpcTones[8] = { 1, 2, 3 }, g_sirNN = 3;              // [Sirenes] TonsDaIA
+static const char* kSirName[5] = { "", "Wail", "Yelp", "Piercer", "Air horn" };   // 3.57: so tres tons
+enum { SIR_AIR = 4, SIR_N = 5 };
 struct SirPcm { short* d; int n, rate; bool wav; };
 static SirPcm g_pcm[SIR_N];
 static volatile bool g_sirReady = false;                                      // sons prontos (gerados na thread SirWatch)
@@ -7937,10 +8440,29 @@ static bool  g_sirDsBad = false;
 static int   g_sirTone = 1, g_sirToneIx = 0;                                  // tom atual do CJ
 static bool  g_sirAir = false, g_sirHornWas = false;
 static DWORD g_sirHornDown = 0;
+static int   g_sirStrobeRef = -1;                                             // 3.57: veiculo do CJ so com os estrobos
+static bool SirIsStrobe(const char* v) { return v && g_sirStrobeRef >= 0 && VehByRef(g_sirStrobeRef) == v; }
+// 3.58: so estrobos nao abre caminho, menos com o air horn segurado ha 1,5 s (ate soltar)
+static int g_sirStrobeYieldMsCfg = 1500;
+static bool SirYieldBlocked(const char* v) { return SirIsStrobe(v) && !(g_sirStrobeYieldMsCfg > 0 && g_sirAir && GameMs() - g_sirHornDown >= (DWORD)g_sirStrobeYieldMsCfg); }
 static bool SirButton() { return g_hostEverSeen && g_host.version >= 7; }      // overlay 3.10: botao Sirene
+static int   g_sirCiv = 1, g_sirLight = 1, g_sirRadio64 = 1, g_sirCivRef = -1;   // 3.65: pedidos 06 e 07
+static bool SirUsesSiren(char* v) { return ((bool(__thiscall*)(char*))0x6D8470)(v); }   // CVehicle::UsesSiren
+// 3.65 (pedido 06): do nivel 64 em diante, carro, monster truck, quadriciclo e moto do CJ tambem tem sirene (sem
+// aviao, helicoptero, barco, bicicleta, trem e controle remoto). So o veiculo que o CJ dirige (ou o ultimo em que
+// ele ligou a sirene); os carros da rua continuam sem
+static bool SirCivType(char* v) {
+    if (!g_sirCiv || VigLevel() < 64) return false;
+    int st = Rd<int>(v, 0x594);
+    if (st != 0 && st != 1 && st != 2 && st != 9) return false;
+    short m = Rd<short>(v, 0x22);
+    return m != 441 && m != 464 && m != 465 && m != 501 && m != 564 && m != 594 && m != 423;
+}
 static bool SirCapable(char* v) {
     if (!v || Rd<short>(v, 0x22) == 423) return false;                       // Mr. Whoopee: a "sirene" e a musica
-    return ((bool(__thiscall*)(char*))0x6D8470)(v);                           // CVehicle::UsesSiren
+    if (SirUsesSiren(v)) return true;
+    if (!SirCivType(v)) return false;
+    return v == PlayerVehicle() || (g_sirCivRef >= 0 && VehByRef(g_sirCivRef) == v);
 }
 static bool SirFlag(const char* v) { return (Rd<BYTE>(v, 0x42D) & 0x80) != 0; }   // bSirenOrAlarm
 static bool SirOurs(int snd) { return snd >= 3 || (g_sirReady && g_pcm[snd].wav); }   // tocado por nos (e nao pelo jogo)
@@ -7977,70 +8499,90 @@ static bool SirLoadWav(const char* path, SirPcm& p) {
     free(b);
     return true;
 }
-static double SirToneF(int k, double t) {
-    switch (k) {
-    case 3: { double ph = fmod(t * 12.0, 1.0); return 760.0 + 760.0 * pow(ph, 0.8); }          // Priority: subidas rapidas
-    case 4: {                                                                                     // Hi-Lo: 0,5 s cada
-        double ph = fmod(t, 1.0), g = 0.012, hi = 960.0, lo = 720.0;
-        if (ph < 0.5) { double s = ph / g; return lo + (hi - lo) * (s > 1 ? 1 : s); }
-        double s = (ph - 0.5) / g; return hi - (hi - lo) * (s > 1 ? 1 : s);
-    }
-    case 5: { double ph = fmod(t * 15.0, 1.0); return 1050.0 + 800.0 * (1.0 - fabs(2.0 * ph - 1.0)); }   // Piercer
-    }
-    return 1000.0;
-}
+// 3.57: os dois sons refeitos pelas gravacoes que o Gabriel mandou (os da 3.56 ficaram agudos demais).
+// Piercer: a gravacao varre de ~700 a ~1350 Hz, 14 vezes por segundo, quase senoidal (2o harmonico ~-12 dB).
+// Air horn: a gravacao e um zumbido de 68,77 Hz com 40 harmonicos (97% do som) e o mais forte no 14o (963 Hz,
+// a ressonancia da corneta); amplitude e fase de cada harmonico medidas e tocadas de volta
+static const float kAirAmp[40] = { 0.005f, 0.007f, 0.018f, 0.017f, 0.086f, 0.094f, 0.229f, 0.383f, 0.477f, 0.197f, 0.312f, 0.291f, 0.118f, 1.000f, 0.286f, 0.107f, 0.145f, 0.088f, 0.193f, 0.217f, 0.202f, 0.238f, 0.152f, 0.059f, 0.185f, 0.140f, 0.078f, 0.076f, 0.009f, 0.032f, 0.036f, 0.093f, 0.036f, 0.011f, 0.140f, 0.134f, 0.028f, 0.113f, 0.010f, 0.031f };
+static const float kAirPh[40] = { 1.14f, -1.02f, -1.78f, 1.52f, 1.09f, -1.84f, 0.29f, 0.14f, -0.45f, 2.47f, -0.72f, -2.11f, -1.10f, 1.75f, -1.88f, -0.38f, 0.22f, -0.65f, -0.47f, -2.19f, -2.76f, -0.47f, -0.72f, 0.44f, -0.93f, 2.61f, -1.46f, 0.59f, -1.70f, 1.08f, 1.39f, 2.84f, -2.08f, 3.06f, 1.57f, -2.96f, 0.62f, 0.16f, 0.48f, -1.41f };
 static bool SirSynth(int k, SirPcm& p) {
     const int SR = 22050;
     const double PI2 = 6.283185307179586;
-    int n = (k == 4 ? 2 : 1) * SR, N = 2 * n;                                 // gera 2 lacos e fica com o segundo
-    float* x = (float*)malloc(N * sizeof(float));
+    int n = k == SIR_AIR ? (int)(69.0 / 68.77 * SR + 0.5) : SR;              // air horn: 69 ciclos exatos no laco
+    float* x = (float*)malloc(n * sizeof(float));
     if (!x) return false;
-    if (k == SIR_AIR) {                                                       // dois zumbidos graves quase iguais
-        static const double fr[2] = { 372.0, 376.0 }, am[2] = { 1.0, 0.85 };
-        for (int i = 0; i < N; i++) {
-            double t = (double)i / SR, s = 0;
-            for (int o = 0; o < 2; o++) for (int h = 1; h < 16 && h * fr[o] < 0.45 * SR; h++) s += am[o] / h * sin(PI2 * fr[o] * h * t);
-            x[i] = (float)s;
+    if (k == SIR_AIR) {
+        double f0 = 69.0 * SR / n;
+        for (int i = 0; i < n; i++) {
+            double t = (double)i / SR, v = 0;
+            for (int h = 1; h <= 40; h++) v += kAirAmp[h - 1] * cos(PI2 * f0 * h * t + kAirPh[h - 1]);
+            x[i] = (float)v;
         }
-    } else {
-        double Phi = 0;
-        for (int i = 0; i < n; i++) Phi += SirToneF(k, (double)i / SR) / SR;
-        double sc = floor(Phi + 0.5) / Phi, ph = 0;                           // ciclos inteiros no laco: sem emenda
-        static const double am[8] = { 1.0, 0.5, 0.33, 0.2, 0.14, 0.09, 0.06, 0.04 };
-        for (int i = 0; i < N; i++) {
-            double f = SirToneF(k, (double)i / SR) * sc;
-            ph += PI2 * f / SR;
-            if (ph > PI2) ph -= PI2;
-            double s = 0;
-            for (int h = 1; h <= 8; h++) {
-                double fade = (0.45 * SR - h * f) / (0.05 * SR);
-                if (fade <= 0) break;
-                s += am[h - 1] * (fade > 1 ? 1 : fade) * sin(h * ph);
+        if (g_sirAirDual) {
+            // 3.61: air horn "A" da pagina (escolha do Gabriel): segunda corneta desafinada, 72 ciclos no laco (71,8 Hz;
+            // a primeira tem 69), ganho 0,85, batimento de 3 por segundo. Timbre: o envelope dos 40 harmonicos
+            // medidos (interpolado em log sobre h x 68,77 Hz) lido em cada harmonico da segunda; fase kAirPh[(k*7)%40]
+            double f2 = 72.0 * SR / n;
+            float la[40];
+            for (int h = 0; h < 40; h++) la[h] = logf(kAirAmp[h] > 1e-3f ? kAirAmp[h] : 1e-3f);
+            for (int kk = 1; kk * f2 < 2900.0; kk++) {
+                double fk = kk * f2, hp = fk / 68.77 - 1.0, a;              // posicao no envelope (0 = 1o harmonico)
+                if (hp <= 0) a = exp(la[0]);
+                else if (hp >= 39) a = hp > 39 ? exp(-9.0) : exp(la[39]);
+                else { int j = (int)hp; double fr = hp - j; a = exp(la[j] + (la[j + 1] - la[j]) * fr); }
+                a *= 0.85;
+                double phk = kAirPh[(kk * 7) % 40];
+                for (int i = 0; i < n; i++) x[i] += (float)(a * cos(PI2 * fk * i / SR + phk));
             }
-            x[i] = (float)s;
         }
+    } else {                                                                  // Piercer "D" (3.58, escolhido na pagina)
+        // duas cornetas: a mesma varredura (1025 +- 325 Hz, 14 por segundo) com a modulacao defasada 1,2 rad, onda
+        // quadrada (harmonicos impares 1/h), saturacao tanh 1.4 e passa-faixa Butterworth 450 a 3200 Hz (2 biquads)
+        static const double sos[2][6] = { { 0.0972694687881, 0.194538937576, 0.0972694687881, 1, -0.936928438748, 0.394528488435 },
+                                          { 1, -2, 1, 1, -1.82833902211, 0.846899656421 } };
+        for (int i = 0; i < n; i++) x[i] = 0.f;
+        for (int o = 0; o < 2; o++) {
+            double off = o ? 1.2 : 0.0, amp = o ? 0.8 : 1.0, Phi = 0;
+            for (int i = 0; i < n; i++) Phi += (1025.0 + 325.0 * sin(PI2 * 14.0 * i / SR + off)) / SR;
+            double sc = floor(Phi + 0.5) / Phi, ph = 0;
+            for (int i = 0; i < n; i++) {
+                double f = (1025.0 + 325.0 * sin(PI2 * 14.0 * i / SR + off)) * sc;
+                ph += PI2 * f / SR;
+                if (ph > PI2) ph -= PI2;
+                double v = 0;
+                for (int h = 1; h <= 13; h += 2) {
+                    double fade = (0.45 * SR - h * f) / (0.05 * SR);
+                    if (fade <= 0) break;
+                    v += (fade > 1 ? 1 : fade) / h * sin(h * ph);
+                }
+                x[i] += (float)(amp * v);
+            }
+        }
+        float mx = 1e-9f;
+        for (int i = 0; i < n; i++) if (fabsf(x[i]) > mx) mx = fabsf(x[i]);
+        for (int i = 0; i < n; i++) x[i] = tanhf(1.4f * x[i] / mx);
+        double z[2][2] = { { 0, 0 }, { 0, 0 } };                              // duas voltas: a segunda ja no regime (laco sem emenda)
+        for (int pass = 0; pass < 2; pass++)
+            for (int i = 0; i < n; i++) {
+                double v = x[i];
+                for (int q = 0; q < 2; q++) {
+                    const double* c = sos[q];
+                    double y = c[0] * v + z[q][0];
+                    z[q][0] = c[1] * v - c[4] * y + z[q][1];
+                    z[q][1] = c[2] * v - c[5] * y;
+                    v = y;
+                }
+                if (pass) x[i] = (float)v;
+            }
     }
-    float mx = 1e-9f;
-    for (int i = 0; i < N; i++) if (fabsf(x[i]) > mx) mx = fabsf(x[i]);
-    const float tk = tanhf(1.6f);
-    for (int i = 0; i < N; i++) x[i] = tanhf(1.6f * x[i] / mx) / tk;          // corneta: um pouco de saturacao
-    double a = 1.0 / (1.0 + PI2 * 350.0 / SR), px = 0, py = 0;                // passa-alta 350 Hz
-    for (int i = 0; i < N; i++) { double y = a * (py + x[i] - px); px = x[i]; py = y; x[i] = (float)y; }
-    double bl = (PI2 * 5000.0 / SR) / (1.0 + PI2 * 5000.0 / SR); py = 0;      // passa-baixa 5 kHz
-    for (int i = 0; i < N; i++) { py += bl * (x[i] - py); x[i] = (float)py; }
-    float* y = x + n;
-    float* e = (float*)malloc(n * sizeof(float));
-    if (!e) { free(x); return false; }
-    int d1 = (int)(0.045 * SR), d2 = (int)(0.11 * SR);                        // eco de rua, circular (laco continua sem emenda)
-    for (int i = 0; i < n; i++) e[i] = y[i] + 0.18f * y[(i - d1 + n) % n] + 0.08f * y[(i - d2 + n) % n];
-    double ss = 0; for (int i = 0; i < n; i++) ss += (double)e[i] * e[i];
+    double ss = 0; for (int i = 0; i < n; i++) ss += (double)x[i] * x[i];
     double g = pow(10.0, -13.0 / 20.0) / sqrt(ss / n + 1e-12), pk = 0;       // RMS -13 dBFS, como os do jogo
-    for (int i = 0; i < n; i++) if (fabs(e[i] * g) > pk) pk = fabs(e[i] * g);
+    for (int i = 0; i < n; i++) if (fabs(x[i] * g) > pk) pk = fabs(x[i] * g);
     if (pk > 0.891) g *= 0.891 / pk;                                          // pico ate -1 dBFS
     p.d = (short*)malloc(n * 2);
-    if (p.d) for (int i = 0; i < n; i++) { double v = e[i] * g * 32767.0; p.d[i] = (short)(v > 32767 ? 32767 : v < -32768 ? -32768 : lrint(v)); }
+    if (p.d) for (int i = 0; i < n; i++) { double v = x[i] * g * 32767.0; p.d[i] = (short)(v > 32767 ? 32767 : v < -32768 ? -32768 : lrint(v)); }
     p.n = p.d ? n : 0; p.rate = SR; p.wav = false;
-    free(e); free(x);
+    free(x);
     return p.d != nullptr;
 }
 static void SirPrepare() {
@@ -8052,7 +8594,7 @@ static void SirPrepare() {
         if (SirLoadWav(path, g_pcm[k])) { nw++; Log("sirenes: %s (%s) vem do arquivo (%d amostras a %d Hz)", kSirName[k], path, g_pcm[k].n, g_pcm[k].rate); continue; }
         if (k >= 3 && !SirSynth(k, g_pcm[k])) Log("sirenes: nao deu para gerar o tom %d", k);
     }
-    Log("sirenes: prontas (tons 1 e 2 do jogo%s; 3 a 5 e air horn gerados; %d arquivo(s) WAV)", nw ? " ou do arquivo" : "", nw);
+    Log("sirenes: prontas (Wail e Yelp do jogo%s; Piercer e air horn gerados; %d arquivo(s) WAV)", nw ? " ou do arquivo" : "", nw);
 }
 
 // ---- vozes (DirectSound do jogo)
@@ -8098,6 +8640,7 @@ static bool SirVoiceLoad(SirVoice& v, int snd) {
     v.b = b; v.b3 = b3; v.snd = snd; v.rate = p.rate; v.on = false; v.watchStop = false; v.pt = 0; v.lastVol = 999.f; v.lastFreq = 0.f;
     return true;
 }
+static void TbPauseStop();
 static DWORD WINAPI SirWatch(LPVOID) {
     SirPrepare();                                                             // gerar os tons aqui, fora do quadro do jogo
     MemoryBarrier();
@@ -8107,6 +8650,7 @@ static DWORD WINAPI SirWatch(LPVOID) {
         EnterCriticalSection(&g_sirCs);
         if (GetTickCount() - g_sirBeat > 250)                                 // o jogo parou (pausa, carregamento)
             for (auto& v : g_sv) if (v.b && v.on && !v.watchStop) { v.b->Stop(); v.watchStop = true; }
+        if (GetTickCount() - g_sirBeat > 250) TbPauseStop();                 // 3.69: turbo
         LeaveCriticalSection(&g_sirCs);
     }
     return 0;
@@ -8128,7 +8672,7 @@ static void SirVoiceUpdate(SirVoice& v, char* veh, bool want, DWORD now) {
     float tgt = want ? db : -100.f;
     if (!v.on || v.watchStop) {
         if (!want) return;
-        v.vol = db - 24.f;                                                    // entra rapido, sem estalo
+        v.vol = v.snd == SIR_AIR ? db : db - 24.f;                            // 3.60: air horn ja entra alto (toque rapido audivel)
         v.b->SetCurrentPosition(0);
         v.b->SetVolume((LONG)(v.vol * 100.f));
         if (v.b3) v.b3->SetPosition(rel.x, rel.y, rel.z, DS3D_IMMEDIATE);
@@ -8136,7 +8680,7 @@ static void SirVoiceUpdate(SirVoice& v, char* veh, bool want, DWORD now) {
         v.on = true; v.watchStop = false; v.pt = 0; v.lastVol = v.vol; v.lastPos = rel;
     }
     if (tgt > v.vol) v.vol = (tgt - v.vol > 8.f) ? v.vol + 8.f : tgt;          // subida: 8 dB por quadro
-    else v.vol = (v.vol - tgt > 4.f) ? v.vol - 4.f : tgt;                       // descida: 4 dB por quadro
+    else { float dn = v.snd == SIR_AIR ? 12.f : 4.f; v.vol = (v.vol - tgt > dn) ? v.vol - dn : tgt; }   // descida: 4 dB por quadro (air horn 12)
     if (!want && v.vol <= -60.f) { v.b->Stop(); v.on = false; return; }
     float dop = 1.f;
     if (v.pt && now > v.pt) {
@@ -8152,7 +8696,7 @@ static void SirVoiceUpdate(SirVoice& v, char* veh, bool want, DWORD now) {
 }
 
 // ---- veiculos com sirene ligada
-struct SirVeh { char* veh; int ref, tone, voice, mode; DWORD nextChange, nextBlast, airUntil; bool seen, player, npc, air, vanilla; float camDist; };
+struct SirVeh { char* veh; int ref, tone, voice, mode; DWORD nextChange, nextBlast, airUntil; bool seen, player, npc, air, vanilla, strobe; float camDist; };
 static SirVeh g_svh[32];
 static int g_nSvh = 0;
 static SirVeh* SirFind(const char* v) { for (int i = 0; i < g_nSvh; i++) if (g_svh[i].veh == v) return &g_svh[i]; return nullptr; }
@@ -8168,17 +8712,24 @@ static void SirNextTone() {
     g_sirTone = g_sirTones[g_sirToneIx];
     SirShowTone();
 }
+// 3.57: o botao Sirene gira: desligado > so estrobos > sirene e estrobos > desligado. So estrobos = luzes da viatura
+// (bSirenOrAlarm) sem som, o transito nao abre caminho e a Buzina toca so o air horn
 static void SirCmdToggle() {
     char* me = PlayerPed(); char* v = PlayerVehicle();
     if (!g_sirOn || !v || Rd<char*>(v, 0x460) != me || !SirCapable(v)) return;
     BYTE f = Rd<BYTE>(v, 0x42D);
-    bool on = !(f & 0x80);
-    *(BYTE*)(v + 0x42D) = on ? (BYTE)(f | 0x80) : (BYTE)(f & 0x7F);
+    int mode = !(f & 0x80) ? 0 : SirIsStrobe(v) ? 1 : 2, next = (mode + 1) % 3;
+    *(BYTE*)(v + 0x42D) = next ? (BYTE)(f | 0x80) : (BYTE)(f & 0x7F);
     *(DWORD*)(v + 0x514) = 0;
     g_sirAir = false;
-    if (on) { g_sirToneIx = 0; g_sirTone = g_sirNT > 0 ? g_sirTones[0] : 1; SirShowTone(); }
+    if (next && !SirUsesSiren(v)) g_sirCivRef = VehRef(v);                    // 3.65: carro comum com sirene (nivel 64)
+    if (next == 1) { g_sirStrobeRef = VehRef(v); if (g_sirShowName) GarHelp("Estrobos ligados (sem sirene)"); }
+    else if (SirIsStrobe(v)) g_sirStrobeRef = -1;
+    if (next == 2) { g_sirToneIx = 0; g_sirTone = g_sirNT > 0 ? g_sirTones[0] : 1; SirShowTone(); }
+    if (next == 0 && g_sirShowName) GarHelp("Sirene e estrobos desligados");
     static int n = 0;
-    if (n < 10) { n++; Log("sirenes: sirene %s pelo botao (modelo %d)", on ? "ligada" : "desligada", Rd<short>(v, 0x22)); }
+    static const char* kM[3] = { "desligada", "so estrobos", "sirene e estrobos" };
+    if (n < 12) { n++; Log("sirenes: %s pelo botao (modelo %d)", kM[next], Rd<short>(v, 0x22)); }
 }
 // CVehicle::ProcessSirenAndHorn (so o veiculo do jogador): com o botao Sirene, a buzina e buzina; com a sirene
 // ligada, toque troca o tom e segurar e o air horn
@@ -8190,6 +8741,10 @@ static void SirHornLogic(char* veh) {
     if (!SirFlag(veh)) {
         *(DWORD*)(veh + 0x514) = horn ? 1 : 0;                                // m_HornCounter: buzina normal do veiculo
         g_sirAir = false;
+    } else if (SirIsStrobe(veh)) {                                            // so estrobos: a Buzina e o air horn, na hora
+        *(DWORD*)(veh + 0x514) = 0;
+        if (horn && !g_sirHornWas) g_sirHornDown = now;
+        g_sirAir = horn || now - g_sirHornDown < 120;                         // 3.60: toque minimo de 120 ms
     } else {
         *(DWORD*)(veh + 0x514) = 0;                                           // nem buzina nem o yelp do jogo
         if (horn && !g_sirHornWas) g_sirHornDown = now;
@@ -8207,16 +8762,885 @@ typedef void(__thiscall* SirGss_t)(void*, bool*, bool*, void*);
 static SirGss_t g_sirOrigGss = nullptr;
 static void __fastcall SirGssDetour(void* ae, void*, bool* on, bool* fast, void* vp) {
     g_sirOrigGss(ae, on, fast, vp);
-    if (!g_sirOn || !*on || !vp) return;
+    if (!g_sirOn || !vp) return;
     char* veh = *(char**)((char*)vp + 0x10);                                  // tVehicleParams.Vehicle
     SirVeh* e = veh ? SirFind(veh) : nullptr;
     if (!e || e->vanilla) return;
+    // 3.63: o jogo cala o Wail e o Yelp dele com o veiculo abandonado (status 4); os tons nossos ja continuavam
+    // tocando e o Gabriel gostou. Sem motorista (o CJ desceu ou a IA desceu), com a sirene ligada e sem estar
+    // destruido, o tom do jogo tambem continua
+    if (!*on) {
+        if (!SirUsesSiren(veh)) {                                             // 3.65: carro comum (nivel 64): o jogo nao tem sirene nele
+            if (!SirFlag(veh) || (Rd<BYTE>(veh, 0x36) >> 3) == 5) return;
+            *on = true;
+        } else {
+            if (!g_sirUnattended || e->player || e->npc || !SirFlag(veh) || (Rd<BYTE>(veh, 0x36) >> 3) == 5) return;
+            *on = true;
+        }
+    }
     if (e->npc && g_sirNpcAir && Rd<DWORD>(veh, 0x514)) {                    // a IA buzinou com a sirene ligada: air horn
         e->airUntil = GameMs() + 600 + rand() % 700;
         *(DWORD*)(veh + 0x514) = 0;
     }
     if (e->mode == 0) { *on = false; *fast = false; }                         // nos tocamos
     else *fast = e->mode == 2;
+}
+// luz do painel: corona (CCoronas::RegisterCorona 0x6FC580, cdecl, 21 args, posicao no espaco do veiculo) no lado do
+// passageiro, a 62% da altura da caixa de colisao e 28% para a frente; nas motos, no guidao. O brilho gira: forte
+// quando o "espelho" passa pela frente (cos^4), 1,2 voltas por segundo
+typedef void(__cdecl* RegCorona_t)(unsigned, void*, int, int, int, int, const V3*, float, float, int, int, int, int, int, float, int, float, int, float, int, int);
+static void SirDashLight(char* v, DWORD now) {
+    short m = Rd<short>(v, 0x22);
+    const char* mi = ((char**)0xA9B0C8)[m];
+    if (!mi) return;
+    bool bike = Rd<int>(v, 0x594) == 9;
+    V3 pos;
+    // 3.67: no lugar do painel do passageiro: o banco da frente (dummy 4 do CVehicleStructure, m_pVehicleStruct +0x5C)
+    // espelhado para a direita, 0,65 m para a frente e 0,40 m acima. Sem o dummy (ou na moto), pela caixa de colisao
+    const float* vs = Rd<const float*>(mi, 0x5C);
+    const float* seat = vs ? vs + 4 * 3 : nullptr;
+    if (!bike && seat && (seat[0] != 0.f || seat[1] != 0.f || seat[2] != 0.f)) pos = V3{ fabsf(seat[0]), seat[1] + 0.65f, seat[2] + 0.40f };
+    else {
+        const float* bb = Rd<const float*>(mi, 0x14);                         // m_pColModel: CBoundingBox min, max
+        if (!bb) return;
+        float minZ = bb[2], maxX = bb[3], maxY = bb[4], maxZ = bb[5];
+        pos = bike ? V3{ 0.f, maxY * 0.45f, minZ + (maxZ - minZ) * 0.78f } : V3{ maxX * 0.45f, maxY * 0.28f, minZ + (maxZ - minZ) * 0.62f };
+    }
+    float ph = (float)(now % 100000) * 0.0075398f;                            // 1,2 voltas por segundo
+    float c = cosf(ph); c = c > 0.f ? c * c * c * c : 0.f;
+    int a = 35 + (int)(220.f * c);
+    // o jogo desenha corona com textura sempre com teste de profundidade: as luzes das viaturas (e as do painel do FBI
+    // Rancher) usam pullTowardsCam 1,5 m (CAutomobile::PreRender, 0x6ABA60) para sair de dentro da lataria; aqui igual
+    ((RegCorona_t)0x6FC580)((unsigned)(uintptr_t)v + 0x51E7u, v, 255, 18, 8, a, &pos, 0.30f + 0.25f * c, 90.f, 1, 0, 0, 0, 0, 0.f, 0, 1.5f, 0, 15.f, 0, 0);
+    static bool noted = false;
+    if (!noted) { noted = true; Log("sirenes: luz do painel no modelo %d (posicao %.2f, %.2f, %.2f%s)", m, pos.x, pos.y, pos.z, bike || !seat ? ", pela caixa de colisao" : ", pelo banco da frente"); }
+}
+// radio (pedido 06): no nivel 64 as viaturas tem radio de musica (tipo de radio civil no tVehicleAudioSettings
+// 0x860AF0, passo 0x24: estacao +0x1A, tipo +0x1B; copia do veiculo em +0x1BC); com o radio desligado numa viatura
+// (ou no carro comum com a sirene ligada) toca o radio da policia (estacao 0, RADIO_EMERGENCY_AA) pelo
+// CAERadioTrackManager::StartRadio (0x4EB3C0, thiscall; gerente em 0x8CB6F8: estacao pedida +0xAD, ativa +0xE9,
+// graves +0xEA, ganho +0xEC, ultima troca +0x50)
+static const short kSirRadioCops[] = { 596, 597, 598, 599, 523, 427, 490, 528, 601 };
+static bool SirIsRadioCop(short m) { for (short k : kSirRadioCops) if (k == m) return true; return false; }
+// 3.67: na 3.65 o radio da policia era a estacao 0 tocada num radio civil: o Gabriel nao ouviu nada e o Patriot
+// chegou a nao trocar de estacao ate ele descer. Agora, com o radio desligado, o veiculo vira radio de emergencia
+// (tipo 3 na copia dele, como as viaturas antes do 64) e o StartRadio com as configuracoes dele (0x4EB550) toca a
+// policia do jeito do jogo. Com o tipo 3 o jogo ignora os botoes de estacao: o proximo/anterior (CPad
+// NextStationJustUp 0x5405B0 / LastStationJustUp 0x5405E0, pad 0xB73458) volta o tipo para civil e liga a Playback FM
+// (proximo) ou a WCTR (anterior). Ao descer, o tipo volta a civil
+static int g_sirScanRef = -1, g_sirScanAlways = 1;
+static void SirRadioTick(char* pv, char* me, DWORD now) {
+    if (!g_sirRadio64 || VigLevel() < 64) return;
+    static bool table = false;
+    if (!table) {
+        table = true;
+        int n = 0;
+        for (short m : kSirRadioCops) {
+            BYTE* e = (BYTE*)0x860AF0 + (m - 400) * 0x24;
+            if (e[0x1B] != 3) continue;
+            DWORD op; VirtualProtect(e, 0x24, PAGE_EXECUTE_READWRITE, &op);
+            e[0x1B] = 0; e[0x1A] = 6;                                         // civil, Radio Los Santos
+            VirtualProtect(e, 0x24, op, &op);
+            n++;
+        }
+        Log("sirenes: nivel 64: %d viaturas com radio de musica", n);
+    }
+    bool drive = pv && Rd<char*>(pv, 0x460) == me;
+    if (g_sirScanRef >= 0 && (!drive || VehRef(pv) != g_sirScanRef)) {      // desceu: o carro volta a ter radio civil
+        if (char* o = VehByRef(g_sirScanRef)) if (Rd<BYTE>(o, 0x1BC + 0x1B) == 3) *(BYTE*)(o + 0x1BC + 0x1B) = 0;
+        g_sirScanRef = -1;
+    }
+    if (!drive) return;
+    short m = Rd<short>(pv, 0x22);
+    bool cop = SirIsRadioCop(m);
+    if (cop && Rd<BYTE>(pv, 0x1BC + 0x1B) == 3 && Rd<BYTE>(pv, 0x1BC + 0x1A) == 13 && g_sirScanRef != VehRef(pv)) { *(BYTE*)(pv + 0x1BC + 0x1B) = 0; *(BYTE*)(pv + 0x1BC + 0x1A) = 6; }
+    // 3.68: com RadioDaPoliciaSempre (padrao), qualquer veiculo com radio civil; senao, viatura ou carro com sirene ligada
+    bool want = cop || g_sirScanAlways || (SirFlag(pv) && SirCapable(pv) && !SirUsesSiren(pv));
+    BYTE* rm = (BYTE*)0x8CB6F8;
+    typedef void(__thiscall* StartRadioId_t)(void*, int, int, float, int);
+    typedef void(__thiscall* StartRadioSet_t)(void*, const void*);
+    typedef bool(__thiscall* PadBool_t)(void*);
+    BYTE type = Rd<BYTE>(pv, 0x1BC + 0x1B);
+    if (g_sirScanRef == VehRef(pv) && type == 3) {                            // tocando a policia
+        bool nx = ((PadBool_t)0x5405B0)((void*)0xB73458), pr = ((PadBool_t)0x5405E0)((void*)0xB73458);
+        if (!want || nx || pr) {
+            *(BYTE*)(pv + 0x1BC + 0x1B) = 0;
+            g_sirScanRef = -1;
+            int st = !want ? 13 : nx ? 1 : 11;
+            ((StartRadioId_t)0x4EB3C0)(rm, st, rm[0xEA], *(float*)(rm + 0xEC), 0);
+            rm[1] = 1;                                                        // m_bDisplayStationName
+            *(DWORD*)(rm + 0x50) = now;
+            Log("sirenes: radio da policia desligado (%s)", !want ? "sirene desligada" : nx ? "proxima estacao" : "estacao anterior");
+        }
+        return;
+    }
+    if (!want || type != 0) return;
+    static DWORD tStart = 0;
+    signed char req = (signed char)rm[0xAD], act = (signed char)rm[0xE9];
+    if (req != 13 || act != 13) return;
+    if (now - *(DWORD*)(rm + 0x50) < 1500 || now - tStart < 3000) return;    // trocando de estacao: espera
+    tStart = now;
+    *(BYTE*)(pv + 0x1BC + 0x1B) = 3;
+    g_sirScanRef = VehRef(pv);
+    ((StartRadioSet_t)0x4EB550)(rm, pv + 0x1BC);
+    static int nl = 0;
+    if (nl < 8) { nl++; Log("sirenes: radio desligado em veiculo com sirene: radio da policia (modelo %d)", m); }
+}
+// ---------------------------------------------------------------- 3.69: Oficina GTM (turbo, blindagem, pneus, tracao)
+// Pedido do Gabriel: na TransFender (e nas outras oficinas) qualquer carro, e pecas novas. As pecas valem por carro:
+// cada carro com turbo ou tracao trocada ganha a propria copia do tHandlingData (0xE0 bytes, CVehicle +0x384), com
+// aceleracao (+0x7C), velocidade maxima (+0x84 e +0x88) e arrasto (+0x10) mudados e as marchas refeitas
+// (cTransmission::InitGearRatios 0x6D0460, thiscall, transmissao em +0x2C); tracao em +0x74 ('F', 'R', '4'); motor
+// em +0x75 ('P' gasolina, 'D' diesel, 'E' eletrico, do handling.cfg). Blindagem = bBulletProof (CPhysical +0x40 bit
+// 18); pneus = bTyresDontBurst (+0x42B bit 7). Guardado no registro da garagem (GarCar.mods, pad do arquivo), nas
+// vagas (g_slotMods, cauda 'MODS' do .gtmgar) e enquanto o carro existe (g_tb)
+static int   g_ofOn = 1, g_ofAnyCar = 1, g_ofBig = 1, g_ofPrice[7] = { 18000, 25000, 6000, 5000, 8000, 4000, 500 };   // turbo, blindagem, pneus, ABS, ESP, tracao, variacao
+static float g_tbAccel = 30.f, g_tbVmax = 15.f, g_tbDrag = 15.f, g_tbPitch = 6.f, g_tbVol = 0.f;
+struct TbLive { int ref; char* veh; BYTE m[2]; BYTE* h; };
+static TbLive g_tb[48];
+static int g_nTb = 0;
+static TbLive* TbFind(const char* v) { for (int i = 0; i < g_nTb; i++) if (g_tb[i].veh == v && VehByRef(g_tb[i].ref) == v) return &g_tb[i]; return nullptr; }
+static const BYTE* TbModsOf(const char* v) { TbLive* t = v ? TbFind(v) : nullptr; return t ? t->m : nullptr; }
+static BYTE* TbModelHandling(const char* v) {
+    const char* mi = ((char**)0xA9B0C8)[Rd<short>(v, 0x22)];
+    return mi ? (BYTE*)0xC2B9DC + Rd<BYTE>(mi, 0x4A) * 0xE0 : nullptr;
+}
+static void TbReset() { for (int i = 0; i < g_nTb; i++) free(g_tb[i].h); g_nTb = 0; }
+static void TbApply(char* v, const BYTE* m) {
+    if (!v) return;
+    TbLive* t = TbFind(v);
+    if (!t) {
+        for (int i = g_nTb - 1; i >= 0; i--) if (!VehByRef(g_tb[i].ref) || VehByRef(g_tb[i].ref) != g_tb[i].veh) { free(g_tb[i].h); g_tb[i] = g_tb[--g_nTb]; }
+        if (g_nTb >= 48) return;
+        t = &g_tb[g_nTb++]; memset(t, 0, sizeof *t); t->ref = VehRef(v); t->veh = v;
+    }
+    BYTE old0 = t->m[0];
+    t->m[0] = m[0]; t->m[1] = m[1];
+    if (m[0] & 2) *(DWORD*)(v + 0x40) |= 1u << 18; else if (old0 & 2) *(DWORD*)(v + 0x40) &= ~(1u << 18);
+    if (m[0] & 4) *(BYTE*)(v + 0x42B) |= 0x80; else if (old0 & 4) *(BYTE*)(v + 0x42B) &= 0x7F;
+    BYTE* base = TbModelHandling(v);
+    if (!base) return;
+    if (!(m[0] & 1) && !m[1]) {                                               // sem turbo e tracao original: a do modelo
+        if (t->h) { *(BYTE**)(v + 0x384) = base; free(t->h); t->h = nullptr; }
+        return;
+    }
+    if (!t->h) t->h = (BYTE*)malloc(0xE0);
+    if (!t->h) return;
+    memcpy(t->h, base, 0xE0);
+    if (m[0] & 1) {
+        *(float*)(t->h + 0x7C) *= 1.f + g_tbAccel / 100.f;
+        *(float*)(t->h + 0x84) *= 1.f + g_tbVmax / 100.f;
+        *(float*)(t->h + 0x88) *= 1.f + g_tbVmax / 100.f;
+        *(float*)(t->h + 0x10) *= 1.f - g_tbDrag / 100.f;
+    }
+    if (m[1] == 'F' || m[1] == 'R' || m[1] == '4') t->h[0x74] = m[1];
+    ((void(__thiscall*)(void*))0x6D0460)(t->h + 0x2C);                       // cTransmission::InitGearRatios
+    *(BYTE**)(v + 0x384) = t->h;
+}
+// a cada meio segundo: carros que sumiram saem da lista; as marcas voltam se alguem (entrega, garagem) as tirou
+static void TbTick() {
+    for (int i = g_nTb - 1; i >= 0; i--) {
+        TbLive& t = g_tb[i];
+        char* v = VehByRef(t.ref);
+        if (!v || v != t.veh) { free(t.h); g_tb[i] = g_tb[--g_nTb]; continue; }
+        if (t.m[0] & 2) *(DWORD*)(v + 0x40) |= 1u << 18;
+        if (t.m[0] & 4) *(BYTE*)(v + 0x42B) |= 0x80;
+        if (t.h && Rd<BYTE*>(v, 0x384) != t.h) *(BYTE**)(v + 0x384) = t.h;
+    }
+}
+
+// ---- 3.74: ABS e ESP de verdade (pedido do Gabriel). A flag ABS do handling.cfg (+0x9C) nao e lida pela fisica do
+// SA (a wiki do MTA diz "has no effect"; nenhuma leitura de +0x9C no codigo dos veiculos). Cada roda passa por
+// CVehicle::ProcessWheel (0x6D6C00, thiscall, ret 0x30; moto: ProcessBikeWheel 0x6D73B0, ret 0x38) com a forca de
+// freio, a de tracao e a aderencia dela: com freio > aderencia (x passo de tempo 0xB7CB5C, x perda de tracao +0xA4
+// se a roda ja escorregava) a roda trava (WHEEL_STATE_FIXED) e no quadro seguinte perde aderencia, por isso nao vira.
+// ABS: antes da roda ser calculada, o freio fica logo abaixo do limite do pneu (raiz(aderencia^2 - forca lateral^2))
+// pulsando entre 85% e 98% dez vezes por segundo; o freio de mao (bit 5 de +0x428) nas traseiras fica de fora.
+// ESP: guinada pedida = velocidade x tan(angulo das rodas da frente, do vetor delas) / entre-eixos (dos pontos de
+// contato), limitada pelo atrito; guinada real = velocidade de giro (+0x50) no eixo de cima. Traseira escapando:
+// freia a dianteira de fora; frente saindo: freia a traseira de dentro; nos dois, corta parte do acelerador nas
+// rodas motrizes. Mais o controle de tracao: roda motriz patinando (estado 1) perde 40% da forca. O sinal da guinada
+// e aprendido nas curvas normais antes de o ESP agir. So o carro (ou moto, ABS) que o CJ dirige
+static float g_espGain = 1.f, g_espTol = 1.f, g_espSportGain = 0.6f, g_espSportTol = 2.f;
+// 3.75: modo do ESP nos bits 5 e 6 de m[0] (0 normal, 1 sport, 2 desligado), salvo com o carro; botao ESP do overlay
+// 3.11 (comando 13) roda entre os tres. Sport: tolerancia x ESPSportTolerancia, forca x ESPSportForca e o controle de
+// tracao corta 20% (no normal, 40%). Desligado: sem ESP e sem controle de tracao; o ABS continua
+struct AeState { char* veh; bool abs, esp, bike, sport; float tanD, fy, ry, r, rDes, vf, f, thrScale; int mode, turn, sign, score, nAbs, nEsp, nTcs; DWORD tLog; };
+static AeState g_ae = {};
+static void AeFrame() {
+    if (!g_ofOn) { g_ae.veh = nullptr; return; }
+    char* me = PlayerPed(); char* pv = PlayerVehicle();
+    const BYTE* m = (pv && Rd<char*>(pv, 0x460) == me) ? TbModsOf(pv) : nullptr;
+    int emode = m ? (m[0] >> 5) & 3 : 0;
+    bool abs = m && (m[0] & 8), esp = m && (m[0] & 16) && Rd<int>(pv, 0x594) != 9 && emode != 2;
+    if (!abs && !esp) { g_ae.veh = nullptr; return; }
+    if (g_ae.veh != pv) { memset(&g_ae, 0, sizeof g_ae); g_ae.fy = 1.3f; g_ae.ry = -1.3f; }
+    g_ae.veh = pv; g_ae.abs = abs; g_ae.esp = esp; g_ae.bike = Rd<int>(pv, 0x594) == 9; g_ae.sport = emode == 1;
+    DWORD now = *TimeMs;                                                      // o que agiu nos ultimos 3 s (dados do quadro anterior)
+    if ((g_ae.nEsp || g_ae.nAbs || g_ae.nTcs) && now - g_ae.tLog > 3000) {
+        static int nl = 0;
+        if (nl < 40) { nl++; Log("oficina: ABS %d, ESP %d (%s, forca %.2f, guinada %.2f pedida %.2f, %.0f km/h), tracao %d nos ultimos 3 s",
+                                 g_ae.nAbs, g_ae.nEsp, g_ae.mode == 1 ? "traseira escapando" : g_ae.mode == 2 ? "frente saindo" : "-", g_ae.f, g_ae.r, g_ae.rDes, g_ae.vf * 3.6f, g_ae.nTcs); }
+        g_ae.tLog = now; g_ae.nAbs = g_ae.nEsp = g_ae.nTcs = 0;
+    }
+    g_ae.mode = 0; g_ae.f = 0.f; g_ae.thrScale = 1.f;
+    const float* mx = Rd<const float*>(pv, 0x14);
+    if (!esp || !mx) return;
+    const float* mv = (const float*)(pv + 0x44); const float* tv = (const float*)(pv + 0x50);
+    float vf = (mv[0] * mx[4] + mv[1] * mx[5] + mv[2] * mx[6]) * 50.f;      // m/s para a frente
+    float r = (tv[0] * mx[8] + tv[1] * mx[9] + tv[2] * mx[10]) * 50.f;      // rad/s, + = esquerda (se o sinal confirmar)
+    float L = g_ae.fy - g_ae.ry; if (!(L > 1.f && L < 12.f)) L = 2.6f;
+    float rDes = vf * g_ae.tanD / L;
+    float lim = 9.8f * 1.5f / (fabsf(vf) > 1.f ? fabsf(vf) : 1.f);           // ate 1,5 g de curva (os carros do SA tem muita aderencia)
+    if (rDes > lim) rDes = lim;
+    if (rDes < -lim) rDes = -lim;
+    g_ae.vf = vf; g_ae.rDes = rDes;
+    bool hand = (Rd<BYTE>(pv, 0x428) & 0x20) != 0;
+    // sinal da guinada: aprendido nas curvas normais (sem roda escorregando ficaria melhor; aqui: devagar e constante)
+    if (!g_ae.sign) {
+        if (fabsf(vf) > 8.f && fabsf(rDes) > 0.12f && fabsf(r) > 0.08f && !hand) {
+            g_ae.score += (r * rDes > 0.f) ? 1 : -1;
+            if (g_ae.score > 25 || g_ae.score < -25) {
+                g_ae.sign = g_ae.score > 0 ? 1 : -1;
+                static int nr = 0;
+                if (nr++ < 10) Log("oficina: ESP pronto no %s (sinal da guinada %+d, entre-eixos %.2f m)", CarName(Rd<short>(pv, 0x22)), g_ae.sign, L);
+            }
+        }
+        return;
+    }
+    r *= (float)g_ae.sign;
+    g_ae.r = r;
+    if (vf < 6.f || hand) return;                                             // so para a frente, acima de 21 km/h
+    float tol = (0.10f + 0.15f * fabsf(rDes)) * g_espTol * (g_ae.sport ? g_espSportTol : 1.f);
+    float err = 0.f;
+    if ((fabsf(r) > fabsf(rDes) + tol && r * rDes >= 0.f) || (r * rDes < 0.f && fabsf(r) > tol)) {
+        g_ae.mode = 1; g_ae.turn = r > 0.f ? 1 : -1; err = fabsf(r) - (r * rDes >= 0.f ? fabsf(rDes) : 0.f) - tol;
+    } else if (fabsf(rDes) > tol && fabsf(r) < fabsf(rDes) - tol && r * rDes >= 0.f) {
+        g_ae.mode = 2; g_ae.turn = rDes > 0.f ? 1 : -1; err = fabsf(rDes) - fabsf(r) - tol;
+    }
+    if (g_ae.mode) {
+        float f = err * 1.2f * g_espGain * (g_ae.sport ? g_espSportGain : 1.f); if (f > 0.85f) f = 0.85f; if (f < 0.f) f = 0.f;
+        g_ae.f = f; g_ae.thrScale = 1.f - (f > 0.7f ? 0.7f : f);
+        g_ae.nEsp++;
+    }
+}
+// 0 = sem botao; 1 normal, 2 sport, 3 desligado
+static int AeEspMode(const char* v) {
+    const BYTE* m = v ? TbModsOf(v) : nullptr;
+    if (!m || !(m[0] & 16) || Rd<int>(v, 0x594) == 9) return 0;
+    int md = (m[0] >> 5) & 3;
+    return md > 2 ? 1 : md + 1;
+}
+static void AeCmdCycle() {
+    char* v = PlayerVehicle();
+    if (!v || Rd<char*>(v, 0x460) != PlayerPed()) return;
+    TbLive* t = TbFind(v);
+    if (!t || !(t->m[0] & 16) || Rd<int>(v, 0x594) == 9) return;
+    int md = ((t->m[0] >> 5) & 3) + 1; if (md > 2) md = 0;
+    t->m[0] = (BYTE)((t->m[0] & ~0x60) | (md << 5));
+    int gi = FindGarVeh(v);
+    if (gi >= 0) g_gar[gi].mods[0] = t->m[0];
+    GarHelp(md == 0 ? "ESP normal." : md == 1 ? "ESP Sport: a traseira escapa mais antes de ele agir." : "ESP desligado (o ABS continua).");
+    Log("oficina: ESP %s no %s", md == 0 ? "normal" : md == 1 ? "sport" : "desligado", CarName(Rd<short>(v, 0x22)));
+}
+static float AeTri() { DWORD t = *TimeMs % 100; float ph = t / 100.f; return 1.f - fabsf(2.f * ph - 1.f); }
+typedef void(__thiscall* AePW_t)(void*, V3*, V3*, V3*, V3*, int, float, float, float, int, float*, int*, int);
+static AePW_t g_aeOrigPW = nullptr;
+static void __fastcall AePWDetour(char* v, void*, V3* wf, V3* wr, V3* cs, V3* cp, int n, float thrust, float brake, float adh, int id, float* ws, int* st, int status) {
+    if (v && v == g_ae.veh && n > 0) {
+        const float* m = Rd<const float*>(v, 0x14);
+        BYTE* h = Rd<BYTE*>(v, 0x384);
+        if (m && h) {
+            float fp = cp->x * m[4] + cp->y * m[5] + cp->z * m[6];               // + frente (ponto de contato, para o entre-eixos)
+            int wid = id & 0xFF;                                                 // 0 dianteira esquerda, 1 traseira esquerda, 2 dianteira direita, 3 traseira direita
+            bool front = wid == 0 || wid == 2;
+            float side = (wid >= 2) ? 1.f : -1.f;                                // + direita
+            if (front) {
+                g_ae.fy = fp;
+                float c = wf->x * m[4] + wf->y * m[5] + wf->z * m[6], sr = wf->x * m[0] + wf->y * m[1] + wf->z * m[2];
+                if (c > 0.3f) g_ae.tanD = -sr / c;                               // + = rodas para a esquerda
+            } else g_ae.ry = fp;
+            float a = adh * *(float*)0xB7CB5C * (*st != 0 ? *(float*)(h + 0xA4) : 1.f);
+            float lat = -(wr->x * cs->x + wr->y * cs->y + wr->z * cs->z) / n;
+            float cap2 = a * a - lat * lat, cap = cap2 > 0.f ? sqrtf(cap2) : 0.f;
+            if (cap < 0.4f * a) cap = 0.4f * a;                                  // de lado: ainda freia um pouco, sem travar
+            if (g_ae.esp && g_ae.mode) {
+                bool outer = side * g_ae.turn > 0.f;
+                if (g_ae.mode == 1 ? (front && outer) : (!front && !outer)) { float eb = g_ae.f * cap; if (eb > brake) brake = eb; }
+                if (thrust > 0.f) thrust *= g_ae.thrScale;
+            }
+            if (g_ae.esp && thrust > 0.f && *st == 1) { thrust *= g_ae.sport ? 0.8f : 0.6f; g_ae.nTcs++; }
+            bool hand = (Rd<BYTE>(v, 0x428) & 0x20) != 0 && !front;
+            if (g_ae.abs && brake > 0.f && !hand) {
+                float lim = cap * (0.85f + 0.13f * AeTri());
+                if (brake > lim) { brake = lim > 1e-6f ? lim : 1e-6f; g_ae.nAbs++; }
+            }
+        }
+    }
+    g_aeOrigPW(v, wf, wr, cs, cp, n, thrust, brake, adh, id, ws, st, status);
+}
+typedef void(__thiscall* AePBW_t)(void*, V3*, V3*, V3*, V3*, int, float, float, float, float, int, float*, int*, int, int);
+static AePBW_t g_aeOrigPBW = nullptr;
+static void __fastcall AePBWDetour(char* v, void*, V3* wf, V3* wr, V3* cs, V3* cp, int n, float thrust, float brake, float adh, float destab, int id, float* ws, int* st, int special, int status) {
+    if (v && v == g_ae.veh && g_ae.abs && brake > 0.f && n > 0) {
+        BYTE* h = Rd<BYTE*>(v, 0x384);
+        bool hand = (Rd<BYTE>(v, 0x428) & 0x20) != 0 && (id & 0xFF) == 1;     // freio de mao na traseira fica de fora
+        if (h && !hand) {                                                        // moto: limite conservador (o jogo as vezes ja corta a aderencia)
+            float a = adh * *(float*)0xB7CB5C * *(float*)(h + 0xA4);
+            float lat = (special == 2 || special == 3) ? 0.f : -(wr->x * cs->x + wr->y * cs->y + wr->z * cs->z) / n;
+            float cap2 = a * a - lat * lat, cap = cap2 > 0.f ? sqrtf(cap2) : 0.f;
+            if (cap < 0.4f * a) cap = 0.4f * a;
+            float lim = cap * (0.85f + 0.13f * AeTri());
+            if (brake > lim) { brake = lim > 1e-6f ? lim : 1e-6f; g_ae.nAbs++; }
+        }
+    }
+    g_aeOrigPBW(v, wf, wr, cs, cp, n, thrust, brake, adh, destab, id, ws, st, special, status);
+}
+// ---- TransFender para qualquer carro: no script carmod (script.img, carmod1.scm) a entrada da TransFender
+// recusa aviao, barco, veiculo grande (8969), de emergencia (8975), sem pecas (8038 $10481 0, o GOSUB que conta as
+// pecas com 06E5) e os da Wheel Arch Angels e da Loco Low (896F, 896E). Os testes viram IS_PLAYER_PLAYING $2 (sempre
+// verdade) e "$10481 > -1"; a Loco Low e a Wheel Arch Angels continuam so com os carros delas
+static void OfPatchCarmod() {
+    static DWORD t = 0;
+    DWORD now = GetTickCount();
+    if (!g_ofAnyCar || now - t < 1000) return;
+    t = now;
+    for (char* sc = *(char**)0xA8B42C; sc; sc = *(char**)sc) {
+        if (_strnicmp(sc + 8, "carmod", 6)) continue;
+        BYTE* b = *(BYTE**)(sc + 0x10);
+        if (!b) continue;
+        static const BYTE kTrue[5] = { 0x56, 0x02, 0x02, 0x08, 0x00 };          // IS_PLAYER_PLAYING $2
+        struct P { int off; BYTE exp[7]; int n; } ps[] = {
+            { 1747, { 0x69, 0x89, 0x02, 0xFC, 0xA2 }, 5 }, { 1752, { 0x75, 0x89, 0x02, 0xFC, 0xA2 }, 5 },
+            { 1793, { 0x6F, 0x89, 0x02, 0xFC, 0xA2 }, 5 }, { 1798, { 0x6E, 0x89, 0x02, 0xFC, 0xA2 }, 5 },
+            { 1775, { 0x38, 0x80, 0x02, 0xC4, 0xA3, 0x04, 0x00 }, 7 },
+        };
+        int n = 0, done = 0;
+        for (auto& q : ps) {
+            if (q.off == 1747 && !g_ofBig) continue;
+            if (!memcmp(b + q.off, kTrue, 5) || (q.n == 7 && b[q.off] == 0x18)) { done++; continue; }
+            if (memcmp(b + q.off, q.exp, q.n)) continue;
+            if (q.n == 5) memcpy(b + q.off, kTrue, 5);
+            else { static const BYTE g[7] = { 0x18, 0x00, 0x02, 0xC4, 0xA3, 0x04, 0xFF }; memcpy(b + q.off, g, 7); }   // $10481 > -1
+            n++;
+        }
+        if (n) Log("oficina: TransFender aceita qualquer carro (%d testes do script carmod trocados)", n);
+        else if (!done) { static bool w = false; if (!w) { w = true; Log("oficina: script carmod diferente do esperado; a TransFender fica como no jogo"); } }
+    }
+}
+
+// ---- som do turbo. Assobio em laco (scripts\GTMTurbo\assobio_gasolina.wav / assobio_diesel.wav, gravados na
+// frequencia mais baixa) tocado mais rapido conforme a pressao: 4200 a 7600 Hz (gasolina, A) e 3000 a 5600 Hz
+// (diesel, B), saturando perto do topo (1 - e^(-3,2 p)); volume p^1,4. Pressao: alvo = acelerador x giro (velocidade /
+// velocidade maxima da marcha, do 35% para cima) com atraso para encher (0,35 s gasolina, 0,70 s diesel) e 0,12 s
+// para esvaziar. Troca de marcha (subindo, acelerando): espirro (gasolina) ou grito H2 (diesel), cortado seco em
+// 0,26/0,30 s com o "tuc" da valvula (so gasolina), e a pressao cai pela metade. Tirar o pe: espirro ou grito
+// inteiro; acelerar de novo corta na hora. O tom do motor sobe ate TomDoMotor% com a pressao (gancho em
+// CAEVehicleAudioEntity::GetFreqForPlayerEngineSound 0x4F8070)
+enum { TS_WG, TS_WD, TS_B, TS_BW, TS_G, TS_GW, TS_TUC, TS_N };
+static SirPcm g_tsPcm[TS_N];
+static bool  g_tsLoaded = false, g_tsOk = false;
+struct TbVoiceT { IDirectSoundBuffer* b; IDirectSound3DBuffer* b3; int snd; DWORD cutAt; bool tuc; float k; };
+static TbVoiceT g_tvLoop = {}, g_tvShot = {}, g_tvTuc = {};
+static char* g_tbCar = nullptr;                                               // carro do CJ com turbo (para o tom do motor)
+static int   g_tbNLog = 0;
+static float g_tbBoost = 0.f;
+static void TbPauseStop() { if (g_tvLoop.b) g_tvLoop.b->Stop(); if (g_tvShot.b) g_tvShot.b->Stop(); }
+static void TbFreeVoice(TbVoiceT& v) { if (v.b3) v.b3->Release(); if (v.b) { v.b->Stop(); v.b->Release(); } v = TbVoiceT{}; }
+static bool TbMakeVoice(TbVoiceT& v, int snd) {
+    TbFreeVoice(v);
+    SirPcm& p = g_tsPcm[snd];
+    IDirectSound8* ds = SirDS();
+    if (!ds || !p.d) return false;
+    WAVEFORMATEX wf = {}; wf.wFormatTag = WAVE_FORMAT_PCM; wf.nChannels = 1; wf.nSamplesPerSec = p.rate; wf.wBitsPerSample = 16; wf.nBlockAlign = 2; wf.nAvgBytesPerSec = p.rate * 2;
+    DSBUFFERDESC bd = {}; bd.dwSize = sizeof bd;
+    bd.dwFlags = DSBCAPS_CTRL3D | DSBCAPS_CTRLFREQUENCY | DSBCAPS_CTRLVOLUME | DSBCAPS_GLOBALFOCUS | DSBCAPS_LOCSOFTWARE | DSBCAPS_GETCURRENTPOSITION2;
+    bd.dwBufferBytes = p.n * 2; bd.lpwfxFormat = &wf;
+    IDirectSoundBuffer* b = nullptr;
+    if (FAILED(ds->CreateSoundBuffer(&bd, &b, nullptr)) || !b) return false;
+    void* p1 = nullptr; DWORD n1 = 0; void* p2 = nullptr; DWORD n2 = 0;
+    if (FAILED(b->Lock(0, bd.dwBufferBytes, &p1, &n1, &p2, &n2, 0))) { b->Release(); return false; }
+    memcpy(p1, p.d, n1); if (p2 && n2) memcpy(p2, (char*)p.d + n1, n2);
+    b->Unlock(p1, n1, p2, n2);
+    IDirectSound3DBuffer* b3 = nullptr; b->QueryInterface(kIID_DS3DBuf, (void**)&b3);
+    v.b = b; v.b3 = b3; v.snd = snd;
+    return true;
+}
+static float TbDbAt(char* veh, V3* relOut) {                                 // como o volume da sirene
+    V3 pos = EntityPos(veh), rel = {};
+    ((V3* (__cdecl*)(V3*, const V3*))0x4D80B0)(&rel, &pos);
+    float dist = sqrtf(rel.x * rel.x + rel.y * rel.y + rel.z * rel.z);
+    float mike = ((float(__cdecl*)(const V3*))0x4D7F60)(&rel);
+    float att = ((float(__cdecl*)(float))0x4D7F20)(dist / 2.5f);
+    float lin = Rd<float>((void*)0xB5F8B8, 0x414) * Rd<float>((void*)0xB5F8B8, 0x41C) * Rd<float>((void*)0xB5F8B8, 0x420);
+    float db = mike + att + g_tbVol + (lin > 1e-5f ? 20.f * log10f(lin) : -100.f);
+    *relOut = rel;
+    return db;
+}
+static void TbSetVol(TbVoiceT& v, float db) { if (db < -100.f) db = -100.f; if (db > 0.f) db = 0.f; v.b->SetVolume((LONG)(db * 100.f)); }
+static void TbShot(int snd, float k, char* veh, DWORD cutAt, bool tuc) {
+    if (!TbMakeVoice(g_tvShot, snd)) return;
+    float off = (snd == TS_G || snd == TS_GW) ? 0.f : -6.f;                 // 3.74: diesel como na 3.72, gasolina -6 dB
+    V3 rel; float db = TbDbAt(veh, &rel) + off + 20.f * log10f(k > 0.05f ? k : 0.05f);
+    TbSetVol(g_tvShot, db);
+    if (g_tvShot.b3) g_tvShot.b3->SetPosition(rel.x, rel.y, rel.z, DS3D_IMMEDIATE);
+    g_tvShot.b->Play(0, 0, 0);
+    g_tvShot.cutAt = cutAt; g_tvShot.tuc = tuc; g_tvShot.k = k;
+}
+static void TbCut(char* veh) {
+    if (!g_tvShot.b) return;
+    bool tuc = g_tvShot.tuc; float k = g_tvShot.k;
+    TbFreeVoice(g_tvShot);
+    if (tuc && TbMakeVoice(g_tvTuc, TS_TUC)) {
+        V3 rel; TbSetVol(g_tvTuc, TbDbAt(veh, &rel) - 12.f + 20.f * log10f(k > 0.05f ? k : 0.05f));
+        if (g_tvTuc.b3) g_tvTuc.b3->SetPosition(rel.x, rel.y, rel.z, DS3D_IMMEDIATE);
+        g_tvTuc.b->Play(0, 0, 0);
+    }
+}
+static void TbLoadSounds() {
+    g_tsLoaded = true;
+    static const char* kN[TS_N] = { "assobio_gasolina", "assobio_diesel", "espirro", "espirro_fraco", "grito", "grito_fraco", "tuc" };
+    int n = 0;
+    for (int i = 0; i < TS_N; i++) {
+        char path[MAX_PATH]; snprintf(path, sizeof path, "%sGTMTurbo\\%s.wav", g_dir, kN[i]);
+        if (SirLoadWav(path, g_tsPcm[i])) n++;
+    }
+    g_tsOk = n == TS_N;
+    Log("oficina: sons do turbo %s (%d de %d WAV em scripts\\GTMTurbo)", g_tsOk ? "prontos" : "incompletos: o turbo fica sem som", n, TS_N);
+}
+static void TbAudioTick(char* pv, char* me, DWORD now) {
+    static DWORD last = 0; static float thrWas = 0.f; static int gearWas = -1;
+    float dt = last ? (float)(now - last) / 1000.f : 0.f; last = now;
+    if (dt > 0.1f) dt = 0.1f;
+    TbLive* t = (pv && Rd<char*>(pv, 0x460) == me) ? TbFind(pv) : nullptr;
+    if (!t || !(t->m[0] & 1) || !t->h) {
+        g_tbCar = nullptr; g_tbBoost = 0.f; gearWas = -1;
+        if (g_tvLoop.b) TbFreeVoice(g_tvLoop);
+        return;
+    }
+    if (!g_tsLoaded) TbLoadSounds();
+    g_tbCar = pv;
+    bool diesel = t->h[0x75] == 'D';
+    float gas = Rd<float>(pv, 0x49C); float thr = gas > 0.f ? gas : 0.f;
+    int gear = Rd<BYTE>(pv, 0x4B4);
+    const float* mv = (const float*)(pv + 0x44);
+    float sp = sqrtf(mv[0] * mv[0] + mv[1] * mv[1] + mv[2] * mv[2]);
+    float gmax = gear >= 1 && gear <= 6 ? *(float*)(t->h + 0x2C + gear * 0xC) : 0.f;
+    float rpm = gmax > 0.001f ? sp / gmax : 0.f; if (rpm > 1.f) rpm = 1.f;
+    // 3.72: no log da 3.71 a pressao saiu invalida desde o primeiro quadro (acelerador, marcha e giro certos), e nunca
+    // mais voltou: o expf/powf da biblioteca, com a FPU do jogo em precisao simples (e o x87 emulado no iPhone), dava
+    // NaN. Agora so soma, multiplicacao e raiz: alvo = acelerador x raiz(giro util); seguidor de primeira ordem
+    // dt/(tc+dt); valor sempre entre 0 e 1
+    float x = (rpm - 0.35f) / 0.6f; if (!(x > 0.f)) x = 0.f; if (x > 1.f) x = 1.f;
+    float tgt = thr * sqrtf(x);
+    if (gear == 0 || !(tgt >= 0.f && tgt <= 1.f)) tgt = 0.f;
+    if (!(g_tbBoost >= 0.f && g_tbBoost <= 1.f)) g_tbBoost = 0.f;
+    float tc = tgt > g_tbBoost ? (diesel ? 0.70f : 0.35f) : 0.12f;
+    g_tbBoost += (tgt - g_tbBoost) * (dt / (tc + dt));
+    if (!(g_tbBoost >= 0.f && g_tbBoost <= 1.f)) g_tbBoost = 0.f;
+    // eventos: troca de marcha subindo com o pe no fundo, e tirada de pe
+    if (g_tsOk && SirDS()) {
+        if (gearWas >= 1 && gear > gearWas && thr > 0.3f && g_tbBoost > 0.15f) {
+            float k = fminf(1.f, 0.35f + g_tbBoost);
+            TbShot(diesel ? (g_tbBoost > 0.6f ? TS_G : TS_GW) : (g_tbBoost > 0.6f ? TS_B : TS_BW), k, pv, now + (diesel ? 300 : 260), !diesel);
+            if (g_tbNLog < 12) { g_tbNLog++; Log("turbo: troca %d->%d com pressao %d%%: %s cortado (%s)", gearWas, gear, (int)(g_tbBoost * 100.f + 0.5f), diesel ? "grito" : "espirro", g_tvShot.b ? "tocando" : "SEM BUFFER"); }
+            g_tbBoost *= 0.5f;
+        } else if (thrWas > 0.4f && thr < 0.15f && g_tbBoost > 0.15f) {
+            float k = fminf(1.f, 0.35f + g_tbBoost);
+            TbShot(diesel ? (g_tbBoost > 0.6f ? TS_G : TS_GW) : (g_tbBoost > 0.6f ? TS_B : TS_BW), k, pv, 0, !diesel);
+            if (g_tbNLog < 12) { g_tbNLog++; Log("turbo: tirou o pe com pressao %d%%: %s (%s)", (int)(g_tbBoost * 100.f + 0.5f), diesel ? "grito" : "espirro", g_tvShot.b ? "tocando" : "SEM BUFFER"); }
+        }
+        if (g_tvShot.b) {
+            DWORD st = 0; g_tvShot.b->GetStatus(&st);
+            if (!(st & DSBSTATUS_PLAYING)) TbFreeVoice(g_tvShot);
+            else if ((g_tvShot.cutAt && (int)(now - g_tvShot.cutAt) >= 0) || (!g_tvShot.cutAt && thr > 0.4f)) TbCut(pv);   // a borboleta abriu
+            else { V3 rel; TbDbAt(pv, &rel); if (g_tvShot.b3) g_tvShot.b3->SetPosition(rel.x, rel.y, rel.z, DS3D_IMMEDIATE); }
+        }
+        if (g_tvTuc.b) { DWORD st = 0; g_tvTuc.b->GetStatus(&st); if (!(st & DSBSTATUS_PLAYING)) TbFreeVoice(g_tvTuc); }
+        // assobio
+        int ws = diesel ? TS_WD : TS_WG;
+        if (g_tbBoost > 0.02f) {
+            if (!g_tvLoop.b || g_tvLoop.snd != ws) { if (TbMakeVoice(g_tvLoop, ws)) g_tvLoop.b->Play(0, 0, DSBPLAY_LOOPING); }
+            if (g_tvLoop.b) {
+                float lo = diesel ? 3000.f : 4200.f, hi = diesel ? 5600.f : 7600.f;
+                float u = 1.f - g_tbBoost, f = lo + (hi - lo) * (1.f - u * u * u);   // satura perto do topo (~1 - e^(-3,2p))
+                V3 rel; float db = TbDbAt(pv, &rel) + (diesel ? -5.f : -11.f) + 20.f * log10f(g_tbBoost * sqrtf(g_tbBoost) + 1e-5f);   // p^1,5; 3.74: diesel -5, gasolina -11
+                TbSetVol(g_tvLoop, db);
+                g_tvLoop.b->SetFrequency((DWORD)(g_tsPcm[ws].rate * f / lo));
+                if (g_tvLoop.b3) g_tvLoop.b3->SetPosition(rel.x, rel.y, rel.z, DS3D_IMMEDIATE);
+                DWORD st = 0; g_tvLoop.b->GetStatus(&st);
+                if (!(st & DSBSTATUS_PLAYING)) g_tvLoop.b->Play(0, 0, DSBPLAY_LOOPING);   // voltou da pausa
+            }
+        } else if (g_tvLoop.b) TbFreeVoice(g_tvLoop);
+    }
+    // 3.71: no teste da 3.70 o Gabriel nao ouviu nada: diagnostico a cada 2 s nos primeiros 40 s com o turbo
+    {
+        static DWORD tD = 0, t0 = 0; static char* lastCar = nullptr;
+        if (pv != lastCar) { lastCar = pv; t0 = now; tD = 0; }
+        if (now - t0 < 40000 && now - tD >= 2000) {
+            tD = now;
+            long vol = -10000; DWORD st = 0, fq = 0;
+            if (g_tvLoop.b) { g_tvLoop.b->GetVolume(&vol); g_tvLoop.b->GetStatus(&st); g_tvLoop.b->GetFrequency(&fq); }
+            Log("turbo: acel %.2f marcha %d vel %.3f max da marcha %.3f giro %.2f pressao %d%% | assobio %s vol %.1f dB freq %lu | sons %s DS %s",
+                thr, gear, sp, gmax, rpm, (int)(g_tbBoost * 100.f + 0.5f), g_tvLoop.b ? ((st & DSBSTATUS_PLAYING) ? "tocando" : "parado") : "sem buffer",
+                vol / 100.f, (unsigned long)fq, g_tsOk ? "ok" : "faltando", SirDS() ? "ok" : "nao");
+        }
+    }
+    thrWas = thr; gearWas = gear;
+    static bool noted = false;
+    if (!noted) { noted = true; Log("oficina: turbo no modelo %d (motor %c, %d marchas)", Rd<short>(pv, 0x22), t->h[0x75] ? t->h[0x75] : '?', t->h[0x76]); }
+}
+typedef float(__thiscall* TbFreq_t)(void*, void*, int);
+static TbFreq_t g_tbOrigFreq = nullptr;
+static float __fastcall TbFreqDetour(void* ae, void*, void* vp, int st) {
+    float f = g_tbOrigFreq(ae, vp, st);
+    if (g_tbCar && vp && *(char**)((char*)vp + 0x10) == g_tbCar && g_tbBoost >= 0.f && g_tbBoost <= 1.f) f *= 1.f + g_tbPitch / 100.f * g_tbBoost;
+    return f;
+}
+
+// ---- o menu da oficina: telefone > "Oficina GTM", a pe, perto da entrada de uma oficina (as 3 TransFender, a Loco
+// Low e a Wheel Arch Angels), com o carro em que voce chegou (CPed +0x58C) a ate 20 m
+static const float kOfShops[5][3] = { { 1042.01f, -1019.93f, 31.13f }, { -1935.53f, 247.03f, 33.56f }, { 2387.07f, 1050.51f, 9.81f },
+                                      { 2645.11f, -2045.74f, 12.61f }, { -2723.84f, 217.80f, 3.59f } };
+static int g_ofRef = -1, g_ofItem = 0, g_ofPick = 0, g_ofCost = 0, g_ofVarSlot = 0;
+static V3    g_ofHome = {};                                                   // 3.70: porta da oficina em que o carro esta
+static bool  g_ofHomeSet = false;
+static char* OfCarNear() {
+    char* me = PlayerPed();
+    if (!g_ofOn || !me || PlayerVehicle()) return nullptr;
+    V3 pp = EntityPos(me);
+    bool atShop = false;
+    for (auto& k : kOfShops) { V3 sp = { k[0], k[1], k[2] }; if (Dist2(sp, pp) < 35.f && fabsf(k[2] - pp.z) < 10.f) atShop = true; }
+    if (!atShop) return nullptr;
+    char* v = Rd<char*>(me, 0x58C);
+    if (!v || VehByRef(VehRef(v)) != v || (Rd<BYTE>(v, 0x36) >> 3) == 5) return nullptr;
+    int st = Rd<int>(v, 0x594);
+    if (st != 0 && st != 1 && st != 2 && st != 9) return nullptr;
+    if (Dist2(EntityPos(v), pp) > 20.f) return nullptr;
+    return v;
+}
+static const char* OfDriveName(BYTE d) { return d == 'F' ? "dianteira" : d == 'R' ? "traseira" : d == '4' ? "integral" : "?"; }
+// 3.74: itens 0 turbo, 1 blindagem, 2 pneus, 3 ABS, 4 ESP (bit = 1 << item) e 5 tracao; moto: so os 4 primeiros.
+// 3.75: item 6 variacao (se o modelo tiver)
+static const char* kOfName[7] = { "Turbo", "Blindagem", "Pneus blindados", "ABS", "ESP", "Tracao", "Variacao" };
+static int OfItems(const char* v, int* it) {
+    int n = 0; bool bike = Rd<int>(v, 0x594) == 9;
+    for (int i = 0; i < 6; i++) if (!bike || i < 4) it[n++] = i;
+    if (VarCount(Rd<short>(v, 0x22)) > 0) it[n++] = 6;
+    return n;
+}
+static int OfItemAt(const char* v, int row) { int it[8]; int n = OfItems(v, it); return row >= 0 && row < n ? it[row] : -1; }
+static void VarName(char* out, int n, int e) { if (e < 0) snprintf(out, n, "sem variacao"); else snprintf(out, n, "variacao %d", e + 1); }
+// linhas da lista de variacoes (slot 0: a principal, com "Segunda variacao" no fim se o modelo usa duas; slot 1: a segunda)
+static int VarRows(const char* v, int slot, char (*t)[64]) {
+    int model = Rd<short>(v, 0x22), n = VarCount(model);
+    int cur = *(const signed char*)(v + (slot ? 0x439 : 0x438));
+    int r = 0;
+    for (int e = -1; e < n && r < 10; e++, r++) {
+        char nm[24]; VarName(nm, sizeof nm, e);
+        nm[0] = (char)toupper((unsigned char)nm[0]);
+        snprintf(t[r], 64, "%s%s", nm, e == cur ? " (atual)" : "");
+    }
+    if (slot == 0 && VarSecond(model)) {
+        char nm[24]; VarName(nm, sizeof nm, *(const signed char*)(v + 0x439));
+        snprintf(t[r++], 64, "Segunda variacao: %s", nm);
+    }
+    return r;
+}
+static void OfLabel(char* out, int n, int item, BYTE m0, BYTE m1, const char* v, const char* sep) {
+    char p[24]; CdMoney(p, sizeof p, g_ofPrice[item]);
+    if (item == 6) {
+        char nm[24]; VarName(nm, sizeof nm, *(const signed char*)(v + 0x438));
+        snprintf(out, n, "Variacao: %s%strocar %s", nm, sep, p);
+        return;
+    }
+    if (item == 5) {
+        BYTE* base = TbModelHandling(v); BYTE cur = m1 ? m1 : (base ? base[0x74] : 'R');
+        snprintf(out, n, "Tracao %s%strocar %s", OfDriveName(cur), sep, p);
+        return;
+    }
+    static const char* kInst[5] = { "instalado", "instalada", "instalados", "instalado", "instalado" };
+    if (m0 & (1 << item)) snprintf(out, n, "%s: %s (tirar)", kOfName[item], kInst[item]);
+    else snprintf(out, n, "%s%s%s", kOfName[item], sep, p);
+}
+static void OfShowMain() {
+    char* v = VehByRef(g_ofRef);
+    if (!v) { CloseMenu(false); return; }
+    g_level = 8;
+    const BYTE* m = TbModsOf(v); BYTE m0 = m ? m[0] : 0, m1 = m ? m[1] : 0;
+    static char t[8][64];
+    const char* rows[8]; int it[8]; int n = OfItems(v, it);
+    for (int i = 0; i < n; i++) { OfLabel(t[i], 64, it[i], m0, m1, v, " - "); rows[i] = t[i]; }
+    ShowRows("Oficina GTM", CarName(Rd<short>(v, 0x22)), rows, n);
+}
+static void OfShowVar(int slot) {
+    char* v = VehByRef(g_ofRef);
+    if (!v) { CloseMenu(false); return; }
+    g_level = slot ? 12 : 11; g_ofVarSlot = slot;
+    static char t[12][64];
+    const char* rows[12]; int n = VarRows(v, slot, t);
+    for (int i = 0; i < n; i++) rows[i] = t[i];
+    ShowRows(slot ? "Segunda variacao" : "Variacao", CarName(Rd<short>(v, 0x22)), rows, n);
+}
+static void OfShowDrive() {
+    g_level = 9;
+    const char* rows[4] = { "Dianteira (FWD)", "Traseira (RWD)", "Integral (AWD)", "Original do carro" };
+    ShowRows("Tracao", "Escolha", rows, 4);
+}
+static void OfShowConfirm() {
+    g_level = 10;
+    static char yes[64]; char p[24];
+    if (g_ofCost > 0) { CdMoney(p, sizeof p, g_ofCost); snprintf(yes, sizeof yes, "Sim, por %s", p); }
+    else snprintf(yes, sizeof yes, "Sim, tirar (sem reembolso)");
+    const char* rows[2] = { yes, "Nao" };
+    ShowRows("Tem certeza?", kOfName[g_ofItem], rows, 2);
+}
+static void OfOpen() {
+    char* v = OfCarNear();
+    if (!v) { CloseMenu(false); GarHelp("Traga o carro ate a porta de uma oficina (TransFender, Loco Low ou Wheel Arch Angels)."); return; }
+    g_ofRef = VehRef(v);
+    OfShowMain();
+}
+static void OfBack() {
+    if (g_level == 10) { if (g_ofItem == 5) OfShowDrive(); else if (g_ofItem == 6) OfShowVar(g_ofVarSlot); else OfShowMain(); }
+    else if (g_level == 12) OfShowVar(0);
+    else if (g_level == 9 || g_level == 11) OfShowMain();
+    else ShowRoot();
+}
+// escolha numa lista de variacoes: -1..n-1, 100 = abrir a segunda; 200 = a atual (nada a fazer)
+static int VarPickRow(const char* v, int slot, int row) {
+    int model = Rd<short>(v, 0x22), n = VarCount(model);
+    if (row >= 0 && row <= n) {
+        int e = row - 1;
+        return e == *(const signed char*)(v + (slot ? 0x439 : 0x438)) ? 200 : e;
+    }
+    if (slot == 0 && row == n + 1 && VarSecond(model)) return 100;
+    return -2;
+}
+static void OfDo() {
+    char* v = VehByRef(g_ofRef);
+    if (!v) { GarHelp("O carro nao esta mais aqui."); return; }
+    const BYTE* cm = TbModsOf(v);
+    BYTE m[2] = { cm ? cm[0] : (BYTE)0, cm ? cm[1] : (BYTE)0 };
+    int gi = FindGarVeh(v);
+    if (!cm && gi >= 0) { m[0] = g_gar[gi].mods[0]; m[1] = g_gar[gi].mods[1]; }
+    if (g_ofCost > 0) {
+        int money = *(volatile int*)0xB7CE50;
+        if (money < g_ofCost) { char p[24]; CdMoney(p, sizeof p, g_ofCost); GarHelp("Dinheiro insuficiente: custa %s.", p); return; }
+    }
+    if (g_ofItem < 5) m[0] ^= (BYTE)(1 << g_ofItem);
+    else if (g_ofItem == 5) m[1] = (BYTE)g_ofPick;
+    // o carro vira seu (Meus carros), para as pecas ficarem com ele
+    if (gi < 0) {
+        char* gr = nullptr; int house = CdHomeHouse(g_ofHomeSet ? g_ofHome : EntityPos(PlayerPed()), &gr);
+        BYTE blank[0x40] = {};
+        GarCar* g = house >= 0 && gr ? NewGar(house, 0, blank) : nullptr;
+        if (g) {
+            CaptureCar(*g, v);
+            const float* o = (const float*)gr;
+            float Ax = Rd<float>(gr, 0xC), Ay = Rd<float>(gr, 0x10), Bx = Rd<float>(gr, 0x14), By = Rd<float>(gr, 0x18), W = Rd<float>(gr, 0x20), D = Rd<float>(gr, 0x24);
+            g->home[0] = o[0] + Ax * W * 0.5f + Bx * D * 0.5f; g->home[1] = o[1] + Ay * W * 0.5f + By * D * 0.5f; g->home[2] = o[2];
+            g->homeDir[0] = (signed char)(int)floorf(Bx * 100.f + .5f); g->homeDir[1] = (signed char)(int)floorf(By * 100.f + .5f);
+            g->state = GS_LIVE; g->veh = VehRef(v); g->inGarage = 0;
+            *(BYTE*)(v + 0x4A4) = 2;
+            gi = (int)(g - g_gar);
+            Log("oficina: %s virou seu (casa %d)", CarName(Rd<short>(v, 0x22)), house);
+        }
+    }
+    if (gi >= 0) memcpy(g_gar[gi].mods, m, 2);
+    const char* nm = CarName(Rd<short>(v, 0x22));
+    if (g_ofItem == 6) {                                                      // 3.75: variacao
+        int e1 = *(signed char*)(v + 0x438), e2 = *(signed char*)(v + 0x439);
+        if (g_ofVarSlot) e2 = g_ofPick; else e1 = g_ofPick;
+        if (!VarApply(v, e1, e2)) { GarHelp("Nao deu para trocar a variacao do %s.", nm); return; }
+        if (gi >= 0) { g_gar[gi].blob[0x37] = *(BYTE*)(v + 0x438); g_gar[gi].blob[0x38] = *(BYTE*)(v + 0x439); }
+        if (g_ofCost > 0) AddMoney(-g_ofCost);
+        char a[24]; VarName(a, sizeof a, g_ofPick);
+        GarHelp("%s: %s.", nm, a);
+        Log("oficina: variacao %d/%d no %s ($%d)", *(signed char*)(v + 0x438), *(signed char*)(v + 0x439), nm, g_ofCost);
+        return;
+    }
+    TbApply(v, m);
+    if (g_ofCost > 0) AddMoney(-g_ofCost);
+    const char* const* kT = kOfName;
+    if (g_ofItem == 5) GarHelp("Tracao %s no %s.", m[1] ? OfDriveName(m[1]) : "original", nm);
+    else GarHelp(g_ofCost > 0 ? "%s instalado no %s." : "%s retirado do %s.", kT[g_ofItem], nm);
+    BYTE* h = Rd<BYTE*>(v, 0x384);
+    Log("oficina: %s no %s (pecas %d, tracao %c, motor %c, $%d)", kT[g_ofItem], nm, m[0], m[1] ? m[1] : '-', h ? h[0x75] : '?', g_ofCost);
+}
+static void OfPick(int row) {
+    char* v = VehByRef(g_ofRef);
+    if (!v) { CloseMenu(false); return; }
+    if (g_level == 8) {
+        int item = OfItemAt(v, row);
+        if (item < 0) return;
+        const BYTE* m = TbModsOf(v);
+        g_ofItem = item;
+        if (item == 5) { OfShowDrive(); return; }
+        if (item == 6) { OfShowVar(0); return; }
+        g_ofCost = (m && (m[0] & (1 << item))) ? 0 : g_ofPrice[item];
+        OfShowConfirm();
+        return;
+    }
+    if (g_level == 11 || g_level == 12) {
+        int e = VarPickRow(v, g_ofVarSlot, row);
+        if (e == 100) { OfShowVar(1); return; }
+        if (e == 200) { GarHelp("Essa ja e a variacao atual."); return; }
+        if (e < -1) return;
+        g_ofPick = e; g_ofCost = g_ofPrice[6];
+        OfShowConfirm();
+        return;
+    }
+    if (g_level == 9) {
+        if (row < 0 || row > 3) return;
+        g_ofPick = row == 0 ? 'F' : row == 1 ? 'R' : row == 2 ? '4' : 0;
+        g_ofCost = g_ofPrice[5];
+        OfShowConfirm();
+        return;
+    }
+    if (g_level == 10) {
+        if (row != 0) { OfBack(); return; }
+        CloseMenu(true);
+        OfDo();
+    }
+}
+// ---- 3.70: a Oficina GTM dentro da TransFender, da Loco Low e da Wheel Arch Angels (pedido do Gabriel: no menu da
+// propria oficina, nao no telefone). O script carmod monta a lista de categorias no menu $2419 (CMenuSystem, criado
+// com $2420 = 1; MenuNumber 0xBA82D8, MenuInUse 0xBA82E0; Menu: titulos das linhas +0x41 [4][12][10], numeros +0x224,
+// cabecalhos +0x3A4, titulo +0x3CC, linha selecionavel +0x3D6, linhas +0x3F6, linha marcada +0x415). O mod poe
+// "Oficina GTM" no fim da lista. Com ela marcada (ou com o menu da oficina GTM aberto) o script deixa de ver os botoes
+// 15 (sair) e 16 (confirmar) do IS_BUTTON_PRESSED (gancho GetPadState): o mod le os dois e troca as linhas do proprio
+// menu pelas dele; ao sair, as linhas da oficina voltam. As pecas: as mesmas do telefone (OfDo)
+static int   g_cmOn = 1;
+static int   g_cmRow = -1, g_cmMode = 0, g_cmMenu = -1;                       // 0 fora; 8/9/10 como OfShow*
+static BYTE  g_cmSaved[0x418];
+static char* CmMenuPtr(int id) { return (id >= 0 && id < 2 && *(volatile BYTE*)(0xBA82E0 + id)) ? *(char**)(0xBA82D8 + id * 4) : nullptr; }
+static void CmSetRows(char* m, const char* const* keys, int n, const char* header) {
+    memset(m + 0x41, 0, 12 * 10);                                             // so a coluna 0
+    for (int r = 0; r < n && r < 12; r++) { strncpy(m + 0x41 + r * 10, keys[r], 9); *(int*)(m + 0x224 + r * 4) = -1; *(int*)(m + 0x2E4 + r * 4) = -1; m[0x3D6 + r] = 1; m[0x3E2 + r] = 0; }
+    *(BYTE*)(m + 0x3F6) = (BYTE)n;
+    *(signed char*)(m + 0x415) = 0;
+    if (header) strncpy(m + 0x3A4, header, 9);
+}
+static void CmShow(char* m, int level) {
+    char* v = PlayerVehicle();
+    if (!v) return;
+    g_ofRef = VehRef(v);
+    static const char* k5[12] = { "GTMO0", "GTMO1", "GTMO2", "GTMO3", "GTMO4", "GTMO5", "GTMO6", "GTMO7", "GTMO8", "GTMO9", "GTMOA", "GTMOB" };
+    char p[24];
+    if (level == 8) {
+        const BYTE* mm = TbModsOf(v); BYTE m0 = mm ? mm[0] : 0, m1 = mm ? mm[1] : 0;
+        int gi = FindGarVeh(v); if (!mm && gi >= 0) { m0 = g_gar[gi].mods[0]; m1 = g_gar[gi].mods[1]; }
+        char t[64]; int it[8]; int n = OfItems(v, it);
+        for (int i = 0; i < n; i++) { OfLabel(t, 64, it[i], m0, m1, v, "  "); SetText(k5[i], t); }
+        SetText("GTMOH", "Oficina GTM");
+        CmSetRows(m, k5, n, "GTMOH");
+    } else if (level == 11 || level == 12) {
+        static char t[12][64];
+        int n = VarRows(v, level == 12, t);
+        for (int i = 0; i < n; i++) SetText(k5[i], t[i]);
+        SetText("GTMOH", level == 12 ? "Segunda variacao" : "Variacao");
+        CmSetRows(m, k5, n, "GTMOH");
+        g_ofVarSlot = level == 12;
+    } else if (level == 9) {
+        SetText(k5[0], "Dianteira (FWD)"); SetText(k5[1], "Traseira (RWD)"); SetText(k5[2], "Integral (AWD)"); SetText(k5[3], "Original do carro");
+        SetText("GTMOH", "Tracao");
+        CmSetRows(m, k5, 4, "GTMOH");
+    } else if (level == 10) {
+        char yes[64];
+        if (g_ofCost > 0) { CdMoney(p, sizeof p, g_ofCost); snprintf(yes, sizeof yes, "Sim, por %s", p); } else snprintf(yes, sizeof yes, "Sim, tirar (sem reembolso)");
+        SetText(k5[0], yes); SetText(k5[1], "Nao");
+        SetText("GTMOH", "Tem certeza?");
+        CmSetRows(m, k5, 2, "GTMOH");
+    }
+    g_cmMode = level;
+}
+static void CmLeave(char* m) {
+    if (m) memcpy(m, g_cmSaved, 0x418);                                       // as linhas da oficina de volta
+    g_cmMode = 0; g_cmEat = 0;
+    if (m) *(signed char*)(m + 0x415) = (signed char)g_cmRow;
+}
+static void CmTick() {
+    static int was15 = 0, was16 = 0;
+    if (!g_cmOn || !g_ofOn) return;
+    char* sc = nullptr;
+    for (char* s2 = *(char**)0xA8B42C; s2; s2 = *(char**)s2) if (!_strnicmp(s2 + 8, "carmod", 6)) { sc = s2; break; }
+    g_cmScript = sc;
+    volatile int* gv = (volatile int*)0xA49960;                              // variaveis globais do script
+    int id = sc && gv[2420] == 1 ? gv[2419] : -1;
+    char* m = CmMenuPtr(id);
+    char* v = PlayerVehicle();
+    if (!m || !v || strncmp(m + 0x3CC, "UPGRADE", 7)) {                        // sem a lista de categorias
+        if (g_cmMode) { g_cmMode = 0; Log("oficina: o menu da oficina fechou com a Oficina GTM aberta"); }
+        g_cmEat = 0; g_cmRow = -1; g_cmMenu = -1; g_ofHomeSet = false;
+        was15 = was16 = 0;
+        return;
+    }
+    if (!g_ofHomeSet) { g_ofHome = { *(float*)&gv[10428], *(float*)&gv[10429], *(float*)&gv[10430] }; g_ofHomeSet = true; }   // a porta desta oficina
+    int r15 = g_cmReal[0], r16 = g_cmReal[1];
+    bool e15 = r15 && !was15, e16 = r16 && !was16;
+    was15 = r15; was16 = r16;
+    if (!g_cmMode) {
+        int n = 0;                                                             // primeira linha vazia (ou "DUMMY")
+        while (n < 12 && m[0x41 + n * 10] && strncmp(m + 0x41 + n * 10, "DUMMY", 5)) n++;
+        if (n > 0 && !strncmp(m + 0x41 + (n - 1) * 10, "GTMOF", 5)) n--;      // ja tem a nossa
+        bool ours = g_cmRow >= 0 && g_cmRow < 12 && !strncmp(m + 0x41 + g_cmRow * 10, "GTMOF", 5);
+        if (!ours || g_cmMenu != id) {                                         // lista nova: poe a linha no fim
+            g_cmRow = -1; g_cmMenu = id;
+            if (n < 12) {
+                SetText("GTMOF", "Oficina GTM");
+                strncpy(m + 0x41 + n * 10, "GTMOF", 9);
+                *(int*)(m + 0x224 + n * 4) = -1; *(int*)(m + 0x2E4 + n * 4) = -1; m[0x3D6 + n] = 1; m[0x3E2 + n] = 0;
+                *(BYTE*)(m + 0x3F6) = (BYTE)(n + 1);
+                g_cmRow = n;
+                static int nl = 0; if (nl < 6) { nl++; Log("oficina: linha Oficina GTM na lista da oficina (linha %d)", n + 1); }
+            }
+        }
+        bool sel = g_cmRow >= 0 && *(signed char*)(m + 0x415) == g_cmRow;
+        g_cmEat = sel ? 1 : 0;                                                 // marcada: o script nao ve o confirmar
+        if (sel && e16) {
+            memcpy(g_cmSaved, m, 0x418);
+            g_cmEat = 2;
+            CmShow(m, 8);
+            Log("oficina: Oficina GTM aberta dentro da oficina (%s)", CarName(Rd<short>(v, 0x22)));
+        }
+        return;
+    }
+    g_cmEat = 2;
+    int row = *(signed char*)(m + 0x415);
+    if (e15) {                                                                 // voltar
+        if (g_cmMode == 10) { if (g_ofItem == 5) CmShow(m, 9); else if (g_ofItem == 6) CmShow(m, g_ofVarSlot ? 12 : 11); else CmShow(m, 8); }
+        else if (g_cmMode == 12) CmShow(m, 11);
+        else if (g_cmMode == 9 || g_cmMode == 11) CmShow(m, 8);
+        else CmLeave(m);
+        return;
+    }
+    if (!e16) return;
+    if (g_cmMode == 8) {
+        int item = OfItemAt(v, row);
+        if (item < 0) return;
+        const BYTE* mm = TbModsOf(v);
+        g_ofItem = item;
+        if (item == 5) { CmShow(m, 9); return; }
+        if (item == 6) { CmShow(m, 11); return; }
+        g_ofCost = (mm && (mm[0] & (1 << item))) ? 0 : g_ofPrice[item];
+        CmShow(m, 10);
+    } else if (g_cmMode == 11 || g_cmMode == 12) {
+        int e = VarPickRow(v, g_cmMode == 12, row);
+        if (e == 100) { CmShow(m, 12); return; }
+        if (e == 200) { GarHelp("Essa ja e a variacao atual."); return; }
+        if (e < -1) return;
+        g_ofPick = e; g_ofCost = g_ofPrice[6];
+        CmShow(m, 10);
+    } else if (g_cmMode == 9) {
+        if (row < 0 || row > 3) return;
+        g_ofPick = row == 0 ? 'F' : row == 1 ? 'R' : row == 2 ? '4' : 0;
+        g_ofCost = g_ofPrice[5];
+        CmShow(m, 10);
+    } else if (g_cmMode == 10) {
+        if (row == 0) { OfDo(); CmShow(m, g_ofItem == 6 ? (g_ofVarSlot ? 12 : 11) : 8); }
+        else { if (g_ofItem == 5) CmShow(m, 9); else if (g_ofItem == 6) CmShow(m, g_ofVarSlot ? 12 : 11); else CmShow(m, 8); }
+    }
 }
 static void SirTick() {
     if (!g_sirOn) return;
@@ -8264,6 +9688,7 @@ static void SirTick() {
             e->player = drv && drv == me;
             e->npc = drv && drv != me;
             e->vanilla = e->player && !btn;
+            e->strobe = !e->vanilla && SirIsStrobe(v);
         }
     }
     for (int i = g_nSvh - 1; i >= 0; i--) {                                   // quem desligou a sirene ou sumiu
@@ -8276,6 +9701,7 @@ static void SirTick() {
     for (int i = 0; i < g_nSvh; i++) {
         SirVeh& e = g_svh[i];
         if (e.player) { e.tone = g_sirTone; e.air = g_sirAir; }
+        else if (e.strobe) e.air = false;
         else if (e.npc) {
             if ((int)(now - e.nextChange) >= 0) {
                 e.tone = SirPickNpcTone(e.tone);
@@ -8291,7 +9717,7 @@ static void SirTick() {
             }
             e.air = (int)(now - e.airUntil) < 0;
         } else e.air = false;
-        int w = (e.vanilla || !g_sirReady) ? 0 : e.air ? SIR_AIR : (e.tone >= 1 && e.tone < SIR_AIR && SirOurs(e.tone)) ? e.tone : 0;
+        int w = (e.vanilla || !g_sirReady) ? 0 : e.air ? SIR_AIR : e.strobe ? 0 : (e.tone >= 1 && e.tone < SIR_AIR && SirOurs(e.tone)) ? e.tone : 0;
         if (w && (g_sirDsBad || !g_pcm[w].d)) w = 0;
         want[i] = w;
         if (e.voice >= 0 && !w) { SirVoiceRelease(g_sv[e.voice]); e.voice = -1; }
@@ -8338,18 +9764,108 @@ static void SirTick() {
     }
     for (int i = 0; i < g_nSvh; i++) {                                        // o que o jogo toca de cada um
         SirVeh& e = g_svh[i];
-        e.mode = e.vanilla ? 1 : e.voice >= 0 ? 0 : e.tone == 2 ? 2 : 1;      // sem voz nossa: wail (ou yelp) do jogo
+        e.mode = e.vanilla ? 1 : (e.voice >= 0 || e.strobe) ? 0 : e.tone == 2 ? 2 : 1;   // sem voz nossa: wail (ou yelp) do jogo
     }
     // a lancha da policia nao passa pelo ProcessSirenAndHorn: a buzina dela e tratada aqui
     if (pv && btn && Rd<char*>(pv, 0x460) == me && Rd<int>(pv, 0x594) == 5 && SirCapable(pv)) SirHornLogic(pv);
-    // a moto da policia do CJ tambem abre caminho (o jogo so faz isso para carro)
-    if (pv && Rd<char*>(pv, 0x460) == me && SirFlag(pv) && SirCapable(pv) && Rd<int>(pv, 0x594) == 9 && (*(volatile unsigned*)0xB7CB4C & 7) == 5)
-        ((void(__cdecl*)(char*))0x41D660)(pv);                                // CCarAI::MakeWayForCarWithSiren
+    // a moto da policia do CJ tambem abre caminho (o jogo so faz isso para carro com UsesSiren); 3.65: e o carro
+    // comum com sirene do nivel 64
+    if (pv && Rd<char*>(pv, 0x460) == me && SirFlag(pv) && !SirYieldBlocked(pv) && SirCapable(pv) && (Rd<int>(pv, 0x594) == 9 || !SirUsesSiren(pv)) && (*(volatile unsigned*)0xB7CB4C & 7) == 5)
+        ((void(__cdecl*)(char*))0x41D660)(pv);                                // CCarAI::MakeWayForCarWithSiren (pelo gancho)
+    // 3.65 (pedido 07): luz vermelha girando no painel do passageiro do carro comum com sirene
+    if (g_sirLight) for (int i = 0; i < g_nSvh; i++) {
+        char* v = g_svh[i].veh;
+        if (v && SirFlag(v) && !SirUsesSiren(v)) SirDashLight(v, now);
+    }
+    SirRadioTick(pv, me, now);
+    TbAudioTick(pv, me, now);                                                 // 3.69: som do turbo
     LeaveCriticalSection(&g_sirCs);
 }
+typedef void(__cdecl* SirMakeWay_t)(char*);
+static SirMakeWay_t g_sirOrigMakeWay = nullptr;
+// 3.58: para que lado o carro abre caminho. O jogo manda todo carro da frente, no mesmo sentido, desviar para a
+// ESQUERDA (TEMPACT_SWIRVELEFT_STOP 20, 2,5 s) e o que vem de frente, que iria para a direita, so esperar (WAIT 1,
+// 2,5 s); a direita (21) existe e funciona igual (CCarCtrl 0x43803E: volante +-0,25, depois espera 4 s), so nao
+// era usada. Depois do original, quem recebeu agora uma dessas (tempo = agora + 2500) vai para o lado da faixa:
+// pelo trecho de rua do autopiloto (ThePaths 0x96F050, m_pNaviNodes +0x924, CCarPathLink de 14 bytes: posicao
+// int16/8, direcao int8/100, faixas no byte 11: bits 0-2 contrarias, 3-5 no sentido do trecho), rua de mao dupla:
+// todo mundo para a direita (o seu meio-fio; quem vem de frente tambem para a direita dele); mao unica: quem esta
+// a esquerda do meio vai para a esquerda, o resto para a direita. O filtro do jogo continua: so carro aleatorio
+// com motorista do jogo (suspeito do Vigilante, que e de missao, nao entra)
+static int g_sirSideL = 0, g_sirSideR = 0, g_sirSideOn = 1;                 // [Sirenes] CaminhoPeloLado
+static int SirYieldSide(char* v) {                                            // 20 direita, 21 esquerda, 0 sem trecho
+    WORD a = Rd<WORD>(v, 0x390 + 0x14);                                       // CAutoPilot::m_nCurrentPathNodeInfo
+    if (a == 0xFFFF) return 0;
+    int id = a & 0x3FF, area = a >> 10;
+    char* nodes = Rd<char*>((void*)(0x96F050 + 0x924), area * 4);
+    if (!nodes) return 0;
+    const char* L = nodes + id * 14;
+    float lx = Rd<short>(L, 0) / 8.f, ly = Rd<short>(L, 2) / 8.f;
+    float dx = (signed char)Rd<BYTE>(L, 8) / 100.f, dy = (signed char)Rd<BYTE>(L, 9) / 100.f;
+    BYTE ln = Rd<BYTE>(L, 11);
+    int opp = ln & 7, same = (ln >> 3) & 7;
+    const float* m = Rd<const float*>(v, 0x14);                               // matriz: frente em +0x10
+    if (!m) return 0;
+    float s = m[4] * dx + m[5] * dy >= 0.f ? 1.f : -1.f;                      // anda no sentido do trecho?
+    float fx = dx * s, fy = dy * s;
+    V3 p = EntityPos(v);
+    float lat = (p.x - lx) * fy - (p.y - ly) * fx;                            // + = a direita da linha do trecho
+    int mine = s > 0 ? same : opp, other = s > 0 ? opp : same;
+    // 3.59: no jogo o 20 leva o carro para a DIREITA e o 21 para a esquerda (na 3.58, com os nomes do gta-reversed,
+    // todo mundo foi para o meio da rua; o log mostrou 0 para a "esquerda" e todos para a "direita")
+    if (other > 0 || mine <= 1) return 20;                                    // mao dupla (ou faixa unica): meio-fio da direita
+    return lat < -0.5f ? 21 : 20;                                             // mao unica: cada metade para o seu lado
+}
+static void __cdecl SirMakeWayDetour(char* veh) {                             // CCarAI::MakeWayForCarWithSiren
+    if (g_sirOn && SirYieldBlocked(veh)) return;                              // so estrobos: o transito age como sem sirene
+    g_sirOrigMakeWay(veh);
+    if (!g_sirOn || !g_sirSideOn) return;
+    DWORD due = *TimeMs + 2500;
+    char* pool = *(char**)0xB74494;
+    if (!pool) return;
+    char* objs = Rd<char*>(pool, 0); BYTE* map = Rd<BYTE*>(pool, 4); int size = Rd<int>(pool, 8);
+    for (int i = 0; objs && map && i < size && i < 4096; i++) {
+        if (map[i] & 0x80) continue;
+        char* v = objs + i * 0xA18;
+        if (v == veh) continue;
+        BYTE ta = Rd<BYTE>(v, 0x3BB);
+        if ((ta != 20 && ta != 1) || Rd<DWORD>(v, 0x3BC) != due) continue;   // so quem o jogo mandou agora (2,5 s)
+        // 3.59: o jogo chama isto a cada 8 quadros e, acabada a espera de 4 s, manda desviar de novo: o carro seguia
+        // desviando e andando. Quem ja desviou nos ultimos 10 s agora so fica parado (WAIT), ate a sirene passar
+        static struct { char* v; DWORD until; } done[48];
+        int slot = -1, freeS = -1;
+        for (int k = 0; k < 48; k++) {
+            if (done[k].v == v && (int)(done[k].until - *TimeMs) > 0) { slot = k; break; }
+            if (freeS < 0 && (!done[k].v || (int)(done[k].until - *TimeMs) <= 0)) freeS = k;
+        }
+        if (slot >= 0) {
+            *(BYTE*)(v + 0x3BB) = 1;                                          // TEMPACT_WAIT
+            *(DWORD*)(v + 0x3BC) = *TimeMs + 3000;
+            done[slot].until = *TimeMs + 10000;
+            continue;
+        }
+        int side = SirYieldSide(v);
+        if (!side) continue;
+        *(BYTE*)(v + 0x3BB) = (BYTE)side;
+        if (freeS >= 0) { done[freeS].v = v; done[freeS].until = *TimeMs + 10000; }
+        if (side == 21) g_sirSideL++; else g_sirSideR++;
+    }
+    static DWORD tLog = 0;
+    if ((g_sirSideL || g_sirSideR) && *TimeMs - tLog > 20000) {
+        tLog = *TimeMs;
+        Log("sirenes: carros abrindo caminho: %d para a esquerda, %d para a direita (desde a ultima nota)", g_sirSideL, g_sirSideR);
+        g_sirSideL = g_sirSideR = 0;
+    }
+}
 static void InstallSirens() {
+    HookGame(0x41D660, (void*)&SirMakeWayDetour, (void**)&g_sirOrigMakeWay, "do abrir caminho para a sirene (CCarAI::MakeWayForCarWithSiren)");
     HookGame(0x6E0950, (void*)&SirPshDetour, (void**)&g_sirOrigPsh, "da buzina e da sirene do CJ (CVehicle::ProcessSirenAndHorn)");
     HookGame(0x4F62A0, (void*)&SirGssDetour, (void**)&g_sirOrigGss, "do som da sirene (CAEVehicleAudioEntity::GetSirenState)");
+    if (g_ofOn) {
+        HookGame(0x6D6C00, (void*)&AePWDetour, (void**)&g_aeOrigPW, "das rodas do carro para ABS e ESP (CVehicle::ProcessWheel)");
+        HookGame(0x6D73B0, (void*)&AePBWDetour, (void**)&g_aeOrigPBW, "das rodas da moto para ABS (CVehicle::ProcessBikeWheel)");
+    }
+    if (g_ofOn && g_tbPitch > 0.f) HookGame(0x4F8070, (void*)&TbFreqDetour, (void**)&g_tbOrigFreq, "do tom do motor com turbo (CAEVehicleAudioEntity::GetFreqForPlayerEngineSound)");
 }
 
 // fora do DllMain (sem o loader lock): ganchos do MinHook e XInput logo no inicio,
@@ -8378,6 +9894,16 @@ static void LoadConfig(HMODULE self) {
     char* slash = strrchr(path, '\\');
     if (slash) slash[1] = 0; else path[0] = 0;
     strcpy(g_dir, path);
+    {   // 3.59: log acima de 1 MB vira GTMTouchSA.old.log (o anterior sai) e comeca um novo
+        char lp[MAX_PATH], op[MAX_PATH];
+        snprintf(lp, sizeof lp, "%sGTMTouchSA.log", g_dir);
+        snprintf(op, sizeof op, "%sGTMTouchSA.old.log", g_dir);
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        if (GetFileAttributesExA(lp, GetFileExInfoStandard, &fa) && (fa.nFileSizeHigh || fa.nFileSizeLow > 1024 * 1024)) {
+            DeleteFileA(op);
+            MoveFileA(lp, op);
+        }
+    }
     char ini[MAX_PATH];
     snprintf(ini, sizeof ini, "%sGTMTouchSA.ini", g_dir);
     g_steerOn   = GetPrivateProfileIntA("Steer", "Enabled",   1,   ini);
@@ -8407,27 +9933,32 @@ static void LoadConfig(HMODULE self) {
                 if (!*q) break;
                 int t = atoi(q);
                 while (isdigit((unsigned char)*q)) q++;
-                if (t >= 1 && t <= 5) out[k++] = t;
+                if (t >= 1 && t <= 3) out[k++] = t;
             }
             if (k) n = k;
         };
         g_sirOn       = GetPrivateProfileIntA("Sirenes", "Enabled", 1, ini);
-        list("Tons", "1,2,3,4,5", g_sirTones, g_sirNT);
-        list("TonsDaIA", "1,2,3,4,5", g_sirNpcTones, g_sirNN);
+        list("Tons", "1,2,3", g_sirTones, g_sirNT);
+        list("TonsDaIA", "1,2,3", g_sirNpcTones, g_sirNN);
         GetPrivateProfileStringA("Sirenes", "TrocaDaIA", "6,15", fb, sizeof fb, ini);
         { int a = 6, b = 15; if (sscanf(fb, "%d,%d", &a, &b) >= 1) { if (a < 2) a = 2; if (b < a) b = a; g_sirNpcMin = a; g_sirNpcMax = b; } }
         g_sirNpcAir   = GetPrivateProfileIntA("Sirenes", "AirHornDaIA", 1, ini);
+        g_sirAirDual  = GetPrivateProfileIntA("Sirenes", "AirHornDuplo", 0, ini);
+        g_sirUnattended = GetPrivateProfileIntA("Sirenes", "SoaSemMotorista", 1, ini);   // 3.62: padrao uma corneta (o Gabriel quis a atual)
         g_sirVoices   = GetPrivateProfileIntA("Sirenes", "VozesDaIA", 6, ini);
         g_sirHoldMs   = GetPrivateProfileIntA("Sirenes", "SegurarMs", 220, ini);
         if (g_sirHoldMs < 80) g_sirHoldMs = 80;
         if (g_sirHoldMs > 1000) g_sirHoldMs = 1000;
-        g_sirShowName = GetPrivateProfileIntA("Sirenes", "NomeNaTela", 1, ini);
+        g_sirShowName = GetPrivateProfileIntA("Sirenes", "NomeNaTela", 0, ini);
+        g_sirSideOn   = GetPrivateProfileIntA("Sirenes", "CaminhoPeloLado", 1, ini);
+        g_sirStrobeYieldMsCfg = GetPrivateProfileIntA("Sirenes", "EstroboAbreCaminhoMs", 1500, ini);
         GetPrivateProfileStringA("Sirenes", "Volume", "0", fb, sizeof fb, ini);
         g_sirVol = (float)atof(fb);
         if (g_sirVol < -30.f) g_sirVol = -30.f;
         if (g_sirVol > 12.f) g_sirVol = 12.f;
     }
     g_skinOn       = GetPrivateProfileIntA("Skins", "Menu",         1, ini);
+    g_skinStatsFree = GetPrivateProfileIntA("Skins", "StatusLivres", 1, ini);
     g_skinAnims    = GetPrivateProfileIntA("Skins", "Anims",        1, ini);
     g_skinVoice    = GetPrivateProfileIntA("Skins", "Voice",        1, ini);
     {
@@ -8448,6 +9979,43 @@ static void LoadConfig(HMODULE self) {
         GetPrivateProfileStringA("Vigilante", "HelpRadius", "100", fb, sizeof fb, ini);     g_vgHelpR = (float)atof(fb);
         GetPrivateProfileStringA("Vigilante", "BackupCooldown", "60", fb, sizeof fb, ini);  g_vgCool = (float)atof(fb);
         GetPrivateProfileStringA("Vigilante", "SingleCooldown", "60", fb, sizeof fb, ini);  g_vgOneCool = (float)atof(fb);
+        g_vgCarListLvl = GetPrivateProfileIntA("Vigilante", "ViaturaListaNivel", 50, ini);
+        g_cdOn       = GetPrivateProfileIntA("VendedorDeCarros", "Enabled", 1, ini);
+        g_ofOn       = GetPrivateProfileIntA("Oficina", "Enabled", 1, ini);
+        g_ofAnyCar   = GetPrivateProfileIntA("Oficina", "TransFenderQualquerCarro", 1, ini);
+        g_cmOn       = GetPrivateProfileIntA("Oficina", "DentroDaOficina", 1, ini);
+        g_ofPhone    = GetPrivateProfileIntA("Oficina", "TambemNoTelefone", 0, ini);
+        g_ofBig      = GetPrivateProfileIntA("Oficina", "VeiculosGrandes", 1, ini);
+        g_ofPrice[0] = GetPrivateProfileIntA("Oficina", "PrecoTurbo", 18000, ini);
+        g_ofPrice[1] = GetPrivateProfileIntA("Oficina", "PrecoBlindagem", 25000, ini);
+        g_ofPrice[2] = GetPrivateProfileIntA("Oficina", "PrecoPneus", 6000, ini);
+        g_ofPrice[3] = GetPrivateProfileIntA("Oficina", "PrecoABS", 5000, ini);
+        g_ofPrice[4] = GetPrivateProfileIntA("Oficina", "PrecoESP", 8000, ini);
+        g_ofPrice[5] = GetPrivateProfileIntA("Oficina", "PrecoTracao", 4000, ini);
+        g_ofPrice[6] = GetPrivateProfileIntA("Oficina", "PrecoVariacao", 500, ini);
+        { char fb[32]; GetPrivateProfileStringA("Oficina", "ESPForca", "1.0", fb, sizeof fb, ini); g_espGain = (float)atof(fb); }
+        { char fb[32]; GetPrivateProfileStringA("Oficina", "ESPTolerancia", "1.0", fb, sizeof fb, ini); g_espTol = (float)atof(fb); }
+        if (!(g_espGain >= 0.f && g_espGain <= 5.f)) g_espGain = 1.f;
+        if (!(g_espTol >= 0.2f && g_espTol <= 5.f)) g_espTol = 1.f;
+        { char fb[32]; GetPrivateProfileStringA("Oficina", "ESPSportForca", "0.6", fb, sizeof fb, ini); g_espSportGain = (float)atof(fb); }
+        { char fb[32]; GetPrivateProfileStringA("Oficina", "ESPSportTolerancia", "2.0", fb, sizeof fb, ini); g_espSportTol = (float)atof(fb); }
+        if (!(g_espSportGain >= 0.f && g_espSportGain <= 5.f)) g_espSportGain = 0.6f;
+        if (!(g_espSportTol >= 0.2f && g_espSportTol <= 10.f)) g_espSportTol = 2.f;
+        {
+            char fb[32];
+            GetPrivateProfileStringA("Oficina", "TurboAceleracao", "30", fb, sizeof fb, ini); g_tbAccel = (float)atof(fb);
+            GetPrivateProfileStringA("Oficina", "TurboVelocidade", "15", fb, sizeof fb, ini); g_tbVmax = (float)atof(fb);
+            GetPrivateProfileStringA("Oficina", "TurboArrasto", "15", fb, sizeof fb, ini);   g_tbDrag = (float)atof(fb);
+            GetPrivateProfileStringA("Oficina", "TomDoMotor", "6", fb, sizeof fb, ini);      g_tbPitch = (float)atof(fb);
+            GetPrivateProfileStringA("Oficina", "VolumeTurbo", "0", fb, sizeof fb, ini);     g_tbVol = (float)atof(fb);
+        }
+        g_cdMultPct  = GetPrivateProfileIntA("VendedorDeCarros", "Multiplicador", 125, ini);
+        g_priceOn    = GetPrivateProfileIntA("Precos", "Aplicar", 1, ini);
+        snprintf(g_priceIni, MAX_PATH, "%s", ini);
+        g_sirCiv     = GetPrivateProfileIntA("Sirenes", "SireneEmQualquerVeiculo", 1, ini);
+        g_sirLight   = GetPrivateProfileIntA("Sirenes", "LuzNoPainel", 1, ini);
+        g_sirRadio64 = GetPrivateProfileIntA("Sirenes", "RadioNasViaturas", 1, ini);
+        g_sirScanAlways = GetPrivateProfileIntA("Sirenes", "RadioDaPoliciaSempre", 1, ini);
         GetPrivateProfileStringA("Vigilante", "SpawnMin", "30", fb, sizeof fb, ini);        g_vgSpawnMin = (float)atof(fb);
         GetPrivateProfileStringA("Vigilante", "SpawnMax", "70", fb, sizeof fb, ini);        g_vgSpawnMax = (float)atof(fb);
         GetPrivateProfileStringA("Vigilante", "Models", "dsher,csher", g_vgModels, sizeof g_vgModels, ini);
@@ -8464,6 +10032,7 @@ static void LoadConfig(HMODULE self) {
         g_rcMax12      = GetPrivateProfileIntA("Vigilante", "RecruitMax12", 1, ini);
         g_rcMax21      = GetPrivateProfileIntA("Vigilante", "RecruitMax21", 3, ini);
         g_vg64Help     = GetPrivateProfileIntA("Vigilante", "Level64CopsHelp", 1, ini);
+        g_vg64Tune     = GetPrivateProfileIntA("Vigilante", "MusicaNivel64", 1, ini);
         {
             char fb[32];
             GetPrivateProfileStringA("Vigilante", "RecruitTargetRadius", "35", fb, sizeof fb, ini);   g_rcTgtR = (float)atof(fb);
@@ -8649,7 +10218,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     InitializeCriticalSection(&g_hookCs);
     LoadConfig(inst);
     QueryPerformanceFrequency(&g_qpf);
-    Log("GTMTouchSA 3.56 carregado (vigilante=%d transito=%d direcao=%d rampa=%d retorno=%d toque=%d sim/nao por script=%d diag toque=%d ragdoll=%d contagem=%d audio=%d x87=%d pular abertura=%d radar no alto=%d protecao da arma=%d menu de skins=%d andar da skin=%d voz da skin=%d skin nas roupas de missao=%d garagem=%d giroscopio=%d traficante=%d dar arma=%d armas em missao=%d mira do drive-by=%d)",
+    Log("GTMTouchSA 3.75 carregado (vigilante=%d transito=%d direcao=%d rampa=%d retorno=%d toque=%d sim/nao por script=%d diag toque=%d ragdoll=%d contagem=%d audio=%d x87=%d pular abertura=%d radar no alto=%d protecao da arma=%d menu de skins=%d andar da skin=%d voz da skin=%d skin nas roupas de missao=%d garagem=%d giroscopio=%d traficante=%d dar arma=%d armas em missao=%d mira do drive-by=%d)",
         g_vgOn, g_trOn, g_steerOn, g_rampMs, g_releaseMs, g_touchOn, g_ynScripts, g_traceTouch, g_traceRagdoll, g_countRagdoll, g_audioHash, g_fixX87, g_skipIntro, g_radarTop, g_weaponGuard, g_skinOn, g_skinAnims, g_skinVoice, g_skinClothes, g_garOn, g_gyroOn, g_armOn, g_giveOn, g_pmOn, g_daOn);
     if (g_armOn) Log("traficante: ligacao $%d, %d%% abaixo da AmmuNation, fora de epoca %dx e %d caixas por arma por dia, sem atender %d min do jogo, vai embora a %d m",
         g_armCall, g_armDiscount, g_armLockMult, g_armLockBoxes, g_armCooldown, g_armLeave);

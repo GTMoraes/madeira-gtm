@@ -1,4 +1,4 @@
-// GTMTouch.dylib 3.10 - overlay de toque contextual para o GTA San Andreas no Madeira.
+// GTMTouch.dylib 3.11 - overlay de toque contextual para o GTA San Andreas no Madeira.
 //
 // Injetado no IPA oficial do Madeira. Desenha os controles por cima do jogo e troca o
 // conjunto de botoes sozinho conforme o contexto que o GTMTouchSA.asi escreve em
@@ -57,7 +57,7 @@ typedef struct __attribute__((packed)) {
     uint8_t onMission, canSave, slot, pad0;
     uint32_t autosaveIn;
     uint32_t state;                 // v3
-    uint8_t weapon, nearVeh, pad1[2];
+    uint8_t weapon, nearVeh, espMode, pad1;   // espMode: 3.11
     uint8_t pad[20];
 } GTMGameBlock;
 typedef struct __attribute__((packed)) {
@@ -104,6 +104,8 @@ enum {
 // 3.10 (protocolo 7): botao Sirene (comando 12) dirigindo veiculo com sirene (S_SIREN), aceso com ela ligada
 // (S_SIRENON). Com o GTMTouchSA 3.56, a Buzina e buzina normal; com a sirene ligada, toque troca o tom e segurar
 // toca o air horn.
+// 3.11 (protocolo 8): botao ESP (comando 13) dirigindo carro com ESP da Oficina GTM (S_ESP); o modo vem em espMode
+// (1 normal, 2 sport, 3 desligado, GTMTouchSA 3.75): o texto do botao mostra o modo e ele fica apagado desligado.
 // estado do jogo (igual ao .asi) + S_CANSAVE, que e local
 enum {
     S_YESNO = 1u << 0, S_WEAPONS = 1u << 1, S_AIM = 1u << 2, S_DETONATE = 1u << 3, S_MORESATCHEL = 1u << 4,
@@ -112,7 +114,7 @@ enum {
     S_REMOTE = 1u << 14, S_GROUPMEMBERS = 1u << 15, S_DRIVEBY = 1u << 16,
     S_ACTPHONE = 1u << 17, S_ACTWEAPON = 1u << 18, S_ACTOTHER = 1u << 19, S_RELOAD = 1u << 20,
     S_VIG = 1u << 21, S_VIGBACKUP = 1u << 22, S_VIGCAR = 1u << 23, S_RECRUITCOP = 1u << 24, S_VIG64 = 1u << 25,
-    S_CARWEAPONS = 1u << 26, S_SIREN = 1u << 27, S_SIRENON = 1u << 28,
+    S_CARWEAPONS = 1u << 26, S_SIREN = 1u << 27, S_SIRENON = 1u << 28, S_ESP = 1u << 29,
 };
 #define S_CANSAVE 0x80000000u
 #define S_GYROFREE 0x40000000u                          // local: giroscopio ligado tambem fora da mira
@@ -128,8 +130,8 @@ enum {
 };
 enum { CMD_NONE = 0, CMD_SAVE = 1, CMD_DETONATE = 2, CMD_SATCHEL = 3, CMD_RELOAD = 4, CMD_RECENTER = 5,
        CMD_BACKUP = 6, CMD_COPCAR = 7, CMD_RECRUITCOP = 8, CMD_VIGTOGGLE = 9, CMD_WEAPPREV = 10, CMD_WEAPNEXT = 11,
-       CMD_SIREN = 12 };
-enum { DYN_NONE = 0, DYN_WEAPON, DYN_VEHICLE, DYN_GROUP, DYN_ACTION };
+       CMD_SIREN = 12, CMD_ESP = 13 };
+enum { DYN_NONE = 0, DYN_WEAPON, DYN_VEHICLE, DYN_GROUP, DYN_ACTION, DYN_ESP };
 
 // ------------------------------------------------------------------ layouts padrao
 // Posicoes em pontos numa tela de referencia de 874 x 402 (iPhone 6,3" deitado); d = diametro.
@@ -174,6 +176,7 @@ static const double kRefW = 874.0, kRefH = 402.0;
     {.key = "right", .label = "▶", .icon = "hud_right", .bits = B_RIGHT, .x = 245, .y = 315, .d = 83}, \
     {.key = "horn",  .label = "Buzina", .icon = "horn", .bits = B_L3, .x = 187, .y = 225, .d = 58}, \
     {.key = "siren", .label = "Sirene", .cmd = CMD_SIREN, .need = S_SIREN, .lit = S_SIRENON, .x = 100, .y = 240, .d = 50}, \
+    {.key = "esp",   .label = "ESP", .cmd = CMD_ESP, .dyn = DYN_ESP, .need = S_ESP, .x = 157, .y = 148, .d = 44}, \
     VEHICLE_COMMON
 // cruz das aeronaves: ◀ ▶ inclinam as asas (viram direcao no .asi); ▲ ▼ mexem o analogico na vertical
 #define AIR_CROSS(upLabel, upBits, downLabel, downBits) \
@@ -497,6 +500,7 @@ typedef struct { double x, y, d; } GTMPlace;
 @property (nonatomic) GTMPlace place;
 @property (nonatomic) BOOL pressed, dimmed, editing, selectedForEdit, contextHidden;
 - (void)setIconName:(const char *)name;
+- (void)setLabelText:(const char *)text;
 @end
 
 @implementation GTMButtonView {
@@ -556,6 +560,11 @@ typedef struct { double x, y, d; } GTMPlace;
     _img.hidden = (img == nil);
     _label.hidden = (img != nil);
     _badge.hidden = (img == nil);
+}
+// 3.11: texto que muda com o jogo (botao ESP)
+- (void)setLabelText:(const char *)text {
+    NSString *t = [NSString stringWithUTF8String:text ?: _def->label];
+    if (![_label.text isEqualToString:t]) _label.text = t;
 }
 - (void)layoutSubviews {
     [super layoutSubviews];
@@ -640,7 +649,7 @@ static UIResponder *GTMCurrentFirstResponder(void) {
     int _selected;
     double _pinchBase;
     uint32_t _state;
-    uint8_t _weapon, _nearVeh;
+    uint8_t _weapon, _nearVeh, _espMode;
     UIPinchGestureRecognizer *_pinch;                   // so ligado no editor
     double _pitch;                                      // rampa do ▲ ▼ das aeronaves (-1..1)
     CFTimeInterval _pitchTime;
@@ -805,6 +814,10 @@ static UIResponder *GTMCurrentFirstResponder(void) {
         v.contextHidden = hide;
         v.dimmed = (_state & d->lit) != d->lit;
         if (d->dyn) [v setIconName:[self dynamicIconFor:d]];
+        if (d->dyn == DYN_ESP) {                        // 3.11: modo do ESP no texto; desligado fica apagado
+            [v setLabelText:_espMode == 2 ? "ESP\nSport" : _espMode == 3 ? "ESP\nOFF" : "ESP"];
+            v.dimmed = (_espMode == 3);
+        }
         if (hide && !_editing)                          // sumiu com o dedo em cima: solta
             for (int s = 0; s < 12; s++)
                 if (_slots[s].kind == T_BUTTON && _slots[s].button == i) { _slots[s].kind = T_NONE; _slots[s].touch = nil; released = YES; }
@@ -1337,8 +1350,9 @@ enum { GYT_ON = 101, GYT_ALWAYS, GYT_H, GYT_V, GYT_AIM, GYT_INVERT, GYT_ZOOM, GY
         if (g.canSave) state |= S_CANSAVE;
         if (gGyro.on && gGyro.always) state |= S_GYROFREE;
         uint8_t weapon = g.version >= 3 ? g.weapon : 0xFF, nearVeh = g.version >= 3 ? g.nearVeh : 0;
-        if (state != _state || weapon != _weapon || nearVeh != _nearVeh) {
-            _state = state; _weapon = weapon; _nearVeh = nearVeh;
+        uint8_t espMode = g.version >= 3 ? g.espMode : 0;
+        if (state != _state || weapon != _weapon || nearVeh != _nearVeh || espMode != _espMode) {
+            _state = state; _weapon = weapon; _nearVeh = nearVeh; _espMode = espMode;
             stateChanged = YES;
         }
     }
@@ -1363,7 +1377,7 @@ enum { GYT_ON = 101, GYT_ALWAYS, GYT_H, GYT_V, GYT_AIM, GYT_INVERT, GYT_ZOOM, GY
     GTMHostBlock h = {0};
     h.magic = kHostMagic;
     h.seq = ++_hostSeq;
-    h.version = 7;
+    h.version = 8;
     h.cmdSeq = _cmdSeq; h.cmd = _hostCmd;
     if (!_editing) {
         uint32_t bits = 0;
@@ -1441,7 +1455,7 @@ enum { GYT_ON = 101, GYT_ALWAYS, GYT_H, GYT_V, GYT_AIM, GYT_INVERT, GYT_ZOOM, GY
     self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(frame:)];
     self.link.preferredFrameRateRange = CAFrameRateRangeMake(30, 60, 60);
     [self.link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
-    NSLog(@"[GTMTouch] overlay 3.10 ligado; arquivo %@", GTMSharedPath());
+    NSLog(@"[GTMTouch] overlay 3.11 ligado; arquivo %@", GTMSharedPath());
 }
 - (void)frame:(CADisplayLink *)l { [self.pad tick]; }
 - (void)sceneEvent:(NSNotification *)n { [self attachIfNeeded]; }

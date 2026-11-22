@@ -15,7 +15,7 @@ Overlay de toque contextual para o GTA San Andreas (PC 1.0 US) rodando no Madeir
   também a pé e dirigindo (aí a câmera vira e fica, como o mouse; "Olhar atrás" no veículo e "Centralizar" a pé
   voltam ela para trás), com sensibilidade horizontal, vertical e na mira no painel do editor (lápis > Giroscópio).
   Depois do teclado, o foco do teclado volta para o Madeira. Botão Sirene dirigindo veículo com sirene (aceso com
-  ela ligada).
+  ela ligada). Botão ESP no carro com ESP da Oficina GTM: normal, Sport e desligado (o texto mostra o modo).
 - `asi/GTMTouchSA.cpp`: plugin do jogo (vai em `GTA San Andreas/scripts`). Escreve contexto e
   estado e recebe os toques por `C:\gtmtouch.bin` (`Documents/wine/drive_c/gtmtouch.bin` no
   iPhone), entregando ao GInput como um controle. Inclui a direção pelas setas, salvar na hora,
@@ -33,14 +33,16 @@ Overlay de toque contextual para o GTA San Andreas (PC 1.0 US) rodando no Madeir
   reforço (o limite de 278 modelos de pedestre do jogo sobe para 350), a mira do drive-by (de moto ou de carro, o
   tiro vai no suspeito do Vigilante, no veículo dele ou em quem atacou você; sem alvo, só a altura do tiro é acertada
   no pedestre ou veículo à frente), a mira a pé que prefere o suspeito (até dentro do carro) e, no nível hitman, passa
-  sozinha para o próximo agressor, a pistola silenciada .45 mais rápida, a escopeta de combate com 15 chumbos de 10, botões próprios do Vigilante no overlay
+  sozinha para o próximo agressor, a pistola silenciada .45 mais rápida, a escopeta de combate com 15 chumbos de 10, escolha da viatura numa lista a partir do nível 50 (Police LS/SF/LV, Ranger, moto, Enforcer, FBI Rancher, FBI Truck, S.W.A.T.), botões próprios do Vigilante no overlay
   (Reforço, Viatura, Recrutar policial, Vigilante), trocar de arma no veículo e fazer drive-by com pistola, SMG,
   fuzil ou escopeta (na moto com a animação de drive-by do jogo e escopetas com todos os chumbos; recarregando pelo toque no ícone da arma, como a pé), atirar para a frente no carro quebrando
-  o para-brisa, recrutas que sobem no seu veículo (até na garupa da moto), ficam atirando da janela e voltam para você quando chamados,
+  o para-brisa, recrutas que sobem no seu veículo (até na garupa da moto), ficam no banco atirando da janela (no carro do suspeito, se ele estiver dirigindo), voltam para você quando chamados e esperam do lado de fora dos interiores,
   o fim dos "mortos" do Ragdoll que o jogo não registrava (não soltavam a arma nem contavam no Vigilante), sirenes
-  novas (botão Sirene liga e desliga; a Buzina é buzina normal e, com a sirene ligada, um toque troca o tom entre
-  Wail, Yelp, Priority, Hi-Lo e Piercer e segurar toca o air horn; as viaturas da IA sorteiam os tons e usam o air
-  horn; tons gerados pelo plugin ou trocados por WAV), e a garagem pelo telefone
+  novas (botão Sirene: desligado, só estrobos ou sirene e estrobos; a Buzina é buzina normal e, com a sirene ligada,
+  um toque troca o tom entre Wail, Yelp e Piercer e segurar toca o air horn; só com os estrobos o trânsito não abre
+  caminho (a não ser com o air horn segurado por 1,5 s) e a Buzina é o air horn; quem abre caminho vai para o lado da
+  própria faixa, deixando o meio da rua livre; as viaturas da IA sorteiam os tons e usam o air horn; Piercer e air horn gerados
+  pelo plugin a partir de gravações reais, ou trocados por WAV; o air horn soa alto desde o primeiro toque; a sirene continua tocando na viatura sem motorista, sua ou da IA), a música de missão concluída ao chegar no nível 64 do Vigilante, a Oficina GTM dentro das oficinas (linha a mais no menu da TransFender, da Loco Low e da Wheel Arch Angels) (turbo com assobio, espirro e o grito do diesel, blindagem, pneus blindados, ABS, ESP com modos normal, Sport e desligado, tração e a variação do modelo, que fica salva com o carro; a TransFender passa a aceitar qualquer carro), um vendedor de carros pelo telefone (categorias, preços do início dos anos 90, entrega e o carro vira seu), sirene, luz vermelha no painel e rádio da polícia em qualquer carro ou moto a partir do nível 64 do Vigilante, e a garagem pelo telefone
   (Status + Pular: os carros das garagens das casas viram seus; um membro da Grove entrega, busca e leva
   para a garagem; venda no mercado negro; os amassados do LocalDent vao junto, com o LocalDent modificado que
   exporta o estado de cada carro; cada garagem guarda quantos carros couberem nela e o carro que nao cabe fica
