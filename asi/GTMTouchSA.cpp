@@ -11,6 +11,8 @@
 // 3) Direcao: dentro de veiculo, D-pad esquerda/direita vira esterco total com rampa.
 // 4) Salvar: na hora (botao), autosave a cada N minutos e ao passar missao, sempre no
 //    mesmo slot. Se salvou dentro de um veiculo, recria o veiculo ao carregar.
+//    3.89: tambem quando o Madeira sai da tela; ao abrir, pula o menu e carrega o save mais recente; se saiu no
+//    meio de uma missao, o CJ volta ao marcador dela e ela comeca de novo.
 // 5) Comandos do overlay: 1 salvar, 2 detonar as satchels, 3 voltar para a satchel, 4 recarregar, 5 centralizar.
 // 6) Skin Selector (3.10/3.12): Status + Atirar abre o menu; a skin escolhida anda e fala como o
 //    personagem do modelo; o save daqui grava a skin no slot do save.
@@ -40,7 +42,7 @@
 // GTMTouchSA.ini (opcional, mesma pasta):
 //   [Steer]    Enabled=1  RampMs=150  ReleaseMs=60
 //   [Touch]    Enabled=1
-//   [Save]     Slot=8  AutosaveMinutes=5  AfterMission=1  KeepVehicle=1
+//   [Save]     Slot=8  AutosaveMinutes=5  AfterMission=1  KeepVehicle=1  SalvarAoSair=1  ContinuarAoAbrir=1  RecomecarMissao=1
 //   [YesNo]    Scripts=1  IgnoreScripts=
 //   [Vehicles] MissionModels=...  FireModels=...  Fire2Models=...
 //   [Debug]    Log=1  TouchTrace=0  RagdollTrace=0  RagdollCount=0 (diagnosticos)
@@ -64,6 +66,7 @@ static volatile SHORT g_touchRX = 0;                                         // 
 static int  g_traceTouch = 0, g_traceRagdoll = 0, g_countRagdoll = 0, g_audioHash = 0, g_fixX87 = 1, g_skipIntro = 1, g_radarTop = 16, g_weaponGuard = 1;     // diagnosticos ([Debug] TouchTrace / RagdollTrace)
 static int  g_noAirZones = 1;                                                 // [Fixes] SemFreioDeZona (3.55)
 static int  g_saveSlot = 8, g_autosaveMin = 5, g_afterMission = 1, g_keepVehicle = 1;
+static int  g_saveOnLeave = 1, g_contOpen = 1, g_contMission = 1;            // 3.89: [Save] SalvarAoSair, ContinuarAoAbrir, RecomecarMissao
 static int  g_ynScripts = 1;
 static char g_ignoreScripts[512], g_ignoreTabScripts[512];                       // minusculas, ",nome,nome,"
 static char g_dir[MAX_PATH];
@@ -720,11 +723,13 @@ static void SkinCombo(WORD buttons, PadState& p, DWORD now) {
 
 static void GarageCombo(WORD buttons, PadState& p);
 static void GiveCombo(WORD buttons, PadState& p);
+static void TxtFixTick(bool mainThread);
 static DWORD Filter(DWORD ret, DWORD idx, XState* st) {
     if (idx != 0 || !st) return ret;
     InterlockedIncrement(&g_xinputCalls);
     DWORD now = GetTickCount();
     g_lastXInputTick = now;
+    TxtFixTick(false);                                                        // 3.85: tambem no menu (so na thread do jogo)
 
     // no menu o quadro do jogo para: o contexto sai daqui
     if (MenuActive()) {
@@ -961,6 +966,15 @@ static void VgCkLoad();
 static void VgResumeTick();
 static void VgLevelTuneTick();
 static void GarHelp(const char* fmt, ...);
+// 3.89: continuar de onde parou (codigo no fim, antes da thread de inicio)
+static void ResWrite(unsigned timeMs);
+static void ResBeforeRestore();
+static void ResAfterRestore();
+static bool g_resPending = false;
+static signed char g_resRadio = -1;                                           // estacao do .gtmres para o veiculo recriado
+static void ContOnLoad();
+static void ContTick(bool onMission, DWORD now);
+static void DoLeave();
 
 static bool CanSaveNow(const char** why, bool manual = false) {
     char* ped = PlayerPed();
@@ -1049,7 +1063,7 @@ static void DoSave(int kind) {
     const char* why = "";
     g_saveInfo.saveSeq++;
     g_saveInfo.saveKind = (DWORD)kind;
-    if (!CanSaveNow(&why, kind == 1)) {
+    if (!CanSaveNow(&why, kind == 1 || kind == 4)) {      // 3.89: ao sair (4), no Vigilante, vira checkpoint como o botao
         g_saveInfo.saveResult = IsPlayerOnAMission() ? 1 : 2;
         Log("salvar (%d) recusado: %s", kind, why);
         if (kind == 1 && !strncmp(why, "Vigilante:", 10)) GarHelp("%s", why);
@@ -1079,6 +1093,7 @@ static void DoSave(int kind) {
     SetDir("");
     if (ok) WriteVehicleSidecar(t);
     if (ok) SkinSaveRecord(g_saveSlot - 1);
+    if (ok) ResWrite(t);                                 // 3.89: radio, direcao a pe, procurado
     if (ok) { if (vigCk) VgCkWrite(t); else VgCkDelete(); }
     g_saveInfo.saveResult = ok ? 0 : 3;
     g_lastAutosaveTick = GetTickCount();
@@ -1168,6 +1183,10 @@ static void RestoreVehicle() {
     *(float*)(veh + 0x4C0) = v.health;
     for (short u : v.upgrades) if (u > 0) AddVehicleUpgrade(veh, u);
     if (v.remap >= 0) SetRemap(veh, v.remap);
+    if (g_resRadio >= 1 && g_resRadio <= 13 && Rd<BYTE>(veh, 0x1BC + 0x1B) == 0) {   // 3.89: radio civil sintonizado como estava
+        *(BYTE*)(veh + 0x1BC + 0x1A) = (BYTE)g_resRadio;
+        Log("veiculo restaurado: radio na estacao %d", g_resRadio);
+    }
     *(BYTE*)(veh + 0x428) &= ~0x08;                    // bIsLocked = false
     *(BYTE*)(veh + 0x428) |= 0x10;                     // bEngineOn = true
     *(BYTE*)(veh + 0x4A4) = 1;                         // m_nCreatedBy = RANDOM_VEHICLE (some como um carro normal)
@@ -1192,6 +1211,8 @@ static void __cdecl AfterLoadDetour() {
     g_lastMissionsPassed = -1;
     g_missionEndTick = 0;
     Log("jogo carregado (t=%u)", g_loadedTimeMs);
+    g_resPending = true;                                                      // 3.89: extras do .gtmres
+    ContOnLoad();                                                             // 3.89: continuar / recomecar missao
 }
 
 static void VehHandoverTick();
@@ -1202,6 +1223,7 @@ static void CdTick();
 static void PriceTick();
 static void CmTick();
 static void AeFrame();
+static void FacTick();
 static int  g_ofPhone = 0;                                                   // 3.70: Oficina GTM tambem no telefone
 static void VgCarListPick(int row);
 static void RcCmdRecruit();
@@ -1210,7 +1232,9 @@ static void CwCycle(int dir);
 static void SaveTick() {
     DWORD now = GetTickCount();
     if (g_lastAutosaveTick == 0) g_lastAutosaveTick = now;
+    ResBeforeRestore();                                                       // 3.89: le o .gtmres antes de recriar o veiculo
     if (g_pendingRestore && PlayerPed()) { g_pendingRestore = false; RestoreVehicle(); }
+    ResAfterRestore();
     VehHandoverTick();                                                        // controle do veiculo restaurado
     if (g_vgRes.check && !g_pendingRestore && PlayerPed()) { g_vgRes.check = false; VgCkLoad(); }
     VgResumeTick();
@@ -1235,6 +1259,7 @@ static void SaveTick() {
                 case 11: CwCycle(1); break;
                 case 12: SirCmdToggle(); break;                              // Sirene (overlay 3.10)
                 case 13: AeCmdCycle(); break;                                // ESP normal, sport, desligado (overlay 3.11)
+                case 14: DoLeave(); break;                                   // 3.89: o Madeira saiu da tela (overlay 3.12)
                 default: break;
             }
         }
@@ -1244,6 +1269,7 @@ static void SaveTick() {
     int passed = *StatMissionsPassed;
     if (g_lastMissionsPassed < 0) g_lastMissionsPassed = passed;
     if (g_wasOnMission && !onMission) g_missionEndTick = now;
+    ContTick(onMission, now);                                                 // 3.89: guarda/apaga a missao em andamento
     g_wasOnMission = onMission;
 
     // depois de passar uma missao: espera a tela de "missao cumprida" sumir
@@ -1578,6 +1604,285 @@ static void GyroTick();
 static void ProtTick();
 static void TargetStickTick();
 static void ApplyNoMouseSteer();
+// ---------------------------------------------------------------- 3.79/3.80: vidro do LivelyVehiclePhysics ([Fixes] VidroDoLVP=1)
+// O BreakableGlass do LivelyVehiclePhysics 2.0 anota o vidro POR MODELO: um registro por modelo (RVA 0x129EF8, 0x754C
+// bytes cada, quantos em RVA 0x3761F4, no maximo 0x50; +0 modelo (negativo = livre), +2 estado, +0x6D84 os pares
+// {RpGeometry, RpMaterial, ...} de 0x14 bytes, quantos em +0x7504, +0x7548 o clump mestre do modelo). O registro e
+// montado uma vez (0x10050880) pelo clump do primeiro carro daquele modelo que ele ve. Na batida, a chamada de desenho
+// dele (0x100543C0) acha o par {geometria do atomo, material} no registro e poe na fila (RVA 0x3761F8, 0x400 itens de
+// 16 bytes: registro, RpGeometry, RpMaterial, indice; quantos em RVA 0x37A1FC; -2 = vidro que cai) e a funcao da fila
+// (RVA 0x4EF80, comeco do processamento dos carros) solta os cacos. No jogo puro todo carro do modelo usa a mesma
+// geometria, que nunca some. Com o LocalDent, carro amassado tem geometria propria, apagada com o carro (conserto pelo
+// telefone, carro guardado na memoria) ou quando os amassados saem (Pay 'n' Spray). Em 22/11 o Patriot carregou com
+// amassados, foi para o conserto (o carro amassado e apagado e volta outro) e na primeira batida que quebrou vidro o LVP
+// leu a geometria apagada: LivelyVehiclePhysics.asi +0x4f0b4 (lendo 0x3F63868D e 0x3F664C31).
+// 3.79: cada item da fila e conferido antes do LVP (RpGeometry legivel com tipo 8 no RwObject, refCount > 0, contagens
+// plausiveis, materiais e triangulos legiveis, material legivel); item ruim sai da fila.
+// 3.80: alem disso o registro do modelo com geometria morta e esquecido, com a mesma sequencia que o LVP usa quando o
+// clump mestre muda (0x100542D6: zera os itens da tabela de carros RVA 0x3746C0, 0xA4 bytes, que apontam para ele e
+// desconta RVA 0x129EF0; 0x1004B7E0 com ecx = registro; modelo -1 e estado 0). Na proxima vez ele monta de novo pelo
+// carro atual e os cacos continuam. A conferencia passa por 4 registros por quadro (todos em menos de 1 s), para
+// achar o registro velho antes da batida; na fila tambem, se um item ruim escapar
+static int g_lvpGuard = 1;
+typedef void (__cdecl* LvpProc_t)();
+static LvpProc_t g_lvpOrig = nullptr;
+static BYTE* g_lvpBase = nullptr;
+static int g_lvpDropped = 0, g_lvpForgot = 0, g_lvpTries = 0, g_lvpScan = 0;
+static bool g_lvpDone = false;
+static const char* CarName(int model);
+static bool MemReadable(const void* p, size_t n) {
+    if ((DWORD)p < 0x10000 || n == 0) return false;
+    const BYTE* a = (const BYTE*)p; const BYTE* end = a + n;
+    if (end < a) return false;
+    while (a < end) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(a, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return false;
+        if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+        const BYTE* next = (const BYTE*)mbi.BaseAddress + mbi.RegionSize;
+        if (next <= a) return false;
+        a = next;
+    }
+    return true;
+}
+static bool LvpGeoOk(const BYTE* g) {
+    if (!MemReadable(g, 0x60) || g[0] != 8) return false;                    // RwObject.type = rpGEOMETRY
+    int nt = *(const int*)(g + 0x10), nm = *(const int*)(g + 0x24), sp = *(const int*)(g + 0x28);
+    short ref = *(const short*)(g + 0x0E);
+    if (ref <= 0 || nt < 0 || nt > 0x10000 || nm < 0 || nm > 1024 || sp < nm) return false;
+    if (nm && !MemReadable(*(void* const*)(g + 0x20), (size_t)nm * 4)) return false;
+    void* tri = *(void* const*)(g + 0x2C);                                   // o LVP aceita sem triangulos
+    if (nt && tri && !MemReadable(tri, (size_t)nt * 8)) return false;
+    return true;
+}
+static int LvpRecCount() { int n = *(int*)(g_lvpBase + 0x3761F4); return n < 0 ? 0 : n > 0x50 ? 0x50 : n; }
+static BYTE* LvpRec(int k) { return g_lvpBase + 0x129EF8 + k * 0x754C; }
+static bool LvpIsRec(const BYTE* r) {                                         // registro em uso
+    int n = LvpRecCount();
+    if (r < LvpRec(0) || r >= LvpRec(n)) return false;
+    if ((DWORD)(r - LvpRec(0)) % 0x754C) return false;
+    return *(const short*)r >= 0 && r[2] != 0;
+}
+static bool LvpRecStale(const BYTE* rec) {                                    // alguma geometria anotada morreu
+    int n = *(const int*)(rec + 0x7504);
+    if (n <= 0) return false;
+    if (n > 0x60) n = 0x60;
+    const BYTE* last = nullptr;
+    for (int i = 0; i < n; i++) {
+        const BYTE* g = *(BYTE* const*)(rec + 0x6D84 + i * 0x14);
+        if (!g || g == last) continue;
+        if (!LvpGeoOk(g)) return true;
+        last = g;
+    }
+    return false;
+}
+static void LvpForget(BYTE* rec, const char* when) {
+    int model = *(short*)rec;
+    for (BYTE* e = g_lvpBase + 0x3746C0; e < g_lvpBase + 0x376060; e += 0xA4)
+        if (*(DWORD*)e && *(BYTE**)(e + 0xC) == rec) {
+            *(DWORD*)e = 0;
+            int* c = (int*)(g_lvpBase + 0x129EF0);
+            if (*c > 0) (*c)--;
+        }
+    ((void (__fastcall*)(void*, int))(g_lvpBase + 0x4B7E0))(rec, 0);        // ecx = registro
+    *(short*)rec = -1; rec[2] = 0;
+    if (g_lvpForgot++ < 20)
+        Log("vidro do LVP: o vidro anotado do %s (modelo %d) era de uma geometria que ja nao existe (%s); anotacao esquecida, o LVP anota de novo pelo carro atual",
+            model >= 400 && model <= 611 ? CarName(model) : "?", model, when);
+}
+static void __cdecl LvpProcDetour() {
+    int* pn = (int*)(g_lvpBase + 0x37A1FC);
+    int n = *pn;
+    BYTE* bad[8]; int nb = 0;
+    if (n > 0 && n <= 0x400) {
+        BYTE* e = g_lvpBase + 0x3761F8;
+        int w = 0;
+        for (int i = 0; i < n; i++) {
+            BYTE* it = e + i * 16;
+            const BYTE* g = *(BYTE**)(it + 4);
+            const BYTE* m = *(BYTE**)(it + 8);
+            if (LvpGeoOk(g) && MemReadable(m, 0x1C)) { if (w != i) memcpy(e + w * 16, it, 16); w++; continue; }
+            if (g_lvpDropped++ < 20)
+                Log("vidro do LVP: item %d da fila aponta para uma geometria que ja nao existe (geometria %p, material %p, indice %d); tirado da fila para o jogo nao fechar",
+                    i, g, m, *(int*)(it + 12));
+            BYTE* rec = *(BYTE**)it;
+            bool seen = false;
+            for (int k = 0; k < nb; k++) if (bad[k] == rec) seen = true;
+            if (!seen && nb < 8 && LvpIsRec(rec)) bad[nb++] = rec;
+        }
+        *pn = w;
+    }
+    for (int k = 0; k < nb; k++) if (LvpIsRec(bad[k])) LvpForget(bad[k], "na batida");
+    g_lvpOrig();
+}
+static void LvpGuardTick() {
+    if (!g_lvpGuard) return;
+    if (g_lvpOrig) {                                                          // conferencia: 4 registros por quadro
+        int n = LvpRecCount();
+        for (int j = 0; j < 4 && n > 0; j++) {
+            if (g_lvpScan >= n) g_lvpScan = 0;
+            BYTE* r = LvpRec(g_lvpScan++);
+            if (LvpIsRec(r) && LvpRecStale(r)) LvpForget(r, "antes da batida");
+        }
+        return;
+    }
+    if (g_lvpDone) return;
+    static DWORD tNext = 0;
+    DWORD now = GetTickCount();
+    if ((int)(now - tNext) < 0) return;
+    tNext = now + 2000;
+    HMODULE m = GetModuleHandleA("LivelyVehiclePhysics.asi");
+    if (!m) { if (++g_lvpTries >= 30) g_lvpDone = true; return; }
+    g_lvpDone = true;
+    BYTE* b = (BYTE*)m;
+    static const BYTE kHead[6] = { 0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x34 };
+    static const BYTE kUse[21] = { 0x8B, 0x5E, 0xF8, 0x33, 0xD2, 0x8B, 0x4E, 0xFC, 0x8B, 0x43, 0x24, 0x8B, 0x7B, 0x20, 0x85, 0xC0, 0x7E, 0x0A, 0x39, 0x0C, 0x97 };
+    static const BYTE kRel[4] = { 0x53, 0x56, 0x8B, 0x35 };                   // 0x1004B7E0: push ebx; push esi; mov esi,[fila]
+    static const BYTE kEnd[7] = { 0x66, 0x89, 0x1E, 0xC6, 0x46, 0x02, 0x00 }; // 0x1005431F: modelo -1, estado 0
+    bool ok = MemReadable(b + 0x4EF80, 0x130) && MemReadable(b + 0x54290, 0xA0) && MemReadable(b + 0x4B7E0, 0x10) &&
+              !memcmp(b + 0x4EF80, kHead, 6) && !memcmp(b + 0x4F0A2, kUse, 21) &&
+              b[0x4EFB6] == 0x39 && b[0x4EFB7] == 0x0D && *(DWORD*)(b + 0x4EFB8) == (DWORD)(b + 0x37A1FC) &&
+              b[0x4EFC2] == 0xBB && *(DWORD*)(b + 0x4EFC3) == (DWORD)(b + 0x3761F8) &&
+              !memcmp(b + 0x4B7E0, kRel, 4) && *(DWORD*)(b + 0x4B7E4) == (DWORD)(b + 0x37A1FC) &&
+              b[0x54297] == 0x8B && b[0x54298] == 0x15 && *(DWORD*)(b + 0x54299) == (DWORD)(b + 0x3761F4) &&
+              b[0x542A7] == 0xBE && *(DWORD*)(b + 0x542A8) == (DWORD)(b + 0x129EF8) &&
+              b[0x542D6] == 0xB8 && *(DWORD*)(b + 0x542D7) == (DWORD)(b + 0x3746C0) &&
+              b[0x542EA] == 0x83 && b[0x542EB] == 0x3D && *(DWORD*)(b + 0x542EC) == (DWORD)(b + 0x129EF0) &&
+              b[0x5430B] == 0x3D && *(DWORD*)(b + 0x5430C) == (DWORD)(b + 0x376060) &&
+              b[0x54312] == 0x8B && b[0x54313] == 0xCE && b[0x54314] == 0xE8 && (DWORD)(b + 0x54319) + *(int*)(b + 0x54315) == (DWORD)(b + 0x4B7E0) &&
+              *(DWORD*)(b + 0x54329) == 0x754C && !memcmp(b + 0x5431F, kEnd, 7);
+    if (!ok) { Log("vidro do LVP: LivelyVehiclePhysics.asi em %p com outro codigo (versao diferente da 2.0 conhecida); protecao nao instalada", m); return; }
+    g_lvpBase = b;
+    if (MH_CreateHook(b + 0x4EF80, (void*)&LvpProcDetour, (void**)&g_lvpOrig) == MH_OK && MH_EnableHook(b + 0x4EF80) == MH_OK)
+        Log("vidro do LVP: protecao do vidro trincado instalada (LivelyVehiclePhysics.asi em %p, %d modelos anotados)", m, LvpRecCount());
+    else { g_lvpOrig = nullptr; Log("vidro do LVP: falha no gancho em %p", b + 0x4EF80); }
+}
+
+// ---------------------------------------------------------------- 3.85: textos sem reescrever o codigo do jogo ([Fixes] TextoSemReescrita=1)
+// O std.text.dll do Mod Loader intercepta o CText::Get (0x6A0050, devolve o texto de uma chave do GXT) com um salto no
+// comeco da funcao. O GInput entra por cima (salto dele em 0x6A0050, que chama o gancho do std.text). Quando a chave
+// nao e de um mod (quase sempre), o gancho do std.text (RVA 0x5960) chama o original assim: copia os 5 bytes que estao
+// la (o salto do GInput), volta os 5 bytes originais do jogo (guardados em RVA 0x2D32C), chama 0x6A0050, poe o
+// proprio salto de novo (RVA 0x5BE0) e devolve o salto do GInput. Sao 4 escritas no codigo do jogo e 8 VirtualProtect
+// por texto, uns 200 textos por segundo. No iPhone cada escrita faz o FEX jogar fora e traduzir de novo o codigo
+// daquela regiao: em 23/11, 165 mil traducoes em 5 min, a area de codigo traduzido (128 MB) enchia a cada ~5 min e
+// numa dessas trocas o Madeira travou (jogo parado sem fechar). Era tambem o que fechava o jogo ao pausar com o
+// SMC_HOT_PAGE ligado. A 3.85 troca, no gancho do std.text (RVA 0x5A20), o caminho "chamar o original" por uma
+// chamada a um trampolim (os 5 bytes originais, sub esp,20h / push esi / push edi, e um salto para 0x6A0055, como
+// o GInput ja faz no gancho dele) e pula para a saida da funcao (RVA 0x5ABC). O salto do GInput fica la de vez e
+// nada mais escreve no codigo do jogo. Os textos de mods do Mod Loader seguem pelo caminho de antes (sem mudanca).
+// So aplica com o codigo e o estado do std.text.dll conferidos (o de 187904 bytes) e o CText::Get do 1.0 US; senao
+// deixa como esta e avisa no log. Roda na thread do jogo (quadro ou leitura do controle, tambem no menu).
+static int g_txtFix = 1;
+static bool g_txtDone = false, g_txtGaveUp = false, g_txtReported = false, g_txtChanged = false;
+static DWORD g_txtNext = 0, g_txtAt = 0, g_txtMainTid = 0;
+static int g_txtTries = 0;
+static volatile LONG g_txtCalls = 0;                                          // somado pelo trampolim
+static BYTE g_txtHead[5];
+static bool TxtSig(const BYTE* p, const char* pat) {                         // "55 8B ?? ..." (?? = qualquer byte)
+    for (const char* s = pat; *s; ) {
+        while (*s == ' ') s++;
+        if (!*s) break;
+        if (s[0] == '?') { s += 2; p++; continue; }
+        unsigned v = 0;
+        for (int k = 0; k < 2; k++) { char c = s[k]; v = v * 16 + (c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10); }
+        if (*p++ != (BYTE)v) return false;
+        s += 2;
+    }
+    return true;
+}
+static const char* TxtModOf(DWORD a, char* buf, int n) {                      // nome do modulo de um endereco
+    HMODULE m = nullptr;
+    buf[0] = 0;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)a, &m) && m) {
+        char path[MAX_PATH];
+        if (GetModuleFileNameA(m, path, sizeof path)) {
+            const char* f = strrchr(path, '\\');
+            snprintf(buf, n, "%s+0x%X", f ? f + 1 : path, (unsigned)(a - (DWORD)m));
+        }
+    }
+    if (!buf[0]) snprintf(buf, n, "%08X", (unsigned)a);
+    return buf;
+}
+static void TxtFixTick(bool mainThread) {
+    if (!g_txtFix || g_txtGaveUp) return;
+    if (!mainThread && GetCurrentThreadId() != g_txtMainTid) return;
+    DWORD now = GetTickCount();
+    if (g_txtDone) {
+        if (!g_txtReported && now - g_txtAt >= 60000) {
+            g_txtReported = true;
+            Log("textos: %ld textos do jogo lidos pelo trampolim no primeiro minuto, sem escrever no codigo do jogo (antes eram 4 escritas por texto)", (long)g_txtCalls);
+        }
+        if (!g_txtChanged && memcmp((const void*)0x6A0050, g_txtHead, 5)) {
+            g_txtChanged = true;
+            const BYTE* h = (const BYTE*)0x6A0050;
+            Log("textos: o comeco do CText::Get mudou depois da correcao (%02X %02X %02X %02X %02X); outro mod mexeu nele",
+                h[0], h[1], h[2], h[3], h[4]);
+        }
+        return;
+    }
+    if ((int)(now - g_txtNext) < 0) return;
+    g_txtNext = now + 1000;
+    BYTE* b = (BYTE*)GetModuleHandleA("std.text.dll");
+    if (!b) {
+        if (++g_txtTries >= 60) { g_txtGaveUp = true; Log("textos: std.text.dll do Mod Loader nao esta carregado; nada a corrigir"); }
+        return;
+    }
+    bool code = MemReadable(b + 0x5960, 0x180) && MemReadable(b + 0x2D310, 0x30) &&
+        TxtSig(b + 0x5960, "55 8B EC 6A FF 68 ?? ?? ?? ?? 64 A1 00 00 00 00 50 64 89 25 00 00 00 00 83 EC 24 53 56 57 89 4D EC E8 CA 28 00 00") &&
+        TxtSig(b + 0x5A20, "C7 45 D0 ?? ?? ?? ?? C7 45 DC 00 00 00 00 C6 45 E4 00 C7 45 FC 00 00 00 00 E8 12 28 00 00 8D 4D D0 8B 70 0C"
+                           " 8B 45 D0 FF 50 04 6A 00 6A 05 8D 45 D4 66 C7 45 E4 01 00 50 51 8B C4 89 75 DC C7 45 E0 05 00 00 00 89 30"
+                           " E8 84 03 00 00 83 C4 10 E8 DC 27 00 00 8D 48 18 8B 01 FF 50 04 E8 CF 27 00 00 FF 75 08 8B 4D EC 33 D2"
+                           " 8B 40 0C FF D0 8B F0 E8 4B 01 00 00 80 7D E4 00") &&
+        TxtSig(b + 0x5ABC, "8B C6 8B 4D F4 5F 5E 64 89 0D 00 00 00 00 5B 8B E5 5D C2 04 00");
+    if (!code) {
+        g_txtGaveUp = true;
+        Log("textos: std.text.dll em %p com outro codigo (versao diferente da conferida); CText::Get deixado como esta", b);
+        return;
+    }
+    static const BYTE kOrig[5] = { 0x83, 0xEC, 0x20, 0x56, 0x57 };            // sub esp,20h / push esi / push edi
+    static const BYTE kNext[8] = { 0x8B, 0x7C, 0x24, 0x2C, 0x8A, 0x07, 0x3C, 0x20 };
+    bool state = *(DWORD*)(b + 0x2D31C) == 0x6A0050 && *(DWORD*)(b + 0x2D334) == 0x6A0050 &&
+                 *(DWORD*)(b + 0x2D338) == 5 && b[0x2D33C] == 1 && !memcmp(b + 0x2D32C, kOrig, 5);
+    bool game = *(const BYTE*)0x6A0050 == 0xE9 && !memcmp((const void*)0x6A0055, kNext, 8);
+    if (!state || !game) {                                                    // gancho ainda nao instalado: espera
+        if (++g_txtTries >= 60) {
+            g_txtGaveUp = true;
+            const BYTE* h = (const BYTE*)0x6A0050;
+            Log("textos: o gancho do std.text no CText::Get nao ficou como o esperado (endereco %08X, guardados %02X %02X %02X %02X %02X, marca %d; jogo %02X %02X %02X %02X %02X); deixado como esta",
+                (unsigned)*(DWORD*)(b + 0x2D31C), b[0x2D32C], b[0x2D32D], b[0x2D32E], b[0x2D32F], b[0x2D330], (int)b[0x2D33C], h[0], h[1], h[2], h[3], h[4]);
+        }
+        return;
+    }
+    BYTE* t = (BYTE*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!t) { g_txtGaveUp = true; Log("textos: sem memoria para o trampolim; CText::Get deixado como esta"); return; }
+    t[0] = 0xFF; t[1] = 0x05; *(DWORD*)(t + 2) = (DWORD)&g_txtCalls;          // inc dword [g_txtCalls]
+    memcpy(t + 6, kOrig, 5);
+    t[11] = 0xE9; *(int*)(t + 12) = (int)(0x6A0055 - ((DWORD)t + 16));        // jmp 0x6A0055
+    FlushInstructionCache(GetCurrentProcess(), t, 16);
+    BYTE* site = b + 0x5A20;
+    BYTE patch[18] = { 0xFF, 0x75, 0x08,                                      // push [ebp+8]  (chave)
+                       0x8B, 0x4D, 0xEC,                                      // mov ecx,[ebp-14h] (this)
+                       0xE8, 0, 0, 0, 0,                                      // call trampolim
+                       0x8B, 0xF0,                                            // mov esi,eax
+                       0xE9, 0, 0, 0, 0 };                                    // jmp saida (RVA 0x5ABC)
+    *(int*)(patch + 7) = (int)((DWORD)t - ((DWORD)site + 11));
+    *(int*)(patch + 14) = (int)((DWORD)(b + 0x5ABC) - ((DWORD)site + 18));
+    DWORD old;
+    if (!VirtualProtect(site, sizeof patch, PAGE_EXECUTE_READWRITE, &old)) {
+        g_txtGaveUp = true; Log("textos: VirtualProtect falhou no std.text; CText::Get deixado como esta"); return;
+    }
+    memcpy(site, patch, sizeof patch);
+    VirtualProtect(site, sizeof patch, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), site, sizeof patch);
+    memcpy(g_txtHead, (const void*)0x6A0050, 5);
+    g_txtDone = true; g_txtAt = now;
+    char who[96];
+    DWORD dst = 0x6A0055 + *(const int*)0x6A0051;
+    Log("textos: CText::Get sem reescrita: o std.text do Mod Loader (%p) chama o original por um trampolim em %p; o comeco do CText::Get fica fixo (salto para %s)",
+        b, t, TxtModOf(dst, who, sizeof who));
+}
+
+static void SkinCutTick();
 static void __cdecl FrameTick() {
     if (g_origFrameCall) g_origFrameCall();
     if (g_firstFrame) {                                 // reserva, se a thread de inicio nao conseguiu
@@ -1591,6 +1896,7 @@ static void __cdecl FrameTick() {
     if (g_weaponGuard) WeaponGuardTick();
     if (g_skinVoice) SkinVoiceTick();
     if (g_skinClothes) SkinClothesTick();
+    SkinCutTick();                                                            // 3.86: a skin nas cutscenes
     GarageTick();
     GiveTick();
     ProtTick();
@@ -1600,7 +1906,10 @@ static void __cdecl FrameTick() {
     VgLevelTuneTick();
     PriceTick();
     CmTick();
+    FacTick();                                                                // 3.78: pecas de fabrica
     AeFrame();                                                                // 3.74: ABS e ESP
+    LvpGuardTick();                                                           // 3.79/3.80: vidro do LivelyVehiclePhysics
+    TxtFixTick(true);                                                         // 3.85: textos sem reescrever o codigo do jogo
     if (g_info.ctx != g_lastCtx) { Log("contexto: %s", g_info.ctx >= 0 && g_info.ctx <= CTX_CUTSCENE ? kCtxName[g_info.ctx] : "?"); g_lastCtx = g_info.ctx; }
     bool yn = (g_info.state & S_YESNO) != 0;
     if (yn != g_lastYN) {
@@ -1944,6 +2253,256 @@ static void SkinClothesTick() {
     RebuildPlayer(ped, 0);
     g_rebuildNow = false;
     Log("skins: CJ de volta; roupas reconstruidas");
+}
+
+// ---------------------------------------------------------------- 3.86: a skin nas cutscenes ([Skins] SkinNaCutscene=1)
+// Na cutscene o CJ nao e o jogador: e um boneco a parte, o modelo 1 ("csplay", hier do default.ide, CClumpModelInfo),
+// montado com as roupas do CJ a cada LOAD_CUTSCENE (CClothes::RebuildCutscenePlayer 0x5A8270, chamado em 0x4D5EA3).
+// O boneco da cena sai de CCutsceneMgr::CreateCutsceneObject (0x5B02A0, cdecl, modelo): new CCutsceneObject,
+// SetModelIndex (CEntity::CreateRwObject clona o clump do modelo, RpAnimBlendClumpInit) e depois a animacao da cena
+// (0x5B0390) e ligada nesse clone pelos ossos. Todos os pedestres do SA usam o mesmo esqueleto do CJ (o rosto tem
+// menos ossos), entao com uma skin o gancho troca, so durante essa chamada para o modelo 1, o clump do modelo 1 pelo
+// clump do modelo da skin (CPedModelInfo +0x1C) e volta o do CJ logo em seguida: o boneco da cena nasce como copia
+// da skin e o modelo 1 continua o do CJ para a proxima cutscene. A copia segura as proprias geometrias e texturas
+// (contagem do RenderWare), e e apagada com o objeto no fim da cena. Qual skin: a que o CJ veste; se o Skin Selector
+// ja tiver posto o CJ para a cutscene, a ultima vestida enquanto o Skin Selector (o) ainda tem uma skin escolhida
+// (tipo em 8@ do script) ou, sem ele, se o CJ voltou ha menos de 15 s. Pedido do Gabriel (skin 141, SOFYBU, que
+// aparece de figurante no fim da Wu Zi Mu): a skin no lugar do CJ. Voz, falas e nome continuam os do CJ
+static char* ModelInfo(int m);
+static int g_skinCut = 1;
+static int g_skinCutFace = 1;                                                // 3.88: rosto parado na pose da skin
+static int g_csLastSkin = 0;                                                  // ultima skin vestida (0 = CJ)
+static DWORD g_csCjAt = 0;                                                    // quando o CJ voltou depois dela
+static int g_csLogs = 0;
+typedef void* (__cdecl* CreateCutObj_t)(int model);
+static CreateCutObj_t g_csOrigCreate = nullptr;
+typedef void (__cdecl* ReqModel_t)(int model, int flags);
+static const ReqModel_t ReqModelCs = (ReqModel_t)0x4087E0;                    // CStreaming::RequestModel
+typedef void (__cdecl* LoadAllReq_t)(bool onlyPriority);
+static const LoadAllReq_t LoadAllReqCs = (LoadAllReq_t)0x40EA10;             // CStreaming::LoadAllRequestedModels
+static void SkinCutTick() {
+    if (!g_skinCut) return;
+    char* ped = PlayerPed();
+    if (!ped) return;
+    int m = Rd<short>(ped, 0x22);
+    if (m != 0) { g_csLastSkin = m; g_csCjAt = 0; }
+    else if (g_csLastSkin && !g_csCjAt) g_csCjAt = GetTickCount();
+}
+static int SkinSelType() {                                                    // Skin Selector (o): 0 CJ, 1 pedestre, 2 especial, 3 adicional
+    char* sc = g_skinScript;
+    if (!sc || strcmp(g_skinScriptName, "skin_o") || !MemReadable(sc, 0x100)) return -1;
+    char nm[9]; memcpy(nm, sc + 8, 8); nm[8] = 0;
+    for (char* c = nm; *c; c++) *c = (char)tolower((unsigned char)*c);
+    if (strcmp(nm, "skin_o")) return -1;
+    int t = ((const int*)(sc + 0x3C))[8];
+    return t >= 0 && t <= 3 ? t : -1;
+}
+static int CsPickSkin(const char** how) {
+    char* ped = PlayerPed();
+    if (!ped) return 0;
+    int m = Rd<short>(ped, 0x22);
+    if (m > 1) { *how = "vestida"; return m; }
+    if (m != 0 || g_csLastSkin <= 1) return 0;
+    int t = SkinSelType();
+    if (t == 0) return 0;                                                     // escolheram o CJ
+    if (t > 0) { *how = "a ultima vestida; o Skin Selector tinha posto o CJ"; return g_csLastSkin; }
+    if (g_csCjAt && GetTickCount() - g_csCjAt < 15000) { *how = "a ultima vestida; o CJ tinha voltado ha pouco"; return g_csLastSkin; }
+    return 0;
+}
+// 3.87: na 3.86 a skin aparecia torta (flutuando, bracos e pernas trocados). A animacao da cena nao e ligada no
+// boneco pelos ossos na hora: CCutsceneMgr (0x5AFBC0, chamado em 0x5B11FE antes do laco dos objetos) faz
+// ms_cutsceneAssociations (0xBC4020).CreateAssociations (0x4CE3B0, thiscall: bloco, nomes das animacoes, nomes dos
+// objetos, passo 0x20), que para cada animacao acha o modelo pelo nome do objeto ("csplay" = modelo 1), cria um clump
+// (CreateInstance), RpAnimBlendClumpInit e monta a associacao (0x4CEC20) na ordem dos ossos DESSE clump; o objeto
+// da cena so recebe uma copia dela (SetCutsceneAnim 0x5B0390, CopyAnimation 0x4CE0B0). Montada no esqueleto do CJ
+// (com os ossos do rosto e outra ordem) e copiada para a skin, cada osso da skin recebia o movimento de outro.
+// Agora a troca do clump do modelo 1 vale tambem durante o CreateAssociations da cutscene, e o boneco so sai com a
+// skin se as animacoes foram montadas com ela (g_csCutSkin), para os dois baterem sempre
+typedef void (__thiscall* CreateAssoc_t)(void* self, const char* blk, const char* anims, const char* objs, int stride);
+static CreateAssoc_t g_csOrigAssoc = nullptr;
+static int g_csCutSkin = 0;                                                   // skin da cutscene que esta carregando
+static const char* g_csHow = "";
+static const BYTE* CsSkinClump(int skin) {                                    // clump do modelo da skin, conferido
+    char* mi1 = ModelInfo(1);
+    char* mis = ModelInfo(skin);
+    char* mi0 = ((char**)0xA9B0C8)[0];
+    const BYTE* cj = mi1 ? *(const BYTE**)(mi1 + 0x1C) : nullptr;
+    if (!mi1 || !mis || !mi0 || *(void**)mis != *(void**)mi0 || !cj || cj[0] != 2) {
+        if (g_csLogs++ < 10) Log("skins: cutscene com o CJ: o modelo %d nao e um pedestre ou o boneco do CJ nao esta pronto", skin);
+        return nullptr;
+    }
+    if (!*(void**)(mis + 0x1C)) { ReqModelCs(skin, 0); LoadAllReqCs(false); }  // skin ja guardada pelo Skin Selector
+    const BYTE* sk = *(const BYTE**)(mis + 0x1C);
+    if (!sk || sk[0] != 2) {
+        if (g_csLogs++ < 10) Log("skins: cutscene com o CJ: o modelo %d da skin nao carregou", skin);
+        return nullptr;
+    }
+    return sk;
+}
+// 3.88: na 3.87 o corpo da skin ficou certo, mas o rosto torto. A animacao da cena (ANPK, cada trilha com o numero
+// do osso) tem trilha para os ossos do boneco do CJ: os do rosto dele sao 5001-5026, 30 e 40. A pedestre tem os ossos
+// do rosto 6 (L Brow), 7 (R Brow) e 8 (Jaw), sem trilha na cena. Osso sem trilha nao fica na pose de descanso: nos
+// pedestres o rosto e sempre animado (IDLE_stance, WALK_civi etc. tem trilha para 6, 7 e 8), e no boneco da cena ele
+// ficava com rotacao zerada, entortando boca, queixo e sobrancelhas. Depois do CreateAssociations, cada osso da skin
+// sem trilha na associacao do "csplay" (CAnimBlendStaticAssociation: +4 nos, +0xC CAnimBlendSequence** por no, +0x10
+// hierarquia; +0xA da hierarquia = comprimida) ganha uma trilha de 1 quadro com a pose de descanso dele, calculada
+// como o jogo faz (RpSkinGetSkinToBoneMatrices 0x7C7810 invertidas e a pilha de pais do RpHAnim, flags 2 = empurra,
+// 1 = tira). CAnimBlendSequence (0xC): +0 numero do osso, +4 flags (1 rotacao, 2 translacao, 4 comprimida, 8 memoria
+// de fora, 0x10 por numero de osso), +6 quadros, +8 quadros. Quadro sem compressao: quaternio x,y,z,w, tempo,
+// translacao (0x20); comprimido: 4 x int16/4096, tempo int16/60, 3 x int16/1024 (0x10). Conferido no sofybu.dff:
+// a pose calculada bate com as matrizes do DFF e com o rosto da woman_idlestance (queixo 0, 0, 0.823, 0.568)
+struct CsSeq { DWORD tag; WORD flags; short nf; void* frames; };
+static CsSeq g_csSeqs[48];
+static BYTE  g_csKeys[48][32];
+typedef DWORD (__cdecl* UKey_t)(const char*);
+static const UKey_t UKeyCs = (UKey_t)0x53CF30;                                // CKeyGen::GetUppercaseKey
+typedef void* (__cdecl* Ptr1_t)(void*);
+static const Ptr1_t HierOfSkinClump = (Ptr1_t)0x734A40;                       // GetAnimHierarchyFromSkinClump
+static const Ptr1_t FirstAtomicCs = (Ptr1_t)0x734820;                         // GetFirstAtomic
+static const Ptr1_t SkinOfGeo = (Ptr1_t)0x7C7550;                             // RpSkinGeometryGetSkin
+static const Ptr1_t SkinToBone = (Ptr1_t)0x7C7810;                            // RpSkinGetSkinToBoneMatrices
+typedef int (__cdecl* Int1_t)(void*);
+static const Int1_t SkinBones = (Int1_t)0x7C77E0;                             // RpSkinGetNumBones
+struct M43 { float m[3][3]; float p[3]; };
+static bool M43Inv(const M43& a, M43& o) {
+    const float (*m)[3] = a.m;
+    float c00 = m[1][1] * m[2][2] - m[1][2] * m[2][1], c01 = m[1][2] * m[2][0] - m[1][0] * m[2][2], c02 = m[1][0] * m[2][1] - m[1][1] * m[2][0];
+    float det = m[0][0] * c00 + m[0][1] * c01 + m[0][2] * c02;
+    if (fabsf(det) < 1e-8f) return false;
+    float id = 1.f / det;
+    o.m[0][0] = c00 * id; o.m[0][1] = (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * id; o.m[0][2] = (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * id;
+    o.m[1][0] = c01 * id; o.m[1][1] = (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * id; o.m[1][2] = (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * id;
+    o.m[2][0] = c02 * id; o.m[2][1] = (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * id; o.m[2][2] = (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * id;
+    for (int j = 0; j < 3; j++) o.p[j] = -(a.p[0] * o.m[0][j] + a.p[1] * o.m[1][j] + a.p[2] * o.m[2][j]);
+    return true;
+}
+static void M43Mul(const M43& a, const M43& b, M43& o) {                     // vetor-linha: primeiro a, depois b
+    for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) o.m[i][j] = a.m[i][0] * b.m[0][j] + a.m[i][1] * b.m[1][j] + a.m[i][2] * b.m[2][j];
+    for (int j = 0; j < 3; j++) o.p[j] = a.p[0] * b.m[0][j] + a.p[1] * b.m[1][j] + a.p[2] * b.m[2][j] + b.p[j];
+}
+static void M43Quat(M43 L, float q[4]) {                                      // linhas = eixos (como o RwMatrix)
+    for (int i = 0; i < 3; i++) {
+        float n = sqrtf(L.m[i][0] * L.m[i][0] + L.m[i][1] * L.m[i][1] + L.m[i][2] * L.m[i][2]);
+        if (n > 1e-6f) for (int j = 0; j < 3; j++) L.m[i][j] /= n;
+    }
+    float (*m)[3] = L.m, tr = m[0][0] + m[1][1] + m[2][2];
+    if (tr > 0.f) { float s = sqrtf(tr + 1.f) * 2.f; q[3] = 0.25f * s; q[0] = (m[1][2] - m[2][1]) / s; q[1] = (m[2][0] - m[0][2]) / s; q[2] = (m[0][1] - m[1][0]) / s; }
+    else if (m[0][0] > m[1][1] && m[0][0] > m[2][2]) { float s = sqrtf(1.f + m[0][0] - m[1][1] - m[2][2]) * 2.f; q[3] = (m[1][2] - m[2][1]) / s; q[0] = 0.25f * s; q[1] = (m[1][0] + m[0][1]) / s; q[2] = (m[2][0] + m[0][2]) / s; }
+    else if (m[1][1] > m[2][2]) { float s = sqrtf(1.f + m[1][1] - m[0][0] - m[2][2]) * 2.f; q[3] = (m[2][0] - m[0][2]) / s; q[0] = (m[1][0] + m[0][1]) / s; q[1] = 0.25f * s; q[2] = (m[2][1] + m[1][2]) / s; }
+    else { float s = sqrtf(1.f + m[2][2] - m[0][0] - m[1][1]) * 2.f; q[3] = (m[0][1] - m[1][0]) / s; q[0] = (m[2][0] + m[0][2]) / s; q[1] = (m[2][1] + m[1][2]) / s; q[2] = 0.25f * s; }
+    float n = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    if (n > 1e-6f) for (int k = 0; k < 4; k++) q[k] /= n;
+}
+static short CsI16(float v) { v = floorf(v + 0.5f); return (short)(v > 32767.f ? 32767.f : v < -32768.f ? -32768.f : v); }
+static int CsRestPose(const char* anims, const char* objs, int stride, const BYTE* sk, char* list, int listSize) {
+    list[0] = 0;
+    DWORD key = 0;
+    for (int k = 0; k < 64 && objs && anims; k++) {                           // animacao do objeto "csplay"
+        const char* on = objs + k * stride;
+        if (!on[0]) break;
+        if (!_stricmp(on, "csplay")) { key = UKeyCs(anims + k * stride); break; }
+    }
+    if (!key) key = UKeyCs("csplay");
+    char* grp = (char*)0xBC4020;
+    char* arr = *(char**)(grp + 4);
+    int na = *(int*)(grp + 8);
+    char* sa = nullptr;
+    for (int j = 0; arr && j < na && j < 256; j++) {
+        char* a = arr + j * 0x14;
+        const char* h = *(const char**)(a + 0x10);
+        if (h && *(const DWORD*)h == key) { sa = a; break; }
+    }
+    if (!sa) return -1;
+    const char* hier = *(const char**)(sa + 0x10);
+    bool comp = hier[0xA] != 0;
+    int nn = *(short*)(sa + 4);
+    CsSeq** seqs = *(CsSeq***)(sa + 0xC);
+    const char* hh = (const char*)HierOfSkinClump((void*)sk);
+    void* at = FirstAtomicCs((void*)sk);
+    void* skin = at ? SkinOfGeo(*(void**)((char*)at + 0x18)) : nullptr;
+    if (!hh || !skin || !seqs) return -2;
+    int hn = *(const int*)(hh + 4);
+    const BYTE* ni = *(const BYTE* const*)(hh + 0x10);
+    int nb = SkinBones(skin);
+    const float* inv = (const float*)SkinToBone(skin);
+    if (!ni || !inv || hn != nn || nb != hn || hn <= 0 || hn > 64) return -3;
+    static M43 world[64];
+    int parent[64], stack[64], sp = 0, cur = -1;
+    for (int i = 0; i < hn; i++) {
+        M43 s;
+        const float* f = inv + i * 16;
+        for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) s.m[r][c] = f[r * 4 + c];
+        for (int c = 0; c < 3; c++) s.p[c] = f[12 + c];
+        if (!M43Inv(s, world[i])) return -4;
+        int fl = *(const int*)(ni + i * 16 + 8);
+        if ((fl & 2) && sp < 64) stack[sp++] = cur;
+        parent[i] = cur;
+        cur = (fl & 1) ? (sp ? stack[--sp] : -1) : i;
+    }
+    int filled = 0;
+    for (int i = 0; i < hn && filled < 48; i++) {
+        if (seqs[i]) continue;
+        M43 L = world[i];
+        if (parent[i] >= 0) { M43 pinv; if (!M43Inv(world[parent[i]], pinv)) continue; M43Mul(world[i], pinv, L); }
+        float q[4];
+        M43Quat(L, q);
+        CsSeq& s = g_csSeqs[filled];
+        BYTE* kf = g_csKeys[filled];
+        memset(kf, 0, sizeof g_csKeys[0]);
+        if (comp) {
+            short* v = (short*)kf;
+            for (int k = 0; k < 4; k++) v[k] = CsI16(q[k] * 4096.f);
+            for (int k = 0; k < 3; k++) v[5 + k] = CsI16(L.p[k] * 1024.f);
+        } else {
+            float* v = (float*)kf;
+            for (int k = 0; k < 4; k++) v[k] = q[k];
+            for (int k = 0; k < 3; k++) v[5 + k] = L.p[k];
+        }
+        int id = *(const int*)(ni + i * 16);
+        s.tag = (DWORD)(WORD)(short)id;
+        s.flags = (WORD)(0x1 | 0x2 | 0x8 | 0x10 | (comp ? 0x4 : 0));
+        s.nf = 1;
+        s.frames = kf;
+        seqs[i] = (CsSeq*)&s;
+        filled++;
+        size_t l = strlen(list);
+        if (l + 8 < (size_t)listSize) snprintf(list + l, listSize - l, "%s%d", l ? ", " : "", id);
+    }
+    return filled;
+}
+static void __fastcall CreateAssocDetour(void* self, void*, const char* blk, const char* anims, const char* objs, int stride) {
+    if (self != (void*)0xBC4020) { g_csOrigAssoc(self, blk, anims, objs, stride); return; }
+    g_csCutSkin = 0;
+    const char* how = "";
+    int skin = g_skinCut ? CsPickSkin(&how) : 0;
+    const BYTE* sk = skin > 1 ? CsSkinClump(skin) : nullptr;
+    if (!sk) { g_csOrigAssoc(self, blk, anims, objs, stride); return; }
+    char* mi1 = ModelInfo(1);
+    const BYTE* cj = *(const BYTE**)(mi1 + 0x1C);
+    *(const BYTE**)(mi1 + 0x1C) = sk;                                         // animacoes montadas no esqueleto da skin
+    g_csOrigAssoc(self, blk, anims, objs, stride);
+    *(const BYTE**)(mi1 + 0x1C) = cj;
+    g_csCutSkin = skin; g_csHow = how;
+    char list[160];
+    int nf = g_skinCutFace ? CsRestPose(anims, objs, stride, sk, list, sizeof list) : 0;  // 3.88: rosto na pose de descanso
+    if (nf < 0 && g_csLogs++ < 30) Log("skins: rosto da skin %d: nao deu para montar a pose de descanso (%d); o rosto pode sair torto", skin, nf);
+    else if (nf > 0 && g_csLogs++ < 30) Log("skins: rosto da skin %d na pose de descanso (%d ossos sem animacao na cena: %s)", skin, nf, list);
+}
+static void* __cdecl CreateCutObjDetour(int model) {
+    if (model != 1 || g_csCutSkin <= 1) return g_csOrigCreate(model);
+    int skin = g_csCutSkin;
+    const BYTE* sk = CsSkinClump(skin);
+    if (!sk) {
+        if (g_csLogs++ < 10) Log("skins: AVISO: as animacoes da cutscene foram montadas na skin %d, mas ela sumiu; o CJ pode sair torto", skin);
+        return g_csOrigCreate(model);
+    }
+    char* mi1 = ModelInfo(1);
+    const BYTE* cj = *(const BYTE**)(mi1 + 0x1C);
+    *(const BYTE**)(mi1 + 0x1C) = sk;                                         // so durante a criacao do boneco
+    void* obj = g_csOrigCreate(1);
+    *(const BYTE**)(mi1 + 0x1C) = cj;
+    if (g_csLogs++ < 30) Log("skins: cutscene com a skin %d (%s) no lugar do CJ, animacoes montadas no esqueleto dela", skin, g_csHow);
+    return obj;
 }
 
 typedef void (__thiscall* SpeechInit_t)(void* speech, void* entity);
@@ -8896,6 +9455,11 @@ static void SirRadioTick(char* pv, char* me, DWORD now) {
 // vagas (g_slotMods, cauda 'MODS' do .gtmgar) e enquanto o carro existe (g_tb)
 static int   g_ofOn = 1, g_ofAnyCar = 1, g_ofBig = 1, g_ofPrice[7] = { 18000, 25000, 6000, 5000, 8000, 4000, 500 };   // turbo, blindagem, pneus, ABS, ESP, tracao, variacao
 static float g_tbAccel = 30.f, g_tbVmax = 15.f, g_tbDrag = 15.f, g_tbPitch = 6.f, g_tbVol = 0.f;
+static int   g_facOn = 1, g_facPower = 0; static float g_facVol = -10.f;   // 3.78: pecas de fabrica
+static float g_sighDb = 3.f; static int g_tbLoadOn = 1;                     // 3.81: suspiro do turbo de fabrica, pressao pela carga
+static float g_penteDb = 0.f;                                                // 3.83: volume do piado do pente (diesel com turbo GTM)
+static char* g_tbSpinCar = nullptr; static int g_tbSpinN = 0, g_tbDriveN = 0;   // 3.81: rodas com forca que patinam (ProcessWheel)
+static int   g_tbAudSt = -1; static float g_tbAudSpin = 0.f, g_tbAudF = 0.f;   // 3.81: estado do som do motor (diagnostico)
 struct TbLive { int ref; char* veh; BYTE m[2]; BYTE* h; };
 static TbLive g_tb[48];
 static int g_nTb = 0;
@@ -8920,20 +9484,21 @@ static void TbApply(char* v, const BYTE* m) {
     if (m[0] & 4) *(BYTE*)(v + 0x42B) |= 0x80; else if (old0 & 4) *(BYTE*)(v + 0x42B) &= 0x7F;
     BYTE* base = TbModelHandling(v);
     if (!base) return;
-    if (!(m[0] & 1) && !m[1]) {                                               // sem turbo e tracao original: a do modelo
+    BYTE tr = m[1] & 0x7F;                                                    // 3.78: bit 7 de m[1] = turbo de fabrica
+    if (!(m[0] & 1) && !tr) {                                                 // sem turbo e tracao original: a do modelo
         if (t->h) { *(BYTE**)(v + 0x384) = base; free(t->h); t->h = nullptr; }
         return;
     }
     if (!t->h) t->h = (BYTE*)malloc(0xE0);
     if (!t->h) return;
     memcpy(t->h, base, 0xE0);
-    if (m[0] & 1) {
+    if ((m[0] & 1) && (!(m[1] & 0x80) || g_facPower)) {                       // o de fabrica ja esta no handling.cfg
         *(float*)(t->h + 0x7C) *= 1.f + g_tbAccel / 100.f;
         *(float*)(t->h + 0x84) *= 1.f + g_tbVmax / 100.f;
         *(float*)(t->h + 0x88) *= 1.f + g_tbVmax / 100.f;
         *(float*)(t->h + 0x10) *= 1.f - g_tbDrag / 100.f;
     }
-    if (m[1] == 'F' || m[1] == 'R' || m[1] == '4') t->h[0x74] = m[1];
+    if (tr == 'F' || tr == 'R' || tr == '4') t->h[0x74] = tr;
     ((void(__thiscall*)(void*))0x6D0460)(t->h + 0x2C);                       // cTransmission::InitGearRatios
     *(BYTE**)(v + 0x384) = t->h;
 }
@@ -8947,6 +9512,43 @@ static void TbTick() {
         if (t.m[0] & 4) *(BYTE*)(v + 0x42B) |= 0x80;
         if (t.h && Rd<BYTE*>(v, 0x384) != t.h) *(BYTE**)(v + 0x384) = t.h;
     }
+}
+
+// ---- 3.78: pecas de fabrica (pedido do Gabriel: turbo, ABS e ESP nos carros que tinham isso por volta de 1992). Os
+// modelos e o carro de verdade de cada um estao no HANDOFF. O carro ganha as pecas quando o CJ senta no banco do
+// motorista (ou abre a Oficina GTM com ele) e ainda nao tem registro de pecas: m[0] bit 7 = pecas de fabrica ja
+// postas (assim o que o Gabriel tirar na oficina nao volta), m[1] bit 7 = turbo de fabrica: sem ganho de potencia (a do
+// carro de verdade ja esta no handling.cfg; TurboDeFabricaPotencia=1 da o ganho do turbo GTM), sem espirro e grito
+// (valvula de alivio que devolve o ar para a admissao) e assobio mais baixo (VolumeTurboDeFabrica). ESP: nenhum carro
+// do jogo teria em 1992 (o primeiro foi o Mercedes S600 coupe de 1995)
+static const short kFacTurbo[] = {
+    451, 506, 477, 559, 562, 587, 560, 558,                                   // Turismo, Super GT, ZR-350, Jester, Elegy, Euros, Sultan, Uranus
+    403, 515, 514, 455, 578, 443, 524, 408, 406, 486, 532, 431, 437, 407, 544, 433, 601, 428, 499, 456, 414 };   // diesel pesados
+static const short kFacAbs[] = {
+    445, 405, 533, 580, 409, 421, 426, 579, 402, 555, 480, 541, 506, 477, 559, 562, 587 };
+static bool FacIn(const short* l, int n, int model) { for (int i = 0; i < n; i++) if (l[i] == model) return true; return false; }
+static bool FacMods(int model, BYTE* m) {
+    bool tb = FacIn(kFacTurbo, sizeof kFacTurbo / sizeof *kFacTurbo, model), ab = FacIn(kFacAbs, sizeof kFacAbs / sizeof *kFacAbs, model);
+    m[0] = (BYTE)(0x80 | (tb ? 1 : 0) | (ab ? 8 : 0)); m[1] = tb ? 0x80 : 0;
+    return tb || ab;
+}
+static bool FacTurbo(int model) { return FacIn(kFacTurbo, sizeof kFacTurbo / sizeof *kFacTurbo, model); }
+static void FacEnsure(char* v) {
+    if (!g_ofOn || !g_facOn || !v || TbFind(v)) return;
+    int gi = FindGarVeh(v);
+    if (gi >= 0 && (g_gar[gi].mods[0] || g_gar[gi].mods[1])) { TbApply(v, g_gar[gi].mods); return; }
+    BYTE m[2];
+    int model = Rd<short>(v, 0x22);
+    if (!FacMods(model, m)) return;
+    TbApply(v, m);
+    if (gi >= 0) memcpy(g_gar[gi].mods, m, 2);
+    static short seen[24]; static int ns = 0;
+    bool was = false; for (int i = 0; i < ns; i++) if (seen[i] == model) was = true;
+    if (!was && ns < 24) { seen[ns++] = (short)model; Log("fabrica: %s com %s%s%s", CarName(model), (m[0] & 1) ? "turbo" : "", (m[0] & 9) == 9 ? " e " : "", (m[0] & 8) ? "ABS" : ""); }
+}
+static void FacTick() {
+    char* pv = PlayerVehicle();
+    if (pv && Rd<char*>(pv, 0x460) == PlayerPed()) FacEnsure(pv);
 }
 
 // ---- 3.74: ABS e ESP de verdade (pedido do Gabriel). A flag ABS do handling.cfg (+0x9C) nao e lida pela fisica do
@@ -9047,6 +9649,7 @@ static float AeTri() { DWORD t = *TimeMs % 100; float ph = t / 100.f; return 1.f
 typedef void(__thiscall* AePW_t)(void*, V3*, V3*, V3*, V3*, int, float, float, float, int, float*, int*, int);
 static AePW_t g_aeOrigPW = nullptr;
 static void __fastcall AePWDetour(char* v, void*, V3* wf, V3* wr, V3* cs, V3* cp, int n, float thrust, float brake, float adh, int id, float* ws, int* st, int status) {
+    if (v && v == g_tbSpinCar && thrust > 0.f && st) { g_tbDriveN++; if (*st != 0) g_tbSpinN++; }   // 3.81: patinando, escorregando ou presa
     if (v && v == g_ae.veh && n > 0) {
         const float* m = Rd<const float*>(v, 0x14);
         BYTE* h = Rd<BYTE*>(v, 0x384);
@@ -9082,6 +9685,7 @@ static void __fastcall AePWDetour(char* v, void*, V3* wf, V3* wr, V3* cs, V3* cp
 typedef void(__thiscall* AePBW_t)(void*, V3*, V3*, V3*, V3*, int, float, float, float, float, int, float*, int*, int, int);
 static AePBW_t g_aeOrigPBW = nullptr;
 static void __fastcall AePBWDetour(char* v, void*, V3* wf, V3* wr, V3* cs, V3* cp, int n, float thrust, float brake, float adh, float destab, int id, float* ws, int* st, int special, int status) {
+    if (v && v == g_tbSpinCar && thrust > 0.f && st) { g_tbDriveN++; if (*st != 0) g_tbSpinN++; }
     if (v && v == g_ae.veh && g_ae.abs && brake > 0.f && n > 0) {
         BYTE* h = Rd<BYTE*>(v, 0x384);
         bool hand = (Rd<BYTE>(v, 0x428) & 0x20) != 0 && (id & 0xFF) == 1;     // freio de mao na traseira fica de fora
@@ -9137,15 +9741,16 @@ static void OfPatchCarmod() {
 // 0,26/0,30 s com o "tuc" da valvula (so gasolina), e a pressao cai pela metade. Tirar o pe: espirro ou grito
 // inteiro; acelerar de novo corta na hora. O tom do motor sobe ate TomDoMotor% com a pressao (gancho em
 // CAEVehicleAudioEntity::GetFreqForPlayerEngineSound 0x4F8070)
-enum { TS_WG, TS_WD, TS_B, TS_BW, TS_G, TS_GW, TS_TUC, TS_N };
+enum { TS_WG, TS_WD, TS_B, TS_BW, TS_G, TS_GW, TS_TUC, TS_S, TS_P, TS_N };   // 3.81: TS_S suspiro, 3.83: TS_P pente (opcionais)
 static SirPcm g_tsPcm[TS_N];
-static bool  g_tsLoaded = false, g_tsOk = false;
-struct TbVoiceT { IDirectSoundBuffer* b; IDirectSound3DBuffer* b3; int snd; DWORD cutAt; bool tuc; float k; };
-static TbVoiceT g_tvLoop = {}, g_tvShot = {}, g_tvTuc = {};
+static bool  g_tsLoaded = false, g_tsOk = false, g_tsSigh = false, g_tsPente = false;
+struct TbVoiceT { IDirectSoundBuffer* b; IDirectSound3DBuffer* b3; int snd; DWORD cutAt; bool tuc; float k; bool sigh; DWORD fadeAt; float off; };
+static TbVoiceT g_tvLoop = {}, g_tvShot = {}, g_tvTuc = {}, g_tvPente = {};
 static char* g_tbCar = nullptr;                                               // carro do CJ com turbo (para o tom do motor)
 static int   g_tbNLog = 0;
+static bool  g_tbFac = false;
 static float g_tbBoost = 0.f;
-static void TbPauseStop() { if (g_tvLoop.b) g_tvLoop.b->Stop(); if (g_tvShot.b) g_tvShot.b->Stop(); }
+static void TbPauseStop() { if (g_tvLoop.b) g_tvLoop.b->Stop(); if (g_tvShot.b) g_tvShot.b->Stop(); if (g_tvPente.b) g_tvPente.b->Stop(); }
 static void TbFreeVoice(TbVoiceT& v) { if (v.b3) v.b3->Release(); if (v.b) { v.b->Stop(); v.b->Release(); } v = TbVoiceT{}; }
 static bool TbMakeVoice(TbVoiceT& v, int snd) {
     TbFreeVoice(v);
@@ -9197,30 +9802,99 @@ static void TbCut(char* veh) {
         g_tvTuc.b->Play(0, 0, 0);
     }
 }
+// 3.81: suspiro do turbo de fabrica (valvula de alivio): VolumeSuspiro dB acima do assobio cheio do mesmo carro (que e
+// TbDbAt - 11 + VolumeTurboDeFabrica), forca k pela pressao. Corte (acelerou de novo, ou 0,30 s na troca) sem estalo: o
+// volume cai em 80 ms. 3.82: so gasolina (o Gabriel escolheu o E, "turbina solta"); diesel de fabrica sem som nenhum
+static void TbSigh(float k, char* veh, DWORD cutAt) {
+    if (!g_tsSigh || !TbMakeVoice(g_tvShot, TS_S)) return;
+    float off = -11.f + g_facVol + g_sighDb;
+    V3 rel; TbSetVol(g_tvShot, TbDbAt(veh, &rel) + off + 20.f * log10f(k > 0.05f ? k : 0.05f));
+    if (g_tvShot.b3) g_tvShot.b3->SetPosition(rel.x, rel.y, rel.z, DS3D_IMMEDIATE);
+    g_tvShot.b->Play(0, 0, 0);
+    g_tvShot.cutAt = cutAt; g_tvShot.tuc = false; g_tvShot.k = k; g_tvShot.sigh = true; g_tvShot.fadeAt = 0; g_tvShot.off = off;
+}
 static void TbLoadSounds() {
     g_tsLoaded = true;
-    static const char* kN[TS_N] = { "assobio_gasolina", "assobio_diesel", "espirro", "espirro_fraco", "grito", "grito_fraco", "tuc" };
+    static const char* kN[TS_N] = { "assobio_gasolina", "assobio_diesel", "espirro", "espirro_fraco", "grito", "grito_fraco", "tuc", "suspiro", "pente" };
     int n = 0;
     for (int i = 0; i < TS_N; i++) {
         char path[MAX_PATH]; snprintf(path, sizeof path, "%sGTMTurbo\\%s.wav", g_dir, kN[i]);
-        if (SirLoadWav(path, g_tsPcm[i])) n++;
+        if (SirLoadWav(path, g_tsPcm[i]) && i < TS_S) n++;
     }
-    g_tsOk = n == TS_N;
-    Log("oficina: sons do turbo %s (%d de %d WAV em scripts\\GTMTurbo)", g_tsOk ? "prontos" : "incompletos: o turbo fica sem som", n, TS_N);
+    g_tsOk = n == TS_S; g_tsSigh = g_tsPcm[TS_S].d != nullptr; g_tsPente = g_tsPcm[TS_P].d != nullptr;
+    Log("oficina: sons do turbo %s (%d de %d WAV em scripts\\GTMTurbo; suspiro do turbo de fabrica %s; pente do diesel %s)", g_tsOk ? "prontos" : "incompletos: o turbo fica sem som", n, (int)TS_S,
+        g_tsSigh ? "pronto" : "sem suspiro.wav: turbo de fabrica fica sem suspiro", g_tsPente ? "pronto" : "sem pente.wav: diesel GTM com o grito antigo");
 }
+// 3.76: o Gabriel ouviu o espirro fora das trocas e as vezes duas vezes na mesma marcha. A marcha do jogo (+0x4B4) so
+// troca pela velocidade (cTransmission::CalculateDriveAcceleration 0x6D05E0: sobe acima do ChangeUp, desce abaixo do
+// ChangeDown, sem tempo de troca), mas o que se ouve e a caixa do SOM: CAEVehicleAudioEntity (CVehicle +0x138; 3.77: na
+// 3.76 eu li +0x13C e veio sempre 0. O certo sai das chamadas de AddAudioEvent 0x4F6420 com lea ecx,[esi+0x138])
+// ::ProcessPlayerVehicleEngine (0x4FBB10) tem a marcha propria em +0xAA (ate 5) e troca quando a amostra de
+// aceleracao chega no fim (0x4F5E50), ligando bAudioChangingGear (+0x42B bit 5, o tranco do carro na troca, lido em
+// 0x6B24C2). Agora o espirro da troca sai quando a marcha do som sobe; a do jogo so vale se o som nunca trocar em 20 s
+// de acelerador. Tirada de pe: precisa ficar 60 ms sem acelerador (dedo escorregando no botao nao conta), e entre dois
+// espirros pelo menos 0,5 s
+// 3.81: o Gabriel viu que a turbina nao enchia no burnout, no zerinho e subindo morro com o pe no fundo: a pressao so
+// olhava o giro pela velocidade (velocidade / maxima da marcha), e nesses casos a velocidade fica baixa com o motor
+// cheio. Agora o giro usado e o maior de tres: pela velocidade; 0,95 quando as rodas com forca patinam, escorregam ou
+// estao presas com o acelerador acima de 40% (ProcessWheel: estado da roda != 0 com forca > 0; enche em 0,15 s e solta
+// em 0,30 s); e pela subida com o acelerador acima de 50% (frente do carro apontando para cima, seno filtrado em
+// 0,3 s: 0,03 = 0,60 ... 0,10 ou mais = 0,95). Enquanto patina nao ha espirro de troca (o som do motor pode "trocar"
+// no burnout); tirar o pe da espirro/suspiro como sempre
+// 3.82: turbo diesel como o de verdade (pedido do Gabriel: o diesel nao tem borboleta na admissao, entao nao ha ar
+// preso para soltar). A pressao (g_tbBoost: tom do motor, forca do grito) sobe em 0,70 s, ja a partir de 25% do giro
+// da marcha (o turbo do diesel e pequeno para o motor e enche em baixa), cai em 0,25 s ao tirar o pe (o ar so vaza pelo
+// motor) e so 20% na troca (corte de combustivel rapido; na gasolina cai pela metade). A turbina (g_tbTurb: tom e volume
+// do assobio) acompanha a pressao subindo, mas descendo gira solta por inercia (0,9 s): tirou o pe, o assobio desce
+// devagar em vez de sumir. Diesel de fabrica: sem som nenhum na troca nem ao tirar o pe; o diesel com turbo GTM mantem o
+// grito do pente que o Gabriel escolheu. Gasolina como antes
+// 3.83: o grito do pente ficou "sem conexao" na 3.82 (amostra fixa por cima de um assobio que agora descia devagar).
+// Como e na vida real (foruns 4x4 Brasil e a gravacao da F-250 que o Gabriel mandou): o pente e uma chapa fina cortada
+// em ranhuras e entortada, soldada ou parafusada na curva logo depois da turbina, no escape. Acelerando, o gas quente
+// e pulsante passa por ele e so faz chiado; o piado sai quando se tira o pe (e nas trocas, que no diesel manual sao uma
+// tirada de pe): sem combustivel, a turbina continua girando solta e o motor (sem borboleta) continua bombeando ar, e
+// esse fluxo frio e liso nas ranhuras vira um tom. O tom acompanha a rotacao da turbina descendo e o volume cai muito
+// mais rapido (som de fluxo cresce com uma potencia alta da velocidade). Na gravacao: comeca em 1,1 a 1,25 kHz depois
+// de puxada cheia (754 Hz depois de puxada curta), cai ~10% a cada 0,2 s (turbina com constante de 1,9 s) e o volume
+// cai ~20 dB/s; acelerar corta na hora. Agora: turbina do diesel desce em 1,9 s (era 0,9); piado continuo
+// (scripts\GTMTurbo\pente.wav, laco de 2 s em 1 kHz, o timbre do grito H2) a 1,3 kHz x rotacao, volume (rotacao/0,95)^4,
+// liga 60 ms depois de tirar o pe (15 ms de subida) e some em 60 ms ao acelerar. Na troca (no jogo o pe fica no fundo)
+// simula a tirada de pe do motorista: 0,35 s de piado com a turbina descendo, e volta. Diesel de fabrica: so a turbina,
+// sem pente (sem som na troca nem ao tirar o pe). Sem pente.wav, o diesel GTM volta ao grito da 3.69
+// 3.84: no log da 3.83 o assobio do diesel quase nao descia ao tirar o pe (turbina a 38%: assobio ainda a ~5 kHz, -10%)
+// enquanto o piado caia de 1,2 kHz para ~500 Hz, e o assobio ficava alto mais 3 a 4 s depois do piado acabar: dois sons
+// andando cada um para um lado. Na vida real os dois vem da mesma rotacao (o assobio e o compressor: numero de pas x
+// rotacao; o piado e o fluxo nas ranhuras, que acompanha a rotacao), entao descem juntos, no mesmo intervalo musical.
+// Agora, no diesel: g_tbTurb e a energia da turbina (sobe com a pressao em 0,05 s, desce em 0,95 s) e a rotacao e a
+// raiz dela (a pressao cresce com o quadrado da rotacao), que desce em 1,9 s como na gravacao. Assobio = 5,7 kHz x
+// rotacao e piado = 1,3 kHz x rotacao (sempre na mesma proporcao); volume do assobio rotacao^3 (como antes, energia^1,5),
+// do piado (rotacao/0,975)^4 (-18 dB/s, a gravacao da -20). Enquanto o piado toca, o assobio do diesel GTM fica 4 dB
+// mais baixo (na gravacao, ao tirar o pe, quase so se ouve o piado). Puxada curta (energia 0,3) comeca o piado em ~710 Hz
+// (a gravacao: 754 Hz). Gasolina como antes
+static float g_tbTurb = 0.f;
 static void TbAudioTick(char* pv, char* me, DWORD now) {
+    static DWORD shiftLiftUntil = 0, lowSince = 0; static float pGate = 0.f; static bool penteLogged = false;
     static DWORD last = 0; static float thrWas = 0.f; static int gearWas = -1;
+    static float spinF = 0.f, slopeF = 0.f; static bool spinLogged = false, hillLogged = false;
+    static char* carWas = nullptr; static int agWas = -1; static bool agSeen = false, physMode = false;
+    static DWORD thrTime = 0, lastShot = 0, liftAt = 0; static float liftBoost = 0.f;
     float dt = last ? (float)(now - last) / 1000.f : 0.f; last = now;
     if (dt > 0.1f) dt = 0.1f;
     TbLive* t = (pv && Rd<char*>(pv, 0x460) == me) ? TbFind(pv) : nullptr;
+    int spinN = g_tbSpinN, driveN = g_tbDriveN; g_tbSpinN = g_tbDriveN = 0;
     if (!t || !(t->m[0] & 1) || !t->h) {
-        g_tbCar = nullptr; g_tbBoost = 0.f; gearWas = -1;
+        g_tbCar = nullptr; g_tbSpinCar = nullptr; g_tbBoost = 0.f; g_tbTurb = 0.f; gearWas = -1; carWas = nullptr;
         if (g_tvLoop.b) TbFreeVoice(g_tvLoop);
+        if (g_tvPente.b) TbFreeVoice(g_tvPente);
         return;
     }
+    if (pv != carWas) { carWas = pv; agWas = -1; agSeen = false; physMode = false; thrTime = 0; liftAt = 0; g_tbNLog = 0; spinF = 0.f; slopeF = 0.f; spinLogged = hillLogged = false; pGate = 0.f; lowSince = 0; shiftLiftUntil = 0; penteLogged = false; }
+    g_tbSpinCar = pv;
     if (!g_tsLoaded) TbLoadSounds();
     g_tbCar = pv;
     bool diesel = t->h[0x75] == 'D';
+    bool fac = (t->m[1] & 0x80) != 0;                                         // 3.78: turbo de fabrica: sem espirro, assobio baixo
+    g_tbFac = fac;
     float gas = Rd<float>(pv, 0x49C); float thr = gas > 0.f ? gas : 0.f;
     int gear = Rd<BYTE>(pv, 0x4B4);
     const float* mv = (const float*)(pv + 0x44);
@@ -9231,40 +9905,133 @@ static void TbAudioTick(char* pv, char* me, DWORD now) {
     // mais voltou: o expf/powf da biblioteca, com a FPU do jogo em precisao simples (e o x87 emulado no iPhone), dava
     // NaN. Agora so soma, multiplicacao e raiz: alvo = acelerador x raiz(giro util); seguidor de primeira ordem
     // dt/(tc+dt); valor sempre entre 0 e 1
-    float x = (rpm - 0.35f) / 0.6f; if (!(x > 0.f)) x = 0.f; if (x > 1.f) x = 1.f;
+    float rpmSp = rpm;
+    if (g_tbLoadOn) {                                                         // 3.81: motor cheio sem velocidade
+        bool spin = spinN > 0 && thr > 0.4f;
+        spinF += ((spin ? 1.f : 0.f) - spinF) * (dt / ((spin ? 0.15f : 0.30f) + dt));
+        if (!(spinF >= 0.f && spinF <= 1.f)) spinF = 0.f;
+        const float* mx = Rd<const float*>(pv, 0x14);
+        float sl = mx ? mx[6] : 0.f; if (!(sl > -1.f && sl < 1.f)) sl = 0.f;
+        slopeF += (sl - slopeF) * (dt / (0.3f + dt));
+        float rSpin = 0.95f * spinF;
+        float rHill = (thr > 0.5f && slopeF > 0.03f) ? fminf(0.95f, 0.45f + 5.f * slopeF) : 0.f;
+        if (rSpin > rpm) rpm = rSpin;
+        if (rHill > rpm) rpm = rHill;
+        if (spinF > 0.5f && !spinLogged && g_tbNLog < 30) { spinLogged = true; g_tbNLog++; Log("turbo: rodas com forca patinando com o pe no fundo (%d de %d): giro pela patinada 0.95 (pela velocidade %.2f)", spinN, driveN, rpmSp); }
+        if (rHill > rpmSp + 0.1f && !hillLogged && g_tbNLog < 30) { hillLogged = true; g_tbNLog++; Log("turbo: subida (seno %.3f) com o pe no fundo: giro pela carga %.2f (pela velocidade %.2f)", slopeF, rHill, rpmSp); }
+    }
+    float x = diesel ? (rpm - 0.25f) / 0.55f : (rpm - 0.35f) / 0.6f; if (!(x > 0.f)) x = 0.f; if (x > 1.f) x = 1.f;
     float tgt = thr * sqrtf(x);
     if (gear == 0 || !(tgt >= 0.f && tgt <= 1.f)) tgt = 0.f;
+    if (diesel && (int)(shiftLiftUntil - now) > 0) tgt = 0.f;                  // 3.83: pe fora na troca (diesel)
     if (!(g_tbBoost >= 0.f && g_tbBoost <= 1.f)) g_tbBoost = 0.f;
-    float tc = tgt > g_tbBoost ? (diesel ? 0.70f : 0.35f) : 0.12f;
+    float tc = tgt > g_tbBoost ? (diesel ? 0.70f : 0.35f) : (diesel ? 0.25f : 0.12f);
     g_tbBoost += (tgt - g_tbBoost) * (dt / (tc + dt));
     if (!(g_tbBoost >= 0.f && g_tbBoost <= 1.f)) g_tbBoost = 0.f;
+    // marcha do som do motor (a que se ouve) e a do jogo
+    int ag = Rd<BYTE>(pv, 0x138 + 0xAA);
+    bool agUp = false;
+    if (agWas >= 0 && ag != agWas) {
+        if (!agSeen) { agSeen = true; Log("turbo: marcha do som do motor %d->%d (marcha do jogo %d): espirro da troca pelo som", agWas, ag, gear); }
+        agUp = ag > agWas;
+    }
+    agWas = ag;
+    if (thr > 0.4f) thrTime += (DWORD)(dt * 1000.f);
+    if (!agSeen && !physMode && thrTime > 20000) { physMode = true; Log("turbo: o som do motor deste carro nao troca de marcha; espirro pela marcha do jogo"); }
+    bool shiftUp = agSeen ? agUp : (physMode && gearWas >= 1 && gear > gearWas);
+    if (spinF > 0.5f) shiftUp = false;                                        // 3.81: o som do motor "troca" patinando
     // eventos: troca de marcha subindo com o pe no fundo, e tirada de pe
     if (g_tsOk && SirDS()) {
-        if (gearWas >= 1 && gear > gearWas && thr > 0.3f && g_tbBoost > 0.15f) {
-            float k = fminf(1.f, 0.35f + g_tbBoost);
-            TbShot(diesel ? (g_tbBoost > 0.6f ? TS_G : TS_GW) : (g_tbBoost > 0.6f ? TS_B : TS_BW), k, pv, now + (diesel ? 300 : 260), !diesel);
-            if (g_tbNLog < 12) { g_tbNLog++; Log("turbo: troca %d->%d com pressao %d%%: %s cortado (%s)", gearWas, gear, (int)(g_tbBoost * 100.f + 0.5f), diesel ? "grito" : "espirro", g_tvShot.b ? "tocando" : "SEM BUFFER"); }
-            g_tbBoost *= 0.5f;
-        } else if (thrWas > 0.4f && thr < 0.15f && g_tbBoost > 0.15f) {
-            float k = fminf(1.f, 0.35f + g_tbBoost);
-            TbShot(diesel ? (g_tbBoost > 0.6f ? TS_G : TS_GW) : (g_tbBoost > 0.6f ? TS_B : TS_BW), k, pv, 0, !diesel);
-            if (g_tbNLog < 12) { g_tbNLog++; Log("turbo: tirou o pe com pressao %d%%: %s (%s)", (int)(g_tbBoost * 100.f + 0.5f), diesel ? "grito" : "espirro", g_tvShot.b ? "tocando" : "SEM BUFFER"); }
+        if (fac && !diesel && !g_tsSigh) { shiftUp = false; liftAt = 0; }        // 3.81: sem suspiro.wav fica como na 3.78
+        if (shiftUp && thr > 0.3f && g_tbBoost > 0.15f && now - lastShot >= 500) {
+            if (diesel) shiftLiftUntil = now + 350;                             // 3.83: a tirada de pe do motorista na troca
+            if (fac && diesel) {                                                 // 3.82: diesel de fabrica: so a pressao cai um pouco
+                if (g_tbNLog < 30) { g_tbNLog++; Log("turbo diesel de fabrica: troca no som %d->%d com pressao %d%%: sem som (diesel nao tem borboleta)", ag - 1, ag, (int)(g_tbBoost * 100.f + 0.5f)); }
+            } else if (diesel && g_tsPente) {
+                if (g_tbNLog < 30) { g_tbNLog++; Log("pente: troca no som %d->%d com a rotacao da turbina a %d%%: piado curto de %.0f Hz", ag - 1, ag, (int)(sqrtf(g_tbTurb) * 100.f + 0.5f), 1300.f * sqrtf(g_tbTurb)); }
+            } else if (fac) {
+                TbSigh((0.3f + 0.7f * g_tbBoost) * 0.75f, pv, now + 300);
+                if (g_tbNLog < 30) { g_tbNLog++; Log("turbo de fabrica: troca no som %d->%d com pressao %d%%: suspiro curto (%s)", ag - 1, ag, (int)(g_tbBoost * 100.f + 0.5f), g_tvShot.b ? "tocando" : "SEM BUFFER"); }
+            } else {
+                float k = fminf(1.f, 0.35f + g_tbBoost);
+                TbShot(diesel ? (g_tbBoost > 0.6f ? TS_G : TS_GW) : (g_tbBoost > 0.6f ? TS_B : TS_BW), k, pv, now + (diesel ? 300 : 260), !diesel);
+                if (g_tbNLog < 30) { g_tbNLog++; Log("turbo: troca no som %d->%d (marcha do jogo %d) com pressao %d%%: %s cortado (%s)", ag - 1, ag, gear, (int)(g_tbBoost * 100.f + 0.5f), diesel ? "grito" : "espirro", g_tvShot.b ? "tocando" : "SEM BUFFER"); }
+            }
+            g_tbBoost *= diesel ? 0.8f : 0.5f; lastShot = now; liftAt = 0;          // 3.82: diesel cai 20%
+        }
+        if ((!fac || (!diesel && g_tsSigh)) && thrWas > 0.4f && thr < 0.15f) { liftAt = now; liftBoost = g_tbBoost; }   // tirou o pe: espera 60 ms para confirmar
+        if (liftAt && thr > 0.4f) liftAt = 0;                                       // voltou: foi o dedo escorregando
+        if (liftAt && thr < 0.15f && now - liftAt >= 60) {
+            if (liftBoost > 0.15f && now - lastShot >= 500) {
+                if (fac) {
+                    TbSigh(0.3f + 0.7f * liftBoost, pv, 0);
+                    if (g_tbNLog < 30) { g_tbNLog++; Log("turbo de fabrica: tirou o pe com pressao %d%%: suspiro (%s)", (int)(liftBoost * 100.f + 0.5f), g_tvShot.b ? "tocando" : "SEM BUFFER"); }
+                } else if (diesel && g_tsPente) {
+                    if (g_tbNLog < 30) { g_tbNLog++; Log("pente: tirou o pe com a rotacao da turbina a %d%%: piado comecando em %.0f Hz", (int)(sqrtf(g_tbTurb) * 100.f + 0.5f), 1300.f * sqrtf(g_tbTurb)); }
+                } else {
+                    float k = fminf(1.f, 0.35f + liftBoost);
+                    TbShot(diesel ? (liftBoost > 0.6f ? TS_G : TS_GW) : (liftBoost > 0.6f ? TS_B : TS_BW), k, pv, 0, !diesel);
+                    if (g_tbNLog < 30) { g_tbNLog++; Log("turbo: tirou o pe com pressao %d%%: %s (%s)", (int)(liftBoost * 100.f + 0.5f), diesel ? "grito" : "espirro", g_tvShot.b ? "tocando" : "SEM BUFFER"); }
+                }
+                lastShot = now;
+            }
+            liftAt = 0;
         }
         if (g_tvShot.b) {
             DWORD st = 0; g_tvShot.b->GetStatus(&st);
+            bool cut = (g_tvShot.cutAt && (int)(now - g_tvShot.cutAt) >= 0) || (!g_tvShot.cutAt && thr > 0.4f);   // a borboleta abriu
             if (!(st & DSBSTATUS_PLAYING)) TbFreeVoice(g_tvShot);
-            else if ((g_tvShot.cutAt && (int)(now - g_tvShot.cutAt) >= 0) || (!g_tvShot.cutAt && thr > 0.4f)) TbCut(pv);   // a borboleta abriu
+            else if (g_tvShot.sigh) {                                            // 3.81: suspiro some em 80 ms, sem estalo
+                if (cut && !g_tvShot.fadeAt) g_tvShot.fadeAt = now;
+                float a = g_tvShot.fadeAt ? 1.f - (float)(now - g_tvShot.fadeAt) / 80.f : 1.f;
+                if (a <= 0.02f) TbFreeVoice(g_tvShot);
+                else {
+                    V3 rel; float db = TbDbAt(pv, &rel) + g_tvShot.off + 20.f * log10f((g_tvShot.k > 0.05f ? g_tvShot.k : 0.05f) * a);
+                    TbSetVol(g_tvShot, db);
+                    if (g_tvShot.b3) g_tvShot.b3->SetPosition(rel.x, rel.y, rel.z, DS3D_IMMEDIATE);
+                }
+            }
+            else if (cut) TbCut(pv);
             else { V3 rel; TbDbAt(pv, &rel); if (g_tvShot.b3) g_tvShot.b3->SetPosition(rel.x, rel.y, rel.z, DS3D_IMMEDIATE); }
         }
         if (g_tvTuc.b) { DWORD st = 0; g_tvTuc.b->GetStatus(&st); if (!(st & DSBSTATUS_PLAYING)) TbFreeVoice(g_tvTuc); }
-        // assobio
+        // assobio (3.82: pela rotacao da turbina; no diesel ela desce solta por inercia)
+        if (!(g_tbTurb >= 0.f && g_tbTurb <= 1.f)) g_tbTurb = 0.f;
+        bool shiftLift = diesel && (int)(shiftLiftUntil - now) > 0;
+        if (diesel) { float tg = shiftLift ? 0.f : g_tbBoost; float tt = tg > g_tbTurb ? 0.05f : 0.95f; g_tbTurb += (tg - g_tbTurb) * (dt / (tt + dt)); }
+        else g_tbTurb = g_tbBoost;
+        if (!(g_tbTurb >= 0.f && g_tbTurb <= 1.f)) g_tbTurb = 0.f;
+        float rot = sqrtf(g_tbTurb);                                              // 3.84: rotacao da turbina (diesel)
+        // 3.83: piado do pente (diesel com turbo GTM)
+        if (thr < 0.15f) { if (!lowSince) lowSince = now; } else lowSince = 0;
+        bool open = shiftLift || (lowSince && now - lowSince >= 60);
+        pGate += ((open ? 1.f : 0.f) - pGate) * (dt / ((open ? 0.015f : 0.06f) + dt));
+        if (!(pGate >= 0.f && pGate <= 1.f)) pGate = 0.f;
+        if (diesel && !fac && g_tsPente) {
+            float r = rot / 0.975f; if (r > 1.f) r = 1.f;
+            float a = pGate * r * r * r * r;
+            if (a > 0.003f) {
+                if (!g_tvPente.b && TbMakeVoice(g_tvPente, TS_P)) g_tvPente.b->Play(0, 0, DSBPLAY_LOOPING);
+                if (g_tvPente.b) {
+                    float ratio = 1.3f * rot; if (ratio < 0.15f) ratio = 0.15f;
+                    V3 rel; TbSetVol(g_tvPente, TbDbAt(pv, &rel) + 1.4f + g_penteDb + 20.f * log10f(a));
+                    g_tvPente.b->SetFrequency((DWORD)(g_tsPcm[TS_P].rate * ratio));
+                    if (g_tvPente.b3) g_tvPente.b3->SetPosition(rel.x, rel.y, rel.z, DS3D_IMMEDIATE);
+                    DWORD st = 0; g_tvPente.b->GetStatus(&st);
+                    if (!(st & DSBSTATUS_PLAYING)) g_tvPente.b->Play(0, 0, DSBPLAY_LOOPING);   // voltou da pausa
+                    if (!penteLogged) { penteLogged = true; Log("pente: primeiro piado (%.0f Hz, volume %.0f%%)", 1300.f * rot, a * 100.f); }
+                }
+            } else if (g_tvPente.b) TbFreeVoice(g_tvPente);
+        } else if (g_tvPente.b) TbFreeVoice(g_tvPente);
         int ws = diesel ? TS_WD : TS_WG;
-        if (g_tbBoost > 0.02f) {
+        if (g_tbTurb > 0.02f) {
             if (!g_tvLoop.b || g_tvLoop.snd != ws) { if (TbMakeVoice(g_tvLoop, ws)) g_tvLoop.b->Play(0, 0, DSBPLAY_LOOPING); }
             if (g_tvLoop.b) {
                 float lo = diesel ? 3000.f : 4200.f, hi = diesel ? 5600.f : 7600.f;
-                float u = 1.f - g_tbBoost, f = lo + (hi - lo) * (1.f - u * u * u);   // satura perto do topo (~1 - e^(-3,2p))
-                V3 rel; float db = TbDbAt(pv, &rel) + (diesel ? -5.f : -11.f) + 20.f * log10f(g_tbBoost * sqrtf(g_tbBoost) + 1e-5f);   // p^1,5; 3.74: diesel -5, gasolina -11
+                float u = 1.f - g_tbTurb, f = lo + (hi - lo) * (1.f - u * u * u);   // satura perto do topo (~1 - e^(-3,2p))
+                if (diesel) { f = 5700.f * rot; if (f < 600.f) f = 600.f; }        // 3.84: proporcional a rotacao, junto com o piado
+                V3 rel; float db = TbDbAt(pv, &rel) + (diesel ? -5.f : -11.f) + (fac ? g_facVol : 0.f) + 20.f * log10f(g_tbTurb * sqrtf(g_tbTurb) + 1e-5f);   // p^1,5; 3.74: diesel -5, gasolina -11
+                if (diesel && !fac && g_tsPente) db -= 4.f * pGate;                  // 3.84: o piado na frente
                 TbSetVol(g_tvLoop, db);
                 g_tvLoop.b->SetFrequency((DWORD)(g_tsPcm[ws].rate * f / lo));
                 if (g_tvLoop.b3) g_tvLoop.b3->SetPosition(rel.x, rel.y, rel.z, DS3D_IMMEDIATE);
@@ -9281,8 +10048,8 @@ static void TbAudioTick(char* pv, char* me, DWORD now) {
             tD = now;
             long vol = -10000; DWORD st = 0, fq = 0;
             if (g_tvLoop.b) { g_tvLoop.b->GetVolume(&vol); g_tvLoop.b->GetStatus(&st); g_tvLoop.b->GetFrequency(&fq); }
-            Log("turbo: acel %.2f marcha %d vel %.3f max da marcha %.3f giro %.2f pressao %d%% | assobio %s vol %.1f dB freq %lu | sons %s DS %s",
-                thr, gear, sp, gmax, rpm, (int)(g_tbBoost * 100.f + 0.5f), g_tvLoop.b ? ((st & DSBSTATUS_PLAYING) ? "tocando" : "parado") : "sem buffer",
+            Log("turbo: acel %.2f marcha %d (som %d, estado %d, tom %d %.2f, patinada do som %.2f) vel %.3f max da marcha %.3f giro %.2f (velocidade %.2f, rodas %d/%d, subida %.3f) pressao %d%% turbina %d%% piado %d%% | assobio %s vol %.1f dB freq %lu | sons %s DS %s",
+                thr, gear, ag, (int)Rd<signed char>(pv, 0x138 + 0xA9), g_tbAudSt, g_tbAudF, g_tbAudSpin, sp, gmax, rpm, rpmSp, spinN, driveN, slopeF, (int)(g_tbBoost * 100.f + 0.5f), (int)(g_tbTurb * 100.f + 0.5f), (int)(pGate * 100.f + 0.5f), g_tvLoop.b ? ((st & DSBSTATUS_PLAYING) ? "tocando" : "parado") : "sem buffer",
                 vol / 100.f, (unsigned long)fq, g_tsOk ? "ok" : "faltando", SirDS() ? "ok" : "nao");
         }
     }
@@ -9294,7 +10061,8 @@ typedef float(__thiscall* TbFreq_t)(void*, void*, int);
 static TbFreq_t g_tbOrigFreq = nullptr;
 static float __fastcall TbFreqDetour(void* ae, void*, void* vp, int st) {
     float f = g_tbOrigFreq(ae, vp, st);
-    if (g_tbCar && vp && *(char**)((char*)vp + 0x10) == g_tbCar && g_tbBoost >= 0.f && g_tbBoost <= 1.f) f *= 1.f + g_tbPitch / 100.f * g_tbBoost;
+    if (g_tbCar && vp && *(char**)((char*)vp + 0x10) == g_tbCar) { g_tbAudSt = st; g_tbAudF = f; g_tbAudSpin = *(float*)((char*)vp + 0x40); }   // 3.81: diagnostico
+    if (g_tbCar && vp && *(char**)((char*)vp + 0x10) == g_tbCar && g_tbBoost >= 0.f && g_tbBoost <= 1.f) f *= 1.f + g_tbPitch / 100.f * g_tbBoost * (g_tbFac ? 0.5f : 1.f);
     return f;
 }
 
@@ -9347,6 +10115,11 @@ static int VarRows(const char* v, int slot, char (*t)[64]) {
     }
     return r;
 }
+// 3.78: preco de um item (0 = tirar); o turbo de fabrica se troca pelo GTM pagando
+static int OfCostFor(const BYTE* m, int item) {
+    if (item == 0 && m && (m[0] & 1) && (m[1] & 0x80)) return g_ofPrice[0];
+    return (m && (m[0] & (1 << item))) ? 0 : g_ofPrice[item];
+}
 static void OfLabel(char* out, int n, int item, BYTE m0, BYTE m1, const char* v, const char* sep) {
     char p[24]; CdMoney(p, sizeof p, g_ofPrice[item]);
     if (item == 6) {
@@ -9354,8 +10127,9 @@ static void OfLabel(char* out, int n, int item, BYTE m0, BYTE m1, const char* v,
         snprintf(out, n, "Variacao: %s%strocar %s", nm, sep, p);
         return;
     }
+    if (item == 0 && (m0 & 1) && (m1 & 0x80)) { snprintf(out, n, "Turbo de fabrica%strocar pelo GTM %s", sep, p); return; }
     if (item == 5) {
-        BYTE* base = TbModelHandling(v); BYTE cur = m1 ? m1 : (base ? base[0x74] : 'R');
+        BYTE* base = TbModelHandling(v); BYTE cur = (m1 & 0x7F) ? (m1 & 0x7F) : (base ? base[0x74] : 'R');
         snprintf(out, n, "Tracao %s%strocar %s", OfDriveName(cur), sep, p);
         return;
     }
@@ -9398,6 +10172,7 @@ static void OfShowConfirm() {
 static void OfOpen() {
     char* v = OfCarNear();
     if (!v) { CloseMenu(false); GarHelp("Traga o carro ate a porta de uma oficina (TransFender, Loco Low ou Wheel Arch Angels)."); return; }
+    FacEnsure(v);
     g_ofRef = VehRef(v);
     OfShowMain();
 }
@@ -9428,8 +10203,12 @@ static void OfDo() {
         int money = *(volatile int*)0xB7CE50;
         if (money < g_ofCost) { char p[24]; CdMoney(p, sizeof p, g_ofCost); GarHelp("Dinheiro insuficiente: custa %s.", p); return; }
     }
-    if (g_ofItem < 5) m[0] ^= (BYTE)(1 << g_ofItem);
-    else if (g_ofItem == 5) m[1] = (BYTE)g_ofPick;
+    int facMsg = 0;                                                           // 3.78: 1 trocou o de fabrica, 2 voltou o de fabrica
+    if (g_ofItem == 0 && (m[0] & 1) && (m[1] & 0x80)) { m[1] &= 0x7F; facMsg = 1; }
+    else if (g_ofItem == 0 && (m[0] & 1) && FacTurbo(Rd<short>(v, 0x22))) { m[1] |= 0x80; facMsg = 2; }
+    else if (g_ofItem < 5) m[0] ^= (BYTE)(1 << g_ofItem);
+    else if (g_ofItem == 5) m[1] = (BYTE)((m[1] & 0x80) | g_ofPick);
+    m[0] |= 0x80;
     // o carro vira seu (Meus carros), para as pecas ficarem com ele
     if (gi < 0) {
         char* gr = nullptr; int house = CdHomeHouse(g_ofHomeSet ? g_ofHome : EntityPos(PlayerPed()), &gr);
@@ -9463,10 +10242,12 @@ static void OfDo() {
     TbApply(v, m);
     if (g_ofCost > 0) AddMoney(-g_ofCost);
     const char* const* kT = kOfName;
-    if (g_ofItem == 5) GarHelp("Tracao %s no %s.", m[1] ? OfDriveName(m[1]) : "original", nm);
+    if (g_ofItem == 5) GarHelp("Tracao %s no %s.", (m[1] & 0x7F) ? OfDriveName(m[1] & 0x7F) : "original", nm);
+    else if (facMsg == 1) GarHelp("Turbo GTM no %s, no lugar do de fabrica.", nm);
+    else if (facMsg == 2) GarHelp("Turbo GTM retirado do %s: voltou o de fabrica.", nm);
     else GarHelp(g_ofCost > 0 ? "%s instalado no %s." : "%s retirado do %s.", kT[g_ofItem], nm);
     BYTE* h = Rd<BYTE*>(v, 0x384);
-    Log("oficina: %s no %s (pecas %d, tracao %c, motor %c, $%d)", kT[g_ofItem], nm, m[0], m[1] ? m[1] : '-', h ? h[0x75] : '?', g_ofCost);
+    Log("oficina: %s no %s (pecas %d, tracao %c%s, motor %c, $%d)", kT[g_ofItem], nm, m[0], (m[1] & 0x7F) ? (m[1] & 0x7F) : '-', (m[1] & 0x80) ? ", turbo de fabrica" : "", h ? h[0x75] : '?', g_ofCost);
 }
 static void OfPick(int row) {
     char* v = VehByRef(g_ofRef);
@@ -9478,7 +10259,7 @@ static void OfPick(int row) {
         g_ofItem = item;
         if (item == 5) { OfShowDrive(); return; }
         if (item == 6) { OfShowVar(0); return; }
-        g_ofCost = (m && (m[0] & (1 << item))) ? 0 : g_ofPrice[item];
+        g_ofCost = OfCostFor(m, item);
         OfShowConfirm();
         return;
     }
@@ -9525,6 +10306,7 @@ static void CmSetRows(char* m, const char* const* keys, int n, const char* heade
 static void CmShow(char* m, int level) {
     char* v = PlayerVehicle();
     if (!v) return;
+    FacEnsure(v);
     g_ofRef = VehRef(v);
     static const char* k5[12] = { "GTMO0", "GTMO1", "GTMO2", "GTMO3", "GTMO4", "GTMO5", "GTMO6", "GTMO7", "GTMO8", "GTMO9", "GTMOA", "GTMOB" };
     char p[24];
@@ -9623,7 +10405,7 @@ static void CmTick() {
         g_ofItem = item;
         if (item == 5) { CmShow(m, 9); return; }
         if (item == 6) { CmShow(m, 11); return; }
-        g_ofCost = (mm && (mm[0] & (1 << item))) ? 0 : g_ofPrice[item];
+        g_ofCost = OfCostFor(mm, item);
         CmShow(m, 10);
     } else if (g_cmMode == 11 || g_cmMode == 12) {
         int e = VarPickRow(v, g_cmMode == 12, row);
@@ -9868,10 +10650,257 @@ static void InstallSirens() {
     if (g_ofOn && g_tbPitch > 0.f) HookGame(0x4F8070, (void*)&TbFreqDetour, (void**)&g_tbOrigFreq, "do tom do motor com turbo (CAEVehicleAudioEntity::GetFreqForPlayerEngineSound)");
 }
 
+// ---------------------------------------------------------------- 3.89: continuar de onde parou ([Save] SalvarAoSair, ContinuarAoAbrir, RecomecarMissao)
+// Salvar ao sair: quando o Madeira sai da tela (UIApplicationWillResignActive: ligacao, trocar de app, bloquear), o overlay 3.12
+// (protocolo 9) manda o comando 14 e espera ate 0,8 s a resposta, antes do Madeira parar a GPU. O save segue as regras do autosave
+// (fora de missao; no Vigilante vira checkpoint, como o botao Salvar), no slot do autosave, no maximo um a cada 30 s. Tipo 4 no bloco
+// do jogo (o overlay nao mostra aviso).
+// Extras (GTASAsfN.b.gtmres, gravado em todo save daqui): o save do jogo ja guarda o procurado (CPlayerPed::Save 0x5D57E0 grava caos
+// e nivel do CWanted e o Load 0x5D46E0 devolve); o .gtmres guarda tambem a estacao do radio (o veiculo do .gtmveh volta sintonizado
+// nela, +0x1BC+0x1A, so radio civil), a direcao do CJ a pe (o jogo carrega sempre virado para o mesmo lado; 0173 e a camera atras
+// dele com 0373/02EB) e o procurado, reposto (CWanted::SetWantedLevel 0x562470) se o jogo voltar com menos.
+// Continuar ao abrir: no menu inicial (gGameState 0xC8D4C0 = 7, CMenuManager +0xE9 = 1), depois do FrontendIdle (0x53E770), faz o
+// mesmo que o "Carregar jogo" do menu (0x578EEA): m_bSelectedSaveGame (+0x15F) = slot, CGenericGameStorage::CheckSlotDataValid
+// (0x5D1380), +0x32 = 1, CGame::bMissionPackGame (0xB72910) = 0 e m_bLoadingData (+0x60, 0xBA67A8) = 1. O laco principal vai para o
+// estado 9 pelo InitialiseGame (0x53E580, marca m_bDoGameReload) e o CGame::InitialiseWhenRestarting (0x53C680) carrega
+// (GenericLoad 0x5D17B0). O slot e o do GTASAsfN.b mais recente. Protecao: gtmcontinuar.tmp existe do pedido de carregar ate 20 s de
+// jogo depois; se o jogo abrir de novo com ele la (o save travou ou o app fechou no meio), desta vez fica no menu.
+// Recomecar missao: quando uma missao comeca, gtmmissao.dat (pasta dos saves) guarda o nome, onde o CJ estava (o marcador, como o
+// Retry Mission Mod), area, direcao, veiculo e quantas missoes ja tinham passado; o arquivo some quando a missao termina. Se o jogo
+// carregado pelo ContinuarAoAbrir tem as mesmas missoes passadas e o CJ nao estava num veiculo de submissao (MissionModels), uns 2 s
+// depois de carregar ele vai para o marcador (04BB/0860 area, 04E4/03CB cenario, 00A1, direcao) e a missao comeca de novo pelo
+// marcador. Comecou a pe: o veiculo do .gtmveh nao e recriado.
+#pragma pack(push, 1)
+struct ResSave { DWORD magic, version, timeMs; int wanted, chaos, radio; float footHeading; BYTE onFoot, pad[3]; };
+struct MisSave { DWORD magic, version; char name[8]; float x, y, z, heading; int area, passed; short vehModel; BYTE inVeh, pad; };
+#pragma pack(pop)
+static const DWORD RES_MAGIC = 0x524D5447;   // "GTMR"
+static const DWORD MIS_MAGIC = 0x534D5447;   // "GTMS"
+typedef void (__thiscall* WantedSet_t)(void*, int);
+typedef bool (__cdecl* CheckSlot_t)(int);
+static struct { bool valid, apply; ResSave r; } g_res = {};
+static struct { bool pending; DWORD due; MisSave m; } g_contMis = {};
+static bool  g_contLoading = false;                                           // o jogo que esta carregando foi pedido pelo ContinuarAoAbrir
+static DWORD g_contGuardDue = 0, g_lastLeaveSave = 0;
+
+static void UserFile(char* out, const char* name) {                           // pasta dos saves (GTA San Andreas User Files)
+    static char dir[MAX_PATH] = "";
+    if (!dir[0]) {
+        MakeValidSaveName(0);
+        strncpy(dir, SaveFileName, MAX_PATH - 1);
+        char* sl = strrchr(dir, '\\');
+        if (sl) sl[1] = 0; else dir[0] = 0;
+    }
+    snprintf(out, MAX_PATH, "%s%s", dir, name);
+}
+static char* PedWanted(char* ped) {                                            // CPlayerPed::m_pPlayerData->m_pWanted
+    char* pd = ped ? Rd<char*>(ped, 0x480) : nullptr;
+    return pd ? Rd<char*>(pd, 0) : nullptr;
+}
+
+static void ResWrite(unsigned timeMs) {
+    char* ped = PlayerPed();
+    if (!ped) return;
+    char path[MAX_PATH]; snprintf(path, sizeof path, "%s.gtmres", SaveFileName);
+    ResSave r = {};
+    r.magic = RES_MAGIC; r.version = 1; r.timeMs = timeMs; r.radio = -1;
+    if (char* w = PedWanted(ped)) { r.wanted = Rd<int>(w, 0x2C); r.chaos = Rd<int>(w, 0); }
+    char* veh = PlayerVehicle();
+    if (veh && g_info.ctx != CTX_PASSENGER && Rd<BYTE>(veh, 0x1BC + 0x1B) == 0) {
+        const BYTE* rm = (const BYTE*)0x8CB6F8;                               // CAERadioTrackManager: ativa +0xE9, pedida +0xAD
+        int act = (signed char)rm[0xE9], req = (signed char)rm[0xAD];
+        r.radio = (act >= 1 && act <= 13) ? act : (req >= 1 && req <= 13) ? req : -1;
+    }
+    r.onFoot = veh ? 0 : 1;
+    const float* m = Rd<const float*>(ped, 0x14);
+    r.footHeading = m ? atan2f(-m[4], m[5]) * 57.2957795f : 0.f;
+    FILE* f = fopen(path, "wb");
+    if (f) { fwrite(&r, sizeof r, 1, f); fclose(f); }
+    Log("extras guardados: procurado %d, radio %d%s", r.wanted, r.radio, r.onFoot ? ", CJ a pe" : "");
+}
+
+static void ResBeforeRestore() {                                               // antes do RestoreVehicle: a estacao vai junto
+    if (!g_resPending || !PlayerPed()) return;
+    g_resPending = false;
+    g_res.valid = g_res.apply = false;
+    g_resRadio = -1;
+    char path[MAX_PATH];
+    MakeValidSaveName(g_saveSlot - 1);                                         // so monta o nome
+    snprintf(path, sizeof path, "%s.gtmres", SaveFileName);
+    FILE* f = fopen(path, "rb");
+    if (!f) return;
+    ResSave r = {};
+    size_t got = fread(&r, 1, sizeof r, f); fclose(f);
+    if (got < sizeof r || r.magic != RES_MAGIC || r.timeMs != g_loadedTimeMs) return;
+    g_res.r = r; g_res.valid = g_res.apply = true;
+    g_resRadio = (signed char)r.radio;
+}
+
+static void ResAfterRestore() {
+    if (!g_res.apply || g_pendingRestore) return;
+    char* ped = PlayerPed();
+    if (!ped) return;
+    g_res.apply = false;
+    const ResSave& r = g_res.r;
+    char* w = PedWanted(ped);
+    int cur = w ? Rd<int>(w, 0x2C) : 0;
+    if (w && r.wanted > cur) ((WantedSet_t)0x562470)(w, r.wanted);
+    bool turned = false;
+    if (r.onFoot && !PlayerVehicle() && !g_contMis.pending) {
+        int pr = PlayerRef();
+        if (pr >= 0) { Cmd c(0x0173); c.I(pr).F(r.footHeading); RunCmd(c); turned = true; }
+        { Cmd c(0x0373); RunCmd(c); }                                         // SET_CAMERA_BEHIND_PLAYER
+        { Cmd c(0x02EB); RunCmd(c); }                                         // RESTORE_CAMERA_JUMPCUT
+    }
+    Log("extras de volta: procurado %d (o jogo trouxe %d)%s", r.wanted, cur, turned ? ", CJ virado como estava" : "");
+}
+
+static void DoLeave() {
+    DWORD now = GetTickCount();
+    const char* why = nullptr;
+    if (!g_saveOnLeave) why = "SalvarAoSair=0";
+    else if (g_lastLeaveSave && now - g_lastLeaveSave < 30000) why = "o ultimo save ao sair foi ha menos de 30 s";
+    if (why) {
+        g_saveInfo.saveSeq++; g_saveInfo.saveKind = 4; g_saveInfo.saveResult = 2;
+        Log("salvar ao sair: nao salvou (%s)", why);
+        return;
+    }
+    DoSave(4);
+    if (g_saveInfo.saveResult == 0) g_lastLeaveSave = now;
+}
+
+static void ContMissionStart() {
+    char* ped = PlayerPed();
+    if (!ped) return;
+    MisSave m = {};
+    m.magic = MIS_MAGIC; m.version = 1;
+    if (char* ms = MissionScript()) memcpy(m.name, ms + 8, 8);
+    char* veh = PlayerVehicle();
+    char* e = veh ? veh : ped;
+    V3 p = EntityPos(e);
+    const float* mx = Rd<const float*>(e, 0x14);
+    m.x = p.x; m.y = p.y; m.z = p.z;
+    m.heading = mx ? atan2f(-mx[4], mx[5]) : 0.f;
+    m.area = *(volatile int*)0xB72914;                                         // CGame::currArea
+    m.passed = *StatMissionsPassed;
+    m.inVeh = veh ? 1 : 0; m.vehModel = veh ? Rd<short>(veh, 0x22) : -1;
+    char path[MAX_PATH]; UserFile(path, "gtmmissao.dat");
+    FILE* f = fopen(path, "wb");
+    if (f) { fwrite(&m, sizeof m, 1, f); fclose(f); }
+    Log("missao %.8s comecou: marcador guardado em (%.1f, %.1f, %.1f) area %d%s", m.name, m.x, m.y, m.z, m.area, veh ? " (num veiculo)" : "");
+}
+static void ContMissionEnd() {
+    char path[MAX_PATH]; UserFile(path, "gtmmissao.dat");
+    DeleteFileA(path);
+}
+
+static void ContOnLoad() {
+    bool aut = g_contLoading;
+    g_contLoading = false;
+    if (aut) g_contGuardDue = GetTickCount() + 20000;
+    g_contMis.pending = false;
+    char path[MAX_PATH]; UserFile(path, "gtmmissao.dat");
+    MisSave m = {};
+    FILE* f = fopen(path, "rb");
+    if (!f) return;
+    bool have = fread(&m, 1, sizeof m, f) == sizeof m && m.magic == MIS_MAGIC;
+    fclose(f);
+    DeleteFileA(path);                                                         // vale uma vez so
+    if (!have) return;
+    if (!aut || !g_contMission) { Log("missao %.8s estava em andamento: nao recomeca (%s)", m.name, !aut ? "jogo carregado pelo menu" : "RecomecarMissao=0"); return; }
+    int passed = *StatMissionsPassed;
+    if (passed != m.passed) { Log("missao %.8s estava em andamento: nao recomeca (o save tem %d missoes passadas, ela comecou com %d)", m.name, passed, m.passed); return; }
+    if (m.inVeh && InList(g_missionModels, g_nMission, m.vehModel)) { Log("missao %.8s estava em andamento: submissao (veiculo %d), nao recomeca", m.name, m.vehModel); return; }
+    g_contMis.m = m; g_contMis.pending = true; g_contMis.due = GetTickCount() + 2000;
+    if (!m.inVeh) g_pendingRestore = false;                                    // comecou a pe: o veiculo do save fica de fora
+    Log("missao %.8s estava em andamento: o CJ volta ao marcador para ela comecar de novo", m.name);
+}
+
+static void ContMisTick(DWORD now) {
+    if (!g_contMis.pending || (int)(now - g_contMis.due) < 0) return;
+    char* ped = PlayerPed();
+    if (!ped || g_pendingRestore || *(volatile signed char*)0xB5F851 || MenuActive()) return;
+    if (Rd<float>(ped, 0x540) <= 0.f) return;
+    g_contMis.pending = false;
+    const MisSave& m = g_contMis.m;
+    if (IsPlayerOnAMission()) { Log("recomecar missao: ja ha uma missao rodando; nada feito"); return; }
+    int pr = PlayerRef();
+    if (pr < 0) return;
+    char* veh = PlayerVehicle();
+    if (veh && !m.inVeh) { Log("recomecar missao: o CJ esta num veiculo e a missao comecou a pe; nada feito"); return; }
+    { Cmd c(0x04BB); c.I(m.area); RunCmd(c); }                               // SET_AREA_VISIBLE
+    { Cmd c(0x0860); c.I(pr).I(m.area); RunCmd(c); }                          // SET_CHAR_AREA_VISIBLE
+    { Cmd c(0x04E4); c.F(m.x).F(m.y); RunCmd(c); }                            // REQUEST_COLLISION
+    { Cmd c(0x03CB); c.F(m.x).F(m.y).F(m.z); RunCmd(c); }                     // LOAD_SCENE
+    bool found = false;
+    float gz = FindGroundZFor3DCoord(m.x, m.y, m.z + 1.5f, &found, nullptr);
+    float z = (found && fabsf(gz - m.z) < 4.f) ? gz : m.z - 1.f;
+    { Cmd c(0x00A1); c.I(pr).F(m.x).F(m.y).F(z); RunCmd(c); }                 // SET_CHAR_COORDINATES (no veiculo, leva o veiculo)
+    if (veh) SetHeading(veh, m.heading);
+    else { Cmd c(0x0173); c.I(pr).F(m.heading * 57.2957795f); RunCmd(c); }
+    { Cmd c(0x0373); RunCmd(c); }
+    { Cmd c(0x02EB); RunCmd(c); }
+    Log("recomecar missao: CJ no marcador da %.8s (%.1f, %.1f, %.1f) area %d%s", m.name, m.x, m.y, z, m.area, veh ? ", com o veiculo" : "");
+}
+
+static void ContTick(bool onMission, DWORD now) {
+    if (onMission && !g_wasOnMission) ContMissionStart();
+    else if (!onMission && g_wasOnMission) ContMissionEnd();
+    ContMisTick(now);
+    if (g_contGuardDue && (int)(now - g_contGuardDue) >= 0) {
+        g_contGuardDue = 0;
+        char path[MAX_PATH]; UserFile(path, "gtmcontinuar.tmp");
+        DeleteFileA(path);
+        Log("continuar: jogo rodando; protecao apagada");
+    }
+}
+
+static void ContOpenTick() {
+    static int frames = 0;
+    static bool done = false;
+    if (done) return;
+    if (*(volatile int*)0xC8D4C0 != 7 || !*(volatile BYTE*)0xBA6831 || !*(volatile BYTE*)0xBA67A4) return;   // menu inicial
+    if (*(volatile BYTE*)0xBA67A8) { done = true; return; }                  // ja vai carregar (escolhido no menu)
+    if (++frames < 20) return;
+    done = true;
+    char guard[MAX_PATH]; UserFile(guard, "gtmcontinuar.tmp");
+    if (GetFileAttributesA(guard) != INVALID_FILE_ATTRIBUTES) {
+        DeleteFileA(guard);
+        Log("continuar: da ultima vez o jogo nao chegou a rodar depois de continuar; desta vez fica no menu");
+        return;
+    }
+    int best = -1;
+    ULONGLONG bestT = 0;
+    for (int i = 0; i < 8; i++) {
+        MakeValidSaveName(i);
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        if (!GetFileAttributesExA(SaveFileName, GetFileExInfoStandard, &fa)) continue;
+        ULONGLONG t = ((ULONGLONG)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime;
+        if (best < 0 || t > bestT) { best = i; bestT = t; }
+    }
+    if (best < 0) { Log("continuar: nenhum save; fica no menu"); return; }
+    *(volatile BYTE*)0xBA68A7 = (BYTE)best;                                    // m_bSelectedSaveGame
+    if (!((CheckSlot_t)0x5D1380)(best)) { Log("continuar: o save do slot %d nao passou na conferencia do jogo; fica no menu", best + 1); return; }
+    FILE* f = fopen(guard, "wb");
+    if (f) { fputs("continuar\n", f); fclose(f); }
+    *(volatile BYTE*)0xBA677A = 1;                                             // como o menu faz (+0x32)
+    *(volatile BYTE*)0xB72910 = 0;                                             // CGame::bMissionPackGame
+    *(volatile BYTE*)0xBA67A8 = 1;                                             // m_bLoadingData
+    g_contLoading = true;
+    Log("continuar: carregando o slot %d (o save mais recente)", best + 1);
+}
+typedef void (__cdecl* FrontendIdle_t)();
+static FrontendIdle_t g_origFrontendIdle = nullptr;
+static void __cdecl FrontendIdleDetour() {
+    if (g_origFrontendIdle) g_origFrontendIdle();
+    ContOpenTick();
+}
+
 // fora do DllMain (sem o loader lock): ganchos do MinHook e XInput logo no inicio,
 // para o menu principal e o de pausa ja terem controles
 static DWORD WINAPI StartupThread(LPVOID) {
     HookGame(0x618E90, (void*)&AfterLoadDetour, (void**)&g_origAfterLoad, "de carregamento");
+    if (g_contOpen) HookGame(0x53E770, (void*)&FrontendIdleDetour, (void**)&g_origFrontendIdle, "do menu inicial (continuar ao abrir)");
     HookGame(0x485B10, (void*)&GetPadStateDetour, (void**)&g_origGetPadState, "das setas dos scripts");
     HookGame(0x588BE0, (void*)&SetHelpDetour, (void**)&g_origSetHelp, "do texto de ajuda");
     HookGame(0x588E30, (void*)&SetHelpNumDetour, (void**)&g_origSetHelpNum, "do texto de ajuda com numero");
@@ -9882,6 +10911,10 @@ static DWORD WINAPI StartupThread(LPVOID) {
     InstallBikeDriveBy();
     if (g_daOn || (g_cwOn && g_cwBikeAnim)) InstallFihfc2();
     if (g_sirOn) InstallSirens();
+    if (g_skinCut) {
+        HookGame(0x4CE3B0, (void*)&CreateAssocDetour, (void**)&g_csOrigAssoc, "da skin nas cutscenes (CAnimBlendAssocGroup::CreateAssociations)");
+        HookGame(0x5B02A0, (void*)&CreateCutObjDetour, (void**)&g_csOrigCreate, "da skin nas cutscenes (CCutsceneMgr::CreateCutsceneObject)");
+    }
     InstallXInputHooks();
     if (g_audioHash) { HANDLE t = CreateThread(nullptr, 0, AudioHashThread, nullptr, 0, nullptr); if (t) CloseHandle(t); }
     return 0;
@@ -9923,6 +10956,8 @@ static void LoadConfig(HMODULE self) {
     g_radarTop     = GetPrivateProfileIntA("Hud",   "RadarTop",     16, ini);
     g_weaponGuard  = GetPrivateProfileIntA("Fixes", "WeaponGuard",  1, ini);
     g_noAirZones   = GetPrivateProfileIntA("Fixes", "SemFreioDeZona", 1, ini);
+    g_lvpGuard     = GetPrivateProfileIntA("Fixes", "VidroDoLVP",   1, ini);
+    g_txtFix       = GetPrivateProfileIntA("Fixes", "TextoSemReescrita", 1, ini);
     {
         char fb[96];
         auto list = [&](const char* key, const char* def, int* out, int& n) {
@@ -10008,6 +11043,15 @@ static void LoadConfig(HMODULE self) {
             GetPrivateProfileStringA("Oficina", "TurboArrasto", "15", fb, sizeof fb, ini);   g_tbDrag = (float)atof(fb);
             GetPrivateProfileStringA("Oficina", "TomDoMotor", "6", fb, sizeof fb, ini);      g_tbPitch = (float)atof(fb);
             GetPrivateProfileStringA("Oficina", "VolumeTurbo", "0", fb, sizeof fb, ini);     g_tbVol = (float)atof(fb);
+            GetPrivateProfileStringA("Oficina", "VolumeTurboDeFabrica", "-10", fb, sizeof fb, ini); g_facVol = (float)atof(fb);
+            if (!(g_facVol >= -60.f && g_facVol <= 10.f)) g_facVol = -10.f;
+            g_facOn = GetPrivateProfileIntA("Oficina", "PecasDeFabrica", 1, ini);
+            g_facPower = GetPrivateProfileIntA("Oficina", "TurboDeFabricaPotencia", 0, ini);
+            GetPrivateProfileStringA("Oficina", "VolumeSuspiro", "3", fb, sizeof fb, ini); g_sighDb = (float)atof(fb);
+            GetPrivateProfileStringA("Oficina", "VolumePente", "0", fb, sizeof fb, ini); g_penteDb = (float)atof(fb);
+            if (!(g_penteDb >= -30.f && g_penteDb <= 20.f)) g_penteDb = 0.f;
+            if (!(g_sighDb >= -30.f && g_sighDb <= 20.f)) g_sighDb = 3.f;
+            g_tbLoadOn = GetPrivateProfileIntA("Oficina", "TurboPelaCarga", 1, ini);
         }
         g_cdMultPct  = GetPrivateProfileIntA("VendedorDeCarros", "Multiplicador", 125, ini);
         g_priceOn    = GetPrivateProfileIntA("Precos", "Aplicar", 1, ini);
@@ -10117,6 +11161,8 @@ static void LoadConfig(HMODULE self) {
     if (g_daCone > 90.f) g_daCone = 90.f;
     if (g_daConeZ > 45.f) g_daConeZ = 45.f;
     g_skinClothes  = GetPrivateProfileIntA("Skins", "KeepSkin",     1, ini);
+    g_skinCut      = GetPrivateProfileIntA("Skins", "SkinNaCutscene", 1, ini);
+    g_skinCutFace  = GetPrivateProfileIntA("Skins", "RostoNaCutscene", 1, ini);
     g_garOn        = GetPrivateProfileIntA("Garage", "Enabled",     1, ini);
     g_garPrice     = GetPrivateProfileIntA("Garage", "Price",    1250, ini);
     g_garSellPct   = GetPrivateProfileIntA("Garage", "SellPercent", 15, ini);
@@ -10182,6 +11228,9 @@ static void LoadConfig(HMODULE self) {
     g_autosaveMin  = GetPrivateProfileIntA("Save", "AutosaveMinutes", 5, ini);
     g_afterMission = GetPrivateProfileIntA("Save", "AfterMission",    1, ini);
     g_keepVehicle  = GetPrivateProfileIntA("Save", "KeepVehicle",     1, ini);
+    g_saveOnLeave  = GetPrivateProfileIntA("Save", "SalvarAoSair",     1, ini);
+    g_contOpen     = GetPrivateProfileIntA("Save", "ContinuarAoAbrir", 1, ini);
+    g_contMission  = GetPrivateProfileIntA("Save", "RecomecarMissao",  1, ini);
     {
         char fb[32];
         GetPrivateProfileStringA("Save", "AutoDriveSeconds", "2.5", fb, sizeof fb, ini);
@@ -10216,10 +11265,11 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     InitializeCriticalSection(&g_logCs);
     InitializeCriticalSection(&g_io);
     InitializeCriticalSection(&g_hookCs);
+    g_txtMainTid = GetCurrentThreadId();
     LoadConfig(inst);
     QueryPerformanceFrequency(&g_qpf);
-    Log("GTMTouchSA 3.75 carregado (vigilante=%d transito=%d direcao=%d rampa=%d retorno=%d toque=%d sim/nao por script=%d diag toque=%d ragdoll=%d contagem=%d audio=%d x87=%d pular abertura=%d radar no alto=%d protecao da arma=%d menu de skins=%d andar da skin=%d voz da skin=%d skin nas roupas de missao=%d garagem=%d giroscopio=%d traficante=%d dar arma=%d armas em missao=%d mira do drive-by=%d)",
-        g_vgOn, g_trOn, g_steerOn, g_rampMs, g_releaseMs, g_touchOn, g_ynScripts, g_traceTouch, g_traceRagdoll, g_countRagdoll, g_audioHash, g_fixX87, g_skipIntro, g_radarTop, g_weaponGuard, g_skinOn, g_skinAnims, g_skinVoice, g_skinClothes, g_garOn, g_gyroOn, g_armOn, g_giveOn, g_pmOn, g_daOn);
+    Log("GTMTouchSA 3.89 carregado (vigilante=%d transito=%d direcao=%d rampa=%d retorno=%d toque=%d sim/nao por script=%d diag toque=%d ragdoll=%d contagem=%d audio=%d x87=%d pular abertura=%d radar no alto=%d protecao da arma=%d menu de skins=%d andar da skin=%d voz da skin=%d skin nas roupas de missao=%d garagem=%d giroscopio=%d traficante=%d dar arma=%d armas em missao=%d mira do drive-by=%d salvar ao sair=%d continuar ao abrir=%d recomecar missao=%d)",
+        g_vgOn, g_trOn, g_steerOn, g_rampMs, g_releaseMs, g_touchOn, g_ynScripts, g_traceTouch, g_traceRagdoll, g_countRagdoll, g_audioHash, g_fixX87, g_skipIntro, g_radarTop, g_weaponGuard, g_skinOn, g_skinAnims, g_skinVoice, g_skinClothes, g_garOn, g_gyroOn, g_armOn, g_giveOn, g_pmOn, g_daOn, g_saveOnLeave, g_contOpen, g_contMission);
     if (g_armOn) Log("traficante: ligacao $%d, %d%% abaixo da AmmuNation, fora de epoca %dx e %d caixas por arma por dia, sem atender %d min do jogo, vai embora a %d m",
         g_armCall, g_armDiscount, g_armLockMult, g_armLockBoxes, g_armCooldown, g_armLeave);
     if (GetModuleHandleA("GTMSteerSA.asi")) Log("AVISO: GTMSteerSA.asi tambem esta carregado; apague ele da pasta scripts");

@@ -16,15 +16,20 @@ Overlay de toque contextual para o GTA San Andreas (PC 1.0 US) rodando no Madeir
   voltam ela para trás), com sensibilidade horizontal, vertical e na mira no painel do editor (lápis > Giroscópio).
   Depois do teclado, o foco do teclado volta para o Madeira. Botão Sirene dirigindo veículo com sirene (aceso com
   ela ligada). Botão ESP no carro com ESP da Oficina GTM: normal, Sport e desligado (o texto mostra o modo).
+  Quando o Madeira sai da tela (ligação, trocar de app, bloquear), pede ao jogo para salvar antes de a GPU parar.
 - `asi/GTMTouchSA.cpp`: plugin do jogo (vai em `GTA San Andreas/scripts`). Escreve contexto e
   estado e recebe os toques por `C:\gtmtouch.bin` (`Documents/wine/drive_c/gtmtouch.bin` no
   iPhone), entregando ao GInput como um controle. Inclui a direção pelas setas, salvar na hora,
-  autosave e o veículo salvo junto, correções do x87 (sons de missão e clima), pular os vídeos de abertura,
+  autosave e o veículo salvo junto, salvar ao sair do Madeira e continuar de onde parou ao abrir (pula o menu e carrega o
+  save mais recente, com a estação do rádio e a direção do CJ; se você saiu no meio de uma missão, ela recomeça pelo marcador), correções do x87 (sons de missão e clima), pular os vídeos de abertura,
   radar no canto de cima a esquerda, proteção da arma fora da memória (sem ícone, mãos vazias, travar ao mirar),
   recarregar pelo toque no ícone da arma, save dentro do carro e o Skin Selector: menu com Status + Atirar,
-  skin gravada junto com o save e o jeito de andar e a voz do personagem da skin (também nas respostas a pedestres,
+  skin gravada junto com o save, a skin no lugar do CJ nas cutscenes e o jeito de andar e a voz do personagem da skin (também nas respostas a pedestres,
   nas ordens aos recrutados e nas respostas à namorada), o trânsito sem carro surgindo logo à frente quando você olha para trás, o fim do freio
-  escondido de 29 trechos do mapa (retas de LS, a Strip, ruas e pontes de SF), o Vigilante com reforço da polícia
+  escondido de 29 trechos do mapa (retas de LS, a Strip, ruas e pontes de SF), a protecao contra o jogo fechar
+  quando o vidro quebra numa batida com o LivelyVehiclePhysics e o LocalDent juntos (os cacos continuam caindo), o fim
+  da reescrita do código de textos do jogo pelo Mod Loader a cada texto lido (no iPhone fazia o Madeira traduzir código sem parar
+  e travar depois de uns minutos), o Vigilante com reforço da polícia
   pelo Sim/Não e recompensas por nível (12: mirar em policial não dá estrela, recrutar policial como parceiro de
   gangue, armeiro da polícia no Vigilante e o procurado caindo mais rápido; 21: roubo de carro e batida em viatura
   sem estrela e até 3 recrutas; 32: Vigilante sem timer; 64: Vigilante a qualquer hora, a pé ou em qualquer veículo,
@@ -42,7 +47,7 @@ Overlay de toque contextual para o GTA San Andreas (PC 1.0 US) rodando no Madeir
   um toque troca o tom entre Wail, Yelp e Piercer e segurar toca o air horn; só com os estrobos o trânsito não abre
   caminho (a não ser com o air horn segurado por 1,5 s) e a Buzina é o air horn; quem abre caminho vai para o lado da
   própria faixa, deixando o meio da rua livre; as viaturas da IA sorteiam os tons e usam o air horn; Piercer e air horn gerados
-  pelo plugin a partir de gravações reais, ou trocados por WAV; o air horn soa alto desde o primeiro toque; a sirene continua tocando na viatura sem motorista, sua ou da IA), a música de missão concluída ao chegar no nível 64 do Vigilante, a Oficina GTM dentro das oficinas (linha a mais no menu da TransFender, da Loco Low e da Wheel Arch Angels) (turbo com assobio, espirro e o grito do diesel, blindagem, pneus blindados, ABS, ESP com modos normal, Sport e desligado, tração e a variação do modelo, que fica salva com o carro; a TransFender passa a aceitar qualquer carro), um vendedor de carros pelo telefone (categorias, preços do início dos anos 90, entrega e o carro vira seu), sirene, luz vermelha no painel e rádio da polícia em qualquer carro ou moto a partir do nível 64 do Vigilante, e a garagem pelo telefone
+  pelo plugin a partir de gravações reais, ou trocados por WAV; o air horn soa alto desde o primeiro toque; a sirene continua tocando na viatura sem motorista, sua ou da IA), a música de missão concluída ao chegar no nível 64 do Vigilante, a Oficina GTM dentro das oficinas (linha a mais no menu da TransFender, da Loco Low e da Wheel Arch Angels) (turbo com assobio, espirro e, no diesel, o piado do pente na turbina ao tirar o pé e nas trocas, descendo junto com o assobio da turbina, os dois no tom da rotação dela, blindagem, pneus blindados, ABS, ESP com modos normal, Sport e desligado, tração e a variação do modelo, que fica salva com o carro; os carros que em 1992 já vinham com turbo ou ABS saem de fábrica com eles, o turbo de fábrica com assobio baixo e, na gasolina, um suspiro discreto da válvula no lugar do espirro (o diesel, sem borboleta, fica sem som na troca e ao tirar o pé, e a turbina dele enche em baixa e desce solta, como a de verdade); a turbina enche também no burnout, no zerinho e subindo morro com o pé no fundo; a TransFender passa a aceitar qualquer carro), um vendedor de carros pelo telefone (categorias, preços do início dos anos 90, entrega e o carro vira seu), sirene, luz vermelha no painel e rádio da polícia em qualquer carro ou moto a partir do nível 64 do Vigilante, e a garagem pelo telefone
   (Status + Pular: os carros das garagens das casas viram seus; um membro da Grove entrega, busca e leva
   para a garagem; venda no mercado negro; os amassados do LocalDent vao junto, com o LocalDent modificado que
   exporta o estado de cada carro; cada garagem guarda quantos carros couberem nela e o carro que nao cabe fica

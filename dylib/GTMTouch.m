@@ -1,4 +1,4 @@
-// GTMTouch.dylib 3.11 - overlay de toque contextual para o GTA San Andreas no Madeira.
+// GTMTouch.dylib 3.12 - overlay de toque contextual para o GTA San Andreas no Madeira.
 //
 // Injetado no IPA oficial do Madeira. Desenha os controles por cima do jogo e troca o
 // conjunto de botoes sozinho conforme o contexto que o GTMTouchSA.asi escreve em
@@ -106,6 +106,10 @@ enum {
 // toca o air horn.
 // 3.11 (protocolo 8): botao ESP (comando 13) dirigindo carro com ESP da Oficina GTM (S_ESP); o modo vem em espMode
 // (1 normal, 2 sport, 3 desligado, GTMTouchSA 3.75): o texto do botao mostra o modo e ele fica apagado desligado.
+// 3.12 (protocolo 9): quando o Madeira sai da tela (UIApplicationWillResignActive: ligacao, trocar de app, bloquear), manda o
+// comando 14 e espera ate 0,8 s o GTMTouchSA 3.89 salvar (tipo 4 no bloco do jogo, sem aviso), rodando o laco principal enquanto
+// isso. O observador e registrado no construtor, antes do MetalBackgroundGate do Madeira (que segura a GPU do jogo a partir do
+// mesmo aviso): o jogo ainda desenha enquanto salva.
 // estado do jogo (igual ao .asi) + S_CANSAVE, que e local
 enum {
     S_YESNO = 1u << 0, S_WEAPONS = 1u << 1, S_AIM = 1u << 2, S_DETONATE = 1u << 3, S_MORESATCHEL = 1u << 4,
@@ -130,7 +134,7 @@ enum {
 };
 enum { CMD_NONE = 0, CMD_SAVE = 1, CMD_DETONATE = 2, CMD_SATCHEL = 3, CMD_RELOAD = 4, CMD_RECENTER = 5,
        CMD_BACKUP = 6, CMD_COPCAR = 7, CMD_RECRUITCOP = 8, CMD_VIGTOGGLE = 9, CMD_WEAPPREV = 10, CMD_WEAPNEXT = 11,
-       CMD_SIREN = 12, CMD_ESP = 13 };
+       CMD_SIREN = 12, CMD_ESP = 13, CMD_LEAVE = 14 };
 enum { DYN_NONE = 0, DYN_WEAPON, DYN_VEHICLE, DYN_GROUP, DYN_ACTION, DYN_ESP };
 
 // ------------------------------------------------------------------ layouts padrao
@@ -622,6 +626,7 @@ static UIResponder *GTMCurrentFirstResponder(void) {
 @property (nonatomic) BOOL live, editing;
 @property (nonatomic, weak) UIViewController *host;
 - (void)tick;
+- (void)leaving;
 @end
 
 @implementation GTMPadView {
@@ -1316,6 +1321,7 @@ enum { GYT_ON = 101, GYT_ALWAYS, GYT_H, GYT_V, GYT_AIM, GYT_INVERT, GYT_ZOOM, GY
     if (!_saveSeqKnown) { _saveSeqKnown = YES; _lastSaveSeq = g->saveSeq; return; }
     if (g->saveSeq == _lastSaveSeq) return;
     _lastSaveSeq = g->saveSeq;
+    if (g->saveKind == 4) return;                       // 3.12: salvo ao sair, sem aviso
     int slot = g->slot ? g->slot : 8;
     NSString *text = nil;
     switch (g->saveResult) {
@@ -1377,7 +1383,7 @@ enum { GYT_ON = 101, GYT_ALWAYS, GYT_H, GYT_V, GYT_AIM, GYT_INVERT, GYT_ZOOM, GY
     GTMHostBlock h = {0};
     h.magic = kHostMagic;
     h.seq = ++_hostSeq;
-    h.version = 8;
+    h.version = 9;
     h.cmdSeq = _cmdSeq; h.cmd = _hostCmd;
     if (!_editing) {
         uint32_t bits = 0;
@@ -1407,6 +1413,35 @@ enum { GYT_ON = 101, GYT_ALWAYS, GYT_H, GYT_V, GYT_AIM, GYT_INVERT, GYT_ZOOM, GY
         h.lx = lx; h.ly = ly; h.rx = rx; h.ry = ry;
     }
     pwrite(gFd, &h, 32, kHostOffset);                   // so os campos; [96..127] e do giroscopio
+}
+
+// 3.12: o Madeira vai sair da tela. Pede ao jogo para salvar (comando 14) e espera a resposta, ate 0,8 s.
+- (void)leaving {
+    if (!GTMOpenShared()) return;
+    GTMGameBlock g = {0};
+    CFTimeInterval now = CACurrentMediaTime();
+    BOOL valid = pread(gFd, &g, sizeof g, 0) == sizeof g && g.magic == kGameMagic && g.version >= 2;
+    if (valid && g.seq != _lastGameSeq) { _lastGameSeq = g.seq; _lastGameChange = now; }
+    BOOL fresh = valid && (now - _lastGameChange) < 0.4;
+    int ctx = fresh ? (int)g.context : CTX_NONE;
+    if (ctx == CTX_NONE || ctx == CTX_MENU || ctx > CTX_CUTSCENE) return;   // sem jogo ou pausado: o jogo nao responderia
+    uint32_t seq0 = g.saveSeq;
+    _cmdSeq++; _hostCmd = CMD_LEAVE;
+    GTMHostBlock h = {0};                               // botoes e analogicos soltos
+    h.magic = kHostMagic;
+    h.seq = ++_hostSeq;
+    h.version = 9;
+    h.cmdSeq = _cmdSeq; h.cmd = _hostCmd;
+    pwrite(gFd, &h, 32, kHostOffset);
+    CFTimeInterval t0 = CACurrentMediaTime();
+    int result = -1;
+    while (CACurrentMediaTime() - t0 < 0.8) {
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, true);   // o jogo pode precisar da thread principal
+        GTMGameBlock r = {0};
+        if (pread(gFd, &r, sizeof r, 0) == sizeof r && r.magic == kGameMagic && r.saveSeq != seq0 && r.saveKind == 4) { result = r.saveResult; break; }
+    }
+    NSLog(@"[GTMTouch] saindo da tela: %@ em %.0f ms", result == 0 ? @"jogo salvo" : result < 0 ? @"sem resposta do jogo" : @"jogo nao salvou",
+          (CACurrentMediaTime() - t0) * 1000);
 }
 @end
 
@@ -1455,13 +1490,16 @@ enum { GYT_ON = 101, GYT_ALWAYS, GYT_H, GYT_V, GYT_AIM, GYT_INVERT, GYT_ZOOM, GY
     self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(frame:)];
     self.link.preferredFrameRateRange = CAFrameRateRangeMake(30, 60, 60);
     [self.link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
-    NSLog(@"[GTMTouch] overlay 3.11 ligado; arquivo %@", GTMSharedPath());
+    NSLog(@"[GTMTouch] overlay 3.12 ligado; arquivo %@", GTMSharedPath());
 }
 - (void)frame:(CADisplayLink *)l { [self.pad tick]; }
 - (void)sceneEvent:(NSNotification *)n { [self attachIfNeeded]; }
 @end
 
 __attribute__((constructor)) static void GTMTouchInit(void) {
+    // 3.12: registrado aqui, antes do Madeira registrar o dele (MetalBackgroundGate): este roda primeiro
+    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:nil
+                                                usingBlock:^(NSNotification *n) { [GTMController.shared.pad leaving]; }];
     dispatch_async(dispatch_get_main_queue(), ^{
         GTMController *c = GTMController.shared;
         [NSNotificationCenter.defaultCenter addObserver:c selector:@selector(sceneEvent:) name:UISceneDidActivateNotification object:nil];
